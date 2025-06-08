@@ -26,6 +26,15 @@ TEST(GF_2_8, LUT) {
   }
 }
 
+TEST(GF_2_8, GFNI) {
+  gf_2_8::InitGFNI();
+  for (uint16_t x = 0; x < 256; ++x) {
+    for (uint16_t y = 0; y < 256; ++y) {
+      ASSERT_EQ(gf_2_8::Multiply(x, y), gf_2_8::MultiplyGFNI(x, y));
+    }
+  }
+}
+
 TEST(GF_2_8, Inverse) {
   gf_2_8::Init();
   for (uint16_t x = 1; x < 256; ++x) {

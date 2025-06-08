@@ -18,6 +18,9 @@ const element_t primitive_element = 3; // x
 static element_t exp[256]; /* α^i */
 static element_t log[256]; /* log_α(i) */
 
+/* 8x8 Matrices for multiplying on particular element */
+static uint64_t gfni_matrix[256];
+
 void Init(void) {
   element_t x = 1;
 
@@ -29,6 +32,17 @@ void Init(void) {
     x = Multiply(x, primitive_element);
   }
   exp[255] = 1;
+}
+
+void InitGFNI(void) {
+  for (int16_t y = 0; y < 256; ++y) {
+    gfni_matrix[y] = 0;
+    element_t row = y;
+    for (size_t i = 0, shift = 0; i < 8; ++i, shift += 8) {
+      gfni_matrix[y] |= ((uint64_t)row << shift);
+      row = (row << 1) ^ ((row >> 7) * irreducible_poly);
+    }
+  }
 }
 
 element_t Zero() { return 0; }
@@ -66,6 +80,17 @@ element_t Multiply(element_t a, element_t b) {
     b = (b << 1) ^ (irreducible_poly * (b >> 7));
   }
   return result;
+}
+
+element_t MultiplyGFNI(element_t a, element_t b) {
+  return ((a & 1) * (gfni_matrix[b] & 255)) ^
+         (((a >> 1) & 1) * ((gfni_matrix[b] >> 8) & 255)) ^
+         (((a >> 2) & 1) * ((gfni_matrix[b] >> 16) & 255)) ^
+         (((a >> 3) & 1) * ((gfni_matrix[b] >> 24) & 255)) ^
+         (((a >> 4) & 1) * ((gfni_matrix[b] >> 32) & 255)) ^
+         (((a >> 5) & 1) * ((gfni_matrix[b] >> 40) & 255)) ^
+         (((a >> 6) & 1) * ((gfni_matrix[b] >> 48) & 255)) ^
+         (((a >> 7) & 1) * ((gfni_matrix[b] >> 56) & 255));
 }
 
 element_t Div(element_t a, element_t b) {

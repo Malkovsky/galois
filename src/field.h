@@ -28,6 +28,11 @@ element_t One();
 void Init();
 
 /**
+ * Initializes GFNI matrices
+ */
+void InitGFNI();
+
+/**
  * Add two elements in GF(256)
  * In GF(256), addition is XOR
  * @param a First element
@@ -60,6 +65,16 @@ element_t Multiply(element_t a, element_t b);
  * @return The product a * b in GF(256)
  */
 element_t MultiplyLUT(element_t a, element_t b);
+
+/**
+ * Multiply two elements in GF(256) like in GFNI
+ * Note that this is not actual GFNI but emulation
+ * of it for demonstraion puprpose.
+ * @param a First element
+ * @param b Second element
+ * @return The product a * b in GF(256)
+ */
+element_t MultiplyGFNI(element_t a, element_t b);
 
 /**
  * Divide two elements in GF(256)
