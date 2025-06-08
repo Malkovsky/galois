@@ -42,3 +42,4 @@ add_test(
     NAME Unittests
     COMMAND gf_unittests
 )
+enable_testing()
