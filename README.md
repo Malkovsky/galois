@@ -29,6 +29,8 @@ Currently only implement operation $\mathbf{x} += c\mathbf{y}$ with $\mathbf{x},
 - SIMD: Intel implementation using high/low tables (taken from [catid/gf256](https://github.com/catid/gf256/))
 - GFNIAffine/GFNIMul: multiplication via `GF2P8AFFINEQB`/`GF2P8MULB` instructions from [GFNI](https://builders.intel.com/docs/networkbuilders/galois-field-new-instructions-gfni-technology-guide-1-1639042826.pdf)
 
+![Matrix multiplication benchmarks](https://malkovsky.github.io/galois/images/benchmarks.svg)
+
 ## $GF(2^{16})$
 
 Implementation of $GF(2^{16})$ is extension over $GF(2^8)$ via polynomial $x^2+x+\delta$ where $\delta=x^5$ in $GF(2^8)$ (or `32`).
