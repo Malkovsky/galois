@@ -1,24 +1,8 @@
 cmake_minimum_required(VERSION 3.12)
 project(gf256)
 
-#
-# Compiler options
-#
-# option(${PROJECT_NAME}_WARNINGS_AS_ERRORS "Treat compiler warnings as errors." OFF)
-# option(${PROJECT_NAME}_USE_MSVC_MultiThreadDLL "Link dynamically-link mutithread library. This flag only take effect when it is MSVC" OFF)
-
-# if(MSVC)
-#   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /NODEFAULTLIB:LIBCMTD")
-# endif()
-
-# # Add this to your CMakeLists.txt
-# if(MSVC)
-#   # Use dynamic runtime libraries consistently
-#   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDebugDLL")
-  
-#   # For release builds:
-#   # set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
-# endif()
+set(CMAKE_CXX_FLAGS "-march=native")
+set(BENCHMARK_ENABLE_GTEST_TESTS OFF)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -26,13 +10,38 @@ FetchContent_Declare(
     URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
 )
 FetchContent_MakeAvailable(googletest)
+FetchContent_Declare(
+  googlebenchmark
+  GIT_REPOSITORY https://github.com/google/benchmark.git
+  GIT_TAG v1.9.4  # Replace with the desired version/tag
+)
+FetchContent_MakeAvailable(googlebenchmark)
+add_executable(benchmarks
+    src/field.cc
+    third_party/gf256/gf256.cpp
+    benchmarks/matrix_multiplication.cc)
+target_include_directories(benchmarks
+    PUBLIC src
+    PUBLIC third_party
+)
+set_property(TARGET benchmarks PROPERTY CXX_STANDARD 20)
+
+target_link_libraries(benchmarks
+    benchmark
+    benchmark_main)
+add_test(
+    NAME Benchmarks
+    COMMAND benchmarks --benchmark_out=bm_report.csv --benchmark_out_format=csv
+)
 
 add_executable(gf_unittests
     src/field.cc
+    third_party/gf256/gf256.cpp
     tests/field_tests.cc)
 target_include_directories(gf_unittests
     PUBLIC ${GOOGLETEST_SOURCE_DIR}/src
     PUBLIC src
+    PUBLIC third_party
 )
 set_property(TARGET gf_unittests PROPERTY CXX_STANDARD 20)
 target_link_libraries(gf_unittests

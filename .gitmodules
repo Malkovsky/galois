@@ -1,0 +1,3 @@
+[submodule "third_party/gf256"]
+	path = third_party/gf256
+	url = https://github.com/catid/gf256.git

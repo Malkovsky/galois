@@ -1,7 +1,8 @@
 #pragma once
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 
 /**
  * GF(256) field implementation using polynomial representation
@@ -99,8 +100,58 @@ element_t Inv(element_t a);
  */
 element_t Pow(element_t a, int n);
 
-} // namespace gf_2_8
+/**
+ * @brief x += y * z, x, y are vectors with length elmenets, z - scalar
+ * @details
+ * Performs x += y * z using binary multiplication tables
+ */
+void AddScaledRowBase(element_t *x, const element_t *y, element_t z,
+                      size_t length);
 
+/**
+ * @brief x += y * z, x, y are vectors with length elmenets, z - scalar
+ * @details
+ * Performs x += y * z using binary multiplication with SIMD low/high tables
+ */
+void AddScaledRowSIMD(element_t *x, const element_t *y, element_t z,
+                      size_t length);
+
+/**
+ * @brief x += y * z, x, y are vectors with length elmenets, z - scalar
+ * @details
+ * Performs x += y * z using GFNI general affine transform. Applicable
+ * for multiplication in any basis, i.e. with standard or Cantor,
+ * corresponding tables are basis dependent and should be precalculated.
+ */
+void AddScaledRowGFNIGeneral(element_t *x, const element_t *y, element_t z,
+                             size_t length);
+
+/**
+ * @brief x += y * z, x, y are vectors with length elmenets, z - scalar
+ * @details
+ * Performs x += y * z using GFNI multiplication in GF(256). Applicable
+ * for standard basis only with GF(256) build using 0x11B generator
+ * polynomial. This version is faster than general version.
+ */
+void AddScaledRowGFNIDedicated(element_t *x, const element_t *y, element_t z,
+                               size_t length);
+
+/**
+ * @brief baseline
+ * @details
+ * Performs textbook matrix multiplication with ikj loop order over
+ * row-major matrices @p left and @p right of sizes m_i*m_k and m_k*m_j
+ * respectively using @p fma to perform row scaling and addition, i.e.
+ * fma(X, Y, z, length) should perform X += Y * z for X, Y vectors with length
+ * elements and z being scalar. Multiplication result is put into @p result
+ */
+void MatMul(
+    const element_t *left, const element_t *right, size_t m_i, size_t m_k,
+    size_t m_j,
+    std::function<void(element_t *, const element_t *, element_t, size_t)> fma,
+    element_t *result);
+
+} // namespace gf_2_8
 
 /**
  * GF(2^16) field implementation using as an extension over GF(2^8)
@@ -178,4 +229,3 @@ element_t InvIT(element_t a);
 element_t Pow(element_t a, size_t n);
 
 } // namespace gf_2_16
-

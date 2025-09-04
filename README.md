@@ -1,7 +1,9 @@
 # Galois
 Implementation of Galois fields $GF(2^8)$ and $GF(2^{16})$.
 
-## Details
+## $GF(2^8)$
+
+### Base arithmetics
 
 Implementation of $GF(2^8)$ is pretty standard
 * Element is represented by a `uint8_t`.
@@ -17,8 +19,17 @@ where $\exp$, $\log$ are constructed using primitive element $\alpha=x+1$ (which
 \log[\alpha^i]=i.
 ```
 $2\times 256$ bytes in total.
-* Addtionally implemented GFNI-like multiplication with precomputed $8\times 8$ matrices packed into `unit64_t` totalling in $8\times 256$ byte. The multiplication itself is manual matrix-vector multiplication.
 * Inversion via $\log$ table.
+
+### Vector operations
+
+Currently only implement operation $\mathbf{x} += c\mathbf{y}$ with $\mathbf{x}, \mathbf{y}\in \mathbb{F}^k, c\in \mathbb{F}$ in several variants for benchmraking
+
+- Baseline: multiplication via binary multiplication tables
+- SIMD: Intel implementation using high/low tables (taken from [catid/gf256](https://github.com/catid/gf256/))
+- GFNIAffine/GFNIMul: multiplication via `GF2P8AFFINEQB`/`GF2P8MULB` instructions from [GFNI](https://builders.intel.com/docs/networkbuilders/galois-field-new-instructions-gfni-technology-guide-1-1639042826.pdf)
+
+## $GF(2^{16})$
 
 Implementation of $GF(2^{16})$ is extension over $GF(2^8)$ via polynomial $x^2+x+\delta$ where $\delta=x^5$ in $GF(2^8)$ (or `32`).
 * Multiplication is via fomula
@@ -27,8 +38,4 @@ Implementation of $GF(2^{16})$ is extension over $GF(2^8)$ via polynomial $x^2+x
 ```
 * Inverse is via powering and Itoh–Tsujii algorithm.
 
-## Currently not implemented
-* No actual GFNI. `GF2P8MULB` instruction is by far the fastest way of multiplication in $GF(2^8)$ if available, expecially batched.
-* No SIMD optimizations. This is a clear miss as most applications operate on sequences, as far as I know used multiplication implementations are poorly optimized by the compiler. A special mention should be made to [catid/gf256](https://github.com/catid/gf256/blob/master/gf256.cpp#L471) with heavy manual SIMD optimizations and dedicated SIMD-based multiplication algorithm.
-* No benchmarks. Will add them probably at some point. 
 

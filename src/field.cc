@@ -1,4 +1,8 @@
 #include "field.h"
+#include "gf256/gf256.h"
+
+#include <cstring>
+#include <immintrin.h>
 
 namespace gf_2_8 {
 
@@ -13,6 +17,11 @@ const element_t irreducible_poly = 0x1b; // x^4+x^3+x+1
  * x + 1, i.e. `3` in binary.
  */
 const element_t primitive_element = 3; // x
+
+/**
+ * Binary multiplication tables
+ */
+static element_t binary_table[256 * 256];
 
 /* GF(256) tables */
 static element_t exp[256]; /* α^i */
@@ -31,16 +40,30 @@ void Init(void) {
 
     x = Multiply(x, primitive_element);
   }
+
   exp[255] = 1;
+
+  for (size_t i = 0; i < 256; ++i) {
+    for (size_t j = 0; j < 256; ++j) {
+      binary_table[256 * i + j] = Multiply(i, j);
+    }
+  }
 }
 
 void InitGFNI(void) {
   for (int16_t y = 0; y < 256; ++y) {
-    gfni_matrix[y] = 0;
+    uint64_t mt = 0;
     element_t row = y;
     for (size_t i = 0, shift = 0; i < 8; ++i, shift += 8) {
-      gfni_matrix[y] |= ((uint64_t)row << shift);
+      mt |= ((uint64_t)row << shift);
       row = (row << 1) ^ ((row >> 7) * irreducible_poly);
+    }
+    gfni_matrix[y] = 0;
+
+    for (size_t i = 0; i < 8; ++i) {
+      for (size_t j = 0; j < 8; ++j) {
+        gfni_matrix[y] |= ((mt >> (8 * i + j)) & 1) << (8 * j + (7 - i));
+      }
     }
   }
 }
@@ -82,16 +105,15 @@ element_t Multiply(element_t a, element_t b) {
   return result;
 }
 
-element_t MultiplyGFNI(element_t a, element_t b) {
-  return ((a & 1) * (gfni_matrix[b] & 255)) ^
-         (((a >> 1) & 1) * ((gfni_matrix[b] >> 8) & 255)) ^
-         (((a >> 2) & 1) * ((gfni_matrix[b] >> 16) & 255)) ^
-         (((a >> 3) & 1) * ((gfni_matrix[b] >> 24) & 255)) ^
-         (((a >> 4) & 1) * ((gfni_matrix[b] >> 32) & 255)) ^
-         (((a >> 5) & 1) * ((gfni_matrix[b] >> 40) & 255)) ^
-         (((a >> 6) & 1) * ((gfni_matrix[b] >> 48) & 255)) ^
-         (((a >> 7) & 1) * ((gfni_matrix[b] >> 56) & 255));
-}
+// TODO: implement properly for testing/demo purpose
+// element_t MultiplyGFNI(element_t a, element_t b) {
+//     uint64_t x = 0x0101010101010101ULL * b & gfni_matrix[a];
+//     x ^= x >> 4;
+//     x ^= x >> 2;
+//     x ^= x >> 1;
+//     x &= 0x0101010101010101ULL;
+//     return (uint8_t)((x * 0x0102040810204080ULL) >> 56);
+// }
 
 element_t Div(element_t a, element_t b) {
   if (a == 0) {
@@ -129,6 +151,83 @@ element_t Pow(element_t a, int n) {
   /* a^n = α^(log(a) * n mod 255) */
   int log_res = (log[a] * n) % 255;
   return exp[log_res];
+}
+
+void AddScaledRowBase(element_t *x, const element_t *y, element_t z,
+                      size_t length) {
+  if (z == 0) {
+    return;
+  }
+  element_t *z_table = binary_table + 256 * z;
+  for (size_t i = 0; i < length; ++i) {
+    x[i] ^= z_table[y[i]];
+  }
+}
+
+void AddScaledRowSIMD(element_t *x, const element_t *y, element_t z,
+                      size_t length) {
+  if (z == 0) {
+    return;
+  }
+  gf256_muladd_mem(x, z, y, length);
+}
+
+void AddScaledRowGFNIGeneral(element_t *x, const element_t *y, element_t z,
+                             size_t length) {
+  if (z == 0) {
+    return;
+  }
+  size_t processed = 0;
+#if defined(__GFNI__) and defined(__AVX512F__)
+  __m512i z_matrix = _mm512_set1_epi64(gfni_matrix[z]);
+  while (processed + 64 <= length) {
+    auto x_reg = _mm512_loadu_epi8(x);
+    auto y_reg = _mm512_loadu_epi8(y);
+    x_reg = _mm512_xor_epi64(x_reg,
+                             _mm512_gf2p8affine_epi64_epi8(y_reg, z_matrix, 0));
+    _mm512_storeu_epi8(x, x_reg);
+    x += 64;
+    y += 64;
+    processed += 64;
+  }
+#endif
+  AddScaledRowBase(x, y, z, length - processed);
+}
+
+void AddScaledRowGFNIDedicated(element_t *x, const element_t *y, element_t z,
+                               size_t length) {
+  if (z == 0) {
+    return;
+  }
+  size_t processed = 0;
+#if defined(__GFNI__) and defined(__AVX512F__)
+  __m512i z_reg = _mm512_set1_epi8(z);
+  while (processed + 64 <= length) {
+    auto x_reg = _mm512_loadu_epi8(x);
+    auto y_reg = _mm512_loadu_epi8(y);
+    x_reg = _mm512_xor_epi64(x_reg, _mm512_gf2p8mul_epi8(y_reg, z_reg));
+    _mm512_storeu_epi8(x, x_reg);
+    x += 64;
+    y += 64;
+    processed += 64;
+  }
+#endif
+  AddScaledRowBase(x, y, z, length - processed);
+}
+
+void MatMul(
+    const element_t *left, const element_t *right, size_t m_i, size_t m_k,
+    size_t m_j,
+    std::function<void(element_t *, const element_t *, element_t, size_t)> fma,
+    element_t *result) {
+  std::memset(result, 0, m_i * m_j);
+  for (size_t i = 0; i < m_i; ++i) {
+    auto right_row = right;
+    for (size_t k = 0; k < m_k; ++k, left++, right_row += m_j) {
+      fma(result, right_row, *left, m_j);
+    }
+    result += m_j;
+  }
 }
 
 } // namespace gf_2_8
@@ -172,9 +271,7 @@ element_t Inv(element_t a) {
   return result;
 }
 
-element_t Div(element_t a, element_t b) { 
-  return Multiply(a, Inv(b));
-}
+element_t Div(element_t a, element_t b) { return Multiply(a, Inv(b)); }
 
 element_t Pow(element_t a, size_t n) {
   element_t result = One();
@@ -196,6 +293,5 @@ element_t InvIT(element_t a) {
   gf_2_8::element_t a_r1 = Multiply(a_r, a);
   return Multiply(a_r, gf_2_8::Inv(a_r1));
 }
-
 
 } // namespace gf_2_16
