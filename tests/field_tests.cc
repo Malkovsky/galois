@@ -1,8 +1,10 @@
 #include "field.h"
-#include "gf256/gf256.h"
+#include "matrix.h"
 
 #include <algorithm>
+#include <array>
 #include <random>
+#include <vector>
 
 #include "gtest/gtest.h"
 
@@ -40,7 +42,6 @@ TEST(GF_2_8, LUT) {
 TEST(GF_2_8, RowMulAdd) {
   gf_2_8::InitGFNI();
   gf_2_8::Init();
-  gf256_init();
   std::mt19937 rng(42);
   constexpr size_t length = 1000;
   std::array<gf_2_8::element_t, length> data, x, y, result, ref;
@@ -49,7 +50,7 @@ TEST(GF_2_8, RowMulAdd) {
       data[j] = rng();
       y[j] = rng();
     }
-    gf_2_8::element_t z = 1;
+    gf_2_8::element_t z = rng();
 
     std::copy(data.begin(), data.end(), x.begin());
     gf_2_8::AddScaledRowBase(x.data(), y.data(), z, length);
@@ -112,8 +113,118 @@ TEST(GF_2_8, MatMul) {
           }
         }
         ASSERT_EQ(std::equal(ref.begin(), ref.end(), result.begin()), true);
+
+        gf_2_8::MatMul(left.data(), right.data(), n, m, l,
+                       gf_2_8::AddScaledRowSIMD, result.data());
+        ASSERT_EQ(std::equal(ref.begin(), ref.end(), result.begin()), true);
       }
     }
+  }
+}
+
+TEST(GF_2_8, MatMulBlockedGFNI) {
+  gf_2_8::Init();
+  gf_2_8::InitGFNI();
+  std::mt19937 rng(42);
+
+  struct Shape {
+    size_t rows;
+    size_t inner;
+    size_t cols;
+  };
+
+  const Shape shapes[] = {
+      {1, 0, 3},    {1, 1, 1},    {3, 5, 7},    {4, 6, 64},
+      {5, 9, 65},   {7, 11, 130}, {9, 13, 512}, {3, 7, 2053},
+  };
+
+  std::vector<gf_2_8::element_t> left;
+  std::vector<gf_2_8::element_t> right;
+  std::vector<gf_2_8::element_t> result;
+  std::vector<gf_2_8::element_t> ref;
+
+  for (const auto shape : shapes) {
+    left.resize(shape.rows * shape.inner);
+    right.resize(shape.inner * shape.cols);
+    result.resize(shape.rows * shape.cols);
+    ref.resize(shape.rows * shape.cols);
+
+    for (auto &x : left) {
+      x = rng();
+    }
+    for (auto &x : right) {
+      x = rng();
+    }
+
+    gf_2_8::MatMulBlockedGFNI(left.data(), right.data(), shape.rows,
+                              shape.inner, shape.cols, result.data());
+
+    std::fill(ref.begin(), ref.end(), 0);
+    for (size_t i = 0; i < shape.rows; ++i) {
+      for (size_t j = 0; j < shape.cols; ++j) {
+        for (size_t k = 0; k < shape.inner; ++k) {
+          ref[i * shape.cols + j] ^=
+              gf_2_8::Multiply(left[i * shape.inner + k],
+                               right[k * shape.cols + j]);
+        }
+      }
+    }
+
+    ASSERT_EQ(std::equal(ref.begin(), ref.end(), result.begin()), true)
+        << "shape=" << shape.rows << "x" << shape.inner << "x" << shape.cols;
+  }
+}
+
+TEST(GF_2_8, MatMulBlockedLUT) {
+  gf_2_8::Init();
+  std::mt19937 rng(43);
+
+  struct Shape {
+    size_t rows;
+    size_t inner;
+    size_t cols;
+  };
+
+  const Shape shapes[] = {
+      {1, 0, 3},    {1, 1, 1},    {3, 5, 7},    {4, 6, 64},
+      {5, 9, 65},   {7, 11, 130}, {9, 13, 512}, {3, 7, 2053},
+  };
+
+  std::vector<gf_2_8::element_t> left;
+  std::vector<gf_2_8::element_t> right;
+  std::vector<gf_2_8::element_t> result;
+  std::vector<gf_2_8::element_t> ref;
+
+  for (const auto shape : shapes) {
+    left.resize(shape.rows * shape.inner);
+    right.resize(shape.inner * shape.cols);
+    result.resize(shape.rows * shape.cols);
+    ref.resize(shape.rows * shape.cols);
+
+    for (auto &x : left) {
+      x = rng();
+    }
+    for (auto &x : right) {
+      x = rng();
+    }
+
+    gf_2_8::MatMulBlockedLUT(left.data(), right.data(), shape.rows,
+                             shape.inner, shape.cols, result.data());
+
+    std::fill(ref.begin(), ref.end(), 0);
+    for (size_t i = 0; i < shape.rows; ++i) {
+      for (size_t j = 0; j < shape.cols; ++j) {
+        for (size_t k = 0; k < shape.inner; ++k) {
+          ref[i * shape.cols + j] ^=
+              gf_2_8::Multiply(left[i * shape.inner + k],
+                               right[k * shape.cols + j]);
+        }
+      }
+    }
+
+    ASSERT_EQ(std::equal(ref.begin(), ref.end(), result.begin()), true)
+        << "shape=" << shape.rows << "x" << shape.inner << "x" << shape.cols;
+
   }
 }
 

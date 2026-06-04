@@ -1,0 +1,51 @@
+# GF256 Optimization Experiment Examples
+
+Use this overlay for GF(256) matrix and row-FMA experiments.
+
+## Matrix Kernel Contract
+
+- Public matrix APIs live in `src/matrix.h`.
+- Matrix implementations live in `src/matrix.cc`.
+- `src/field.*` should stay focused on field arithmetic and row FMA primitives.
+- Keep production callers on `MatMul`, `MatMulBlockedLUT`, or
+  `MatMulBlockedGFNI`; avoid leaving slow experimental variants in the public
+  API.
+
+## Correctness Loop
+
+Before trusting timings, run:
+
+```bash
+cmake --build /tmp/gf256-linux --target gf_unittests benchmarks
+/tmp/gf256-linux/gf_unittests
+```
+
+For SIMD gate changes, also compile representative fallback modes:
+
+```bash
+g++ -std=c++20 -I src -I third_party -mno-gfni -mno-avx512f -mno-avx512bw -c src/field.cc -o /tmp/gf256-field-nogfni.o
+g++ -std=c++20 -I src -I third_party -mno-gfni -mno-avx512f -mno-avx512bw -c src/matrix.cc -o /tmp/gf256-matrix-nogfni.o
+g++ -std=c++20 -I src -I third_party -mno-avx2 -mssse3 -c src/field.cc -o /tmp/gf256-field-ssse3.o
+g++ -std=c++20 -I src -I third_party -mno-avx2 -mssse3 -c src/matrix.cc -o /tmp/gf256-matrix-ssse3.o
+g++ -std=c++20 -I src -I third_party -mno-avx2 -mno-ssse3 -c src/field.cc -o /tmp/gf256-field-scalar.o
+g++ -std=c++20 -I src -I third_party -mno-avx2 -mno-ssse3 -c src/matrix.cc -o /tmp/gf256-matrix-scalar.o
+```
+
+## Benchmark Loop
+
+Compare candidate matrix kernels against the current `BlockedLowHighSIMD`,
+`LowHighSIMDTables`, and `BlockedGFNI` rows:
+
+```bash
+BENCH_CPU=${BENCH_CPU:-0}
+taskset -c "${BENCH_CPU}" /tmp/gf256-linux/benchmarks \
+  --benchmark_filter='^(BlockedLowHighSIMD|LowHighSIMDTables|BlockedGFNI)/n:(512|1024|2048)$' \
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true \
+  --benchmark_display_aggregates_only=true \
+  --benchmark_out=/tmp/gf256_matrix_candidate.json \
+  --benchmark_out_format=json
+```
+
+Keep notes with the command, CPU pinning status, and JSON path when a result
+drives an implementation choice.

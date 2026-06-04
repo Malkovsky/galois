@@ -1,3 +1,6 @@
 [submodule "third_party/gf256"]
 	path = third_party/gf256
 	url = https://github.com/catid/gf256.git
+[submodule "agentic/cpp"]
+	path = agentic/cpp
+	url = https://github.com/Malkovsky/ai_for_cpp.git
