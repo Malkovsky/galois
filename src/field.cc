@@ -1,5 +1,4 @@
 #include "field.h"
-#include "gf256/gf256.h"
 
 #include <cstring>
 #include <immintrin.h>
@@ -30,6 +29,15 @@ static element_t log[256]; /* log_α(i) */
 /* 8x8 Matrices for multiplying on particular element */
 static uint64_t gfni_matrix[256];
 
+#if defined(__SSSE3__)
+static __m128i simd_table_lo[256];
+static __m128i simd_table_hi[256];
+#if defined(__AVX2__)
+__m256i simd256_table_lo[256];
+__m256i simd256_table_hi[256];
+#endif
+#endif
+
 void Init(void) {
   element_t x = 1;
 
@@ -48,6 +56,27 @@ void Init(void) {
       binary_table[256 * i + j] = Multiply(i, j);
     }
   }
+
+#if defined(__SSSE3__)
+  for (size_t z = 0; z < 256; ++z) {
+    alignas(16) element_t lo[16];
+    alignas(16) element_t hi[16];
+    const element_t *z_table = binary_table + 256 * z;
+    for (size_t nibble = 0; nibble < 16; ++nibble) {
+      lo[nibble] = z_table[nibble];
+      hi[nibble] = z_table[nibble << 4];
+    }
+
+    simd_table_lo[z] =
+        _mm_load_si128(reinterpret_cast<const __m128i *>(lo));
+    simd_table_hi[z] =
+        _mm_load_si128(reinterpret_cast<const __m128i *>(hi));
+#if defined(__AVX2__)
+    simd256_table_lo[z] = _mm256_broadcastsi128_si256(simd_table_lo[z]);
+    simd256_table_hi[z] = _mm256_broadcastsi128_si256(simd_table_hi[z]);
+#endif
+  }
+#endif
 }
 
 void InitGFNI(void) {
@@ -62,7 +91,7 @@ void InitGFNI(void) {
 
     for (size_t i = 0; i < 8; ++i) {
       for (size_t j = 0; j < 8; ++j) {
-        gfni_matrix[y] |= ((mt >> (8 * i + j)) & 1) << (8 * j + (7 - i));
+        gfni_matrix[y] |= ((mt >> (8 * i + j)) & 1) << (8 * (7 - j) + i);
       }
     }
   }
@@ -169,7 +198,45 @@ void AddScaledRowSIMD(element_t *x, const element_t *y, element_t z,
   if (z == 0) {
     return;
   }
-  gf256_muladd_mem(x, z, y, length);
+
+  size_t processed = 0;
+#if defined(__AVX2__)
+  const __m256i mask = _mm256_set1_epi8(0x0f);
+  const __m256i table_lo = simd256_table_lo[z];
+  const __m256i table_hi = simd256_table_hi[z];
+  while (processed + 32 <= length) {
+    const __m256i y_reg =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y + processed));
+    const __m256i lo = _mm256_shuffle_epi8(table_lo,
+                                           _mm256_and_si256(y_reg, mask));
+    const __m256i hi = _mm256_shuffle_epi8(
+        table_hi, _mm256_and_si256(_mm256_srli_epi64(y_reg, 4), mask));
+    const __m256i x_reg =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(x + processed));
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(x + processed),
+                        _mm256_xor_si256(x_reg, _mm256_xor_si256(lo, hi)));
+    processed += 32;
+  }
+#elif defined(__SSSE3__)
+  const __m128i mask = _mm_set1_epi8(0x0f);
+  const __m128i table_lo = simd_table_lo[z];
+  const __m128i table_hi = simd_table_hi[z];
+  while (processed + 16 <= length) {
+    const __m128i y_reg =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(y + processed));
+    const __m128i lo =
+        _mm_shuffle_epi8(table_lo, _mm_and_si128(y_reg, mask));
+    const __m128i hi = _mm_shuffle_epi8(
+        table_hi, _mm_and_si128(_mm_srli_epi64(y_reg, 4), mask));
+    const __m128i x_reg =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(x + processed));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(x + processed),
+                     _mm_xor_si128(x_reg, _mm_xor_si128(lo, hi)));
+    processed += 16;
+  }
+#endif
+
+  AddScaledRowBase(x + processed, y + processed, z, length - processed);
 }
 
 void AddScaledRowGFNIGeneral(element_t *x, const element_t *y, element_t z,
@@ -213,21 +280,6 @@ void AddScaledRowGFNIDedicated(element_t *x, const element_t *y, element_t z,
   }
 #endif
   AddScaledRowBase(x, y, z, length - processed);
-}
-
-void MatMul(
-    const element_t *left, const element_t *right, size_t m_i, size_t m_k,
-    size_t m_j,
-    std::function<void(element_t *, const element_t *, element_t, size_t)> fma,
-    element_t *result) {
-  std::memset(result, 0, m_i * m_j);
-  for (size_t i = 0; i < m_i; ++i) {
-    auto right_row = right;
-    for (size_t k = 0; k < m_k; ++k, left++, right_row += m_j) {
-      fma(result, right_row, *left, m_j);
-    }
-    result += m_j;
-  }
 }
 
 } // namespace gf_2_8

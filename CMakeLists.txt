@@ -18,6 +18,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(googlebenchmark)
 add_executable(benchmarks
     src/field.cc
+    src/matrix.cc
     third_party/gf256/gf256.cpp
     benchmarks/matrix_multiplication.cc)
 target_include_directories(benchmarks
@@ -36,6 +37,7 @@ add_test(
 
 add_executable(gf_unittests
     src/field.cc
+    src/matrix.cc
     third_party/gf256/gf256.cpp
     tests/field_tests.cc)
 target_include_directories(gf_unittests

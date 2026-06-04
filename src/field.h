@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 
 /**
  * GF(256) field implementation using polynomial representation
@@ -135,21 +134,6 @@ void AddScaledRowGFNIGeneral(element_t *x, const element_t *y, element_t z,
  */
 void AddScaledRowGFNIDedicated(element_t *x, const element_t *y, element_t z,
                                size_t length);
-
-/**
- * @brief baseline
- * @details
- * Performs textbook matrix multiplication with ikj loop order over
- * row-major matrices @p left and @p right of sizes m_i*m_k and m_k*m_j
- * respectively using @p fma to perform row scaling and addition, i.e.
- * fma(X, Y, z, length) should perform X += Y * z for X, Y vectors with length
- * elements and z being scalar. Multiplication result is put into @p result
- */
-void MatMul(
-    const element_t *left, const element_t *right, size_t m_i, size_t m_k,
-    size_t m_j,
-    std::function<void(element_t *, const element_t *, element_t, size_t)> fma,
-    element_t *result);
 
 } // namespace gf_2_8
 
