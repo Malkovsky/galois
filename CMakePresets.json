@@ -1,0 +1,60 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "Release",
+      "description": "Configure an optimized release build",
+      "binaryDir": "${sourceDir}/build/release-preset",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "benchmarks",
+      "displayName": "Native RS Benchmarks",
+      "description": "Configure concise and verbose RS benchmarks with native Leopard and XDRS baselines",
+      "binaryDir": "${sourceDir}/build/benchmarks-preset",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "GF256_BUILD_TESTS": "OFF",
+        "GF256_BUILD_BENCHMARKS": "ON",
+        "GF256_BUILD_REFERENCE_BENCHMARKS": "ON",
+        "GF256_ENABLE_NATIVE_ISA": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "displayName": "Build Release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "benchmarks",
+      "displayName": "Build Native RS Benchmarks",
+      "configurePreset": "benchmarks",
+      "targets": [
+        "rs_benchmarks",
+        "rs_verbose_benchmarks"
+      ]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "release",
+      "displayName": "Test Release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

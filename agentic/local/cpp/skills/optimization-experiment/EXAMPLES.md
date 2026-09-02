@@ -4,7 +4,7 @@ Use this overlay for GF(256) matrix and row-FMA experiments.
 
 ## Matrix Kernel Contract
 
-- Public matrix APIs live in `src/matrix.h`.
+- Public matrix APIs live in `include/matrix.h`.
 - Matrix implementations live in `src/matrix.cc`.
 - `src/field.*` should stay focused on field arithmetic and row FMA primitives.
 - Keep production callers on `MatMul`, `MatMulBlockedLUT`, or
@@ -23,12 +23,12 @@ cmake --build /tmp/gf256-linux --target gf_unittests benchmarks
 For SIMD gate changes, also compile representative fallback modes:
 
 ```bash
-g++ -std=c++20 -I src -I third_party -mno-gfni -mno-avx512f -mno-avx512bw -c src/field.cc -o /tmp/gf256-field-nogfni.o
-g++ -std=c++20 -I src -I third_party -mno-gfni -mno-avx512f -mno-avx512bw -c src/matrix.cc -o /tmp/gf256-matrix-nogfni.o
-g++ -std=c++20 -I src -I third_party -mno-avx2 -mssse3 -c src/field.cc -o /tmp/gf256-field-ssse3.o
-g++ -std=c++20 -I src -I third_party -mno-avx2 -mssse3 -c src/matrix.cc -o /tmp/gf256-matrix-ssse3.o
-g++ -std=c++20 -I src -I third_party -mno-avx2 -mno-ssse3 -c src/field.cc -o /tmp/gf256-field-scalar.o
-g++ -std=c++20 -I src -I third_party -mno-avx2 -mno-ssse3 -c src/matrix.cc -o /tmp/gf256-matrix-scalar.o
+g++ -std=c++20 -I include -I src -mno-gfni -mno-avx512f -mno-avx512bw -c src/field.cc -o /tmp/gf256-field-nogfni.o
+g++ -std=c++20 -I include -I src -mno-gfni -mno-avx512f -mno-avx512bw -c src/matrix.cc -o /tmp/gf256-matrix-nogfni.o
+g++ -std=c++20 -I include -I src -mno-avx2 -mssse3 -c src/field.cc -o /tmp/gf256-field-ssse3.o
+g++ -std=c++20 -I include -I src -mno-avx2 -mssse3 -c src/matrix.cc -o /tmp/gf256-matrix-ssse3.o
+g++ -std=c++20 -I include -I src -mno-avx2 -mno-ssse3 -c src/field.cc -o /tmp/gf256-field-scalar.o
+g++ -std=c++20 -I include -I src -mno-avx2 -mno-ssse3 -c src/matrix.cc -o /tmp/gf256-matrix-scalar.o
 ```
 
 ## Benchmark Loop
