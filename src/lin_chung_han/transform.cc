@@ -1,6 +1,6 @@
 #include <algorithm>
 
-#include "reed_solomon/lin_chung_han/transform_internal.h"
+#include "lin_chung_han/transform_internal.h"
 
 namespace gf2p8::lch {
 namespace {

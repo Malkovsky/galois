@@ -1,9 +1,9 @@
-#include "reed_solomon/lin_chung_han/kernels.h"
+#include "lin_chung_han/kernels.h"
 
-// GFNI realization of the Taylor-style LCH butterfly schedule. Fixed-factor
-// products use Cantor-coordinate affine matrices because GF2P8MULB is fixed to
-// the AES polynomial 0x11B rather than this field's standard 0x11D polynomial.
-
+/**
+ * GFNI realization of the Leopard-style LCH butterfly schedule using
+ * affine transform.
+ */
 #if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || \
     defined(_M_X64)
 #include <immintrin.h>

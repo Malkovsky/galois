@@ -162,7 +162,7 @@ void RegisterLeopardReferenceBenchmarks() {
            {"RS/Leopard/Native/DecodeMax", &NativeLeopardDecode},
        }}) {
     auto* registered = benchmark::RegisterBenchmark(name, function);
-    for (const auto& test_case : kLeopardComparisonCases) {
+    for (const auto& test_case : kNativeLeopardCases) {
       registered->Args(
           {test_case.data_count, test_case.recovery_count, test_case.bytes});
     }

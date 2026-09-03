@@ -49,3 +49,38 @@ taskset -c "${BENCH_CPU}" /tmp/gf256-linux/benchmarks \
 
 Keep notes with the command, CPU pinning status, and JSON path when a result
 drives an implementation choice.
+
+## Compute-Bound LCH Kernel Screen
+
+Preflight the pinned LLVM 18 tools and confirm the host CPU model before
+screening an AVX2 or GFNI kernel:
+
+```bash
+command -v clang++-18 llvm-mca-18 perf taskset
+clang++-18 --version
+llvm-mca-18 --version
+lscpu
+llvm-mca-18 -mcpu=help
+```
+
+Temporarily bracket only the candidate's steady-state loop with
+`asm volatile("# LLVM-MCA-BEGIN lch_kernel")` and
+`asm volatile("# LLVM-MCA-END lch_kernel")`. Remove these markers after the
+experiment. Generate assembly with the same native ISA policy as the benchmark
+build, inspect it for spills and code growth, then model the marked loop:
+
+```bash
+MCA_CPU=${MCA_CPU:-native}
+clang++-18 -std=c++20 -O3 -DNDEBUG -march=native \
+  -I include -I src -S src/lin_chung_han/kernels.cc \
+  -o /tmp/gf256_lch_kernels.s
+llvm-mca-18 -mcpu="${MCA_CPU}" --iterations=100 \
+  --bottleneck-analysis --resource-pressure --timeline \
+  /tmp/gf256_lch_kernels.s
+```
+
+Use this screen for compact compute-bound radix kernels. Skip it for full
+encode/decode orchestration, sparse data-dependent schedules, or rows dominated
+by shard memory traffic. Advance a candidate only after correctness, no
+unexplained spills or bloat, fixed-equal-work `perf stat`, and pinned
+`rs_verbose_benchmarks` timing.

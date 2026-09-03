@@ -3,8 +3,8 @@
 #include <cstddef>
 #include <span>
 
-#include "reed_solomon/lin_chung_han/kernels_internal.h"
-#include "reed_solomon/lin_chung_han/transform.h"
+#include "lin_chung_han/kernels_internal.h"
+#include "lin_chung_han/transform.h"
 
 namespace gf2p8::lch::detail {
 

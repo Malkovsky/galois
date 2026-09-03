@@ -197,14 +197,14 @@ void RegisterXDRSReferenceBenchmarks() {
   const auto register_operation = [](const char* name, bool decode) {
     auto* registered =
         benchmark::RegisterBenchmark(name, [decode](benchmark::State& state) {
-          const bool low_rate = XDRSLowRate(state.range(0));
+          const bool low_rate = NativeXDRSLowRate(state.range(0));
           if (decode) {
             NativeXDRSDecode(state, low_rate, 2);
           } else {
             NativeXDRSEncode(state, low_rate, 2);
           }
         });
-    for (const auto& test_case : kXDRSLogCases) {
+    for (const auto& test_case : kLCHComparisonCases) {
       registered->Args(
           {test_case.data_count, test_case.recovery_count, test_case.bytes});
     }

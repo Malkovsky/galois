@@ -10,3 +10,6 @@
 [submodule "third_party/xdrs"]
 	path = third_party/xdrs
 	url = https://github.com/fastecc/xdrs.git
+[submodule "third_party/isa-l"]
+	path = third_party/isa-l
+	url = https://github.com/intel/isa-l.git

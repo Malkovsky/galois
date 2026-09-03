@@ -2,6 +2,7 @@
 
 namespace gf256_benchmarks {
 
+void RegisterISALReferenceBenchmarks();
 void RegisterLeopardReferenceBenchmarks();
 void RegisterXDRSReferenceBenchmarks();
 

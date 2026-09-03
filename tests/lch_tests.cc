@@ -1,12 +1,16 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "reed_solomon/lin_chung_han/transform.h"
-#include "reed_solomon/lin_chung_han/transform_internal.h"
+#if defined(GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT)
+#include "lin_chung_han/experiment/gfni512_radix8.h"
+#endif
+#include "lin_chung_han/transform.h"
+#include "lin_chung_han/transform_internal.h"
 
 namespace {
 
@@ -18,6 +22,171 @@ using gf2p8::lch::IFFT;
 using gf2p8::lch::Radix;
 using gf2p8::lch::Status;
 using gf2p8::lch::TransformOptions;
+#if defined(GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT)
+using Radix8Kernels = gf2p8::lch::detail::experiment::radix8::Kernels;
+
+std::vector<Element*> Pointers(std::vector<std::vector<Element>>& shards);
+std::vector<const Element*> ConstPointers(
+    const std::vector<std::vector<Element>>& shards);
+
+void ScalarIFFTButterfly(Element& x, Element& y, Element coefficient) {
+  y ^= x;
+  x ^= gf2p8::MultiplyCantor(y, coefficient);
+}
+
+void ScalarIFFTRadix8(Element* x0,
+                      Element* x1,
+                      Element* x2,
+                      Element* x3,
+                      Element* x4,
+                      Element* x5,
+                      Element* x6,
+                      Element* x7,
+                      size_t byte_count,
+                      Element top,
+                      Element middle0,
+                      Element middle1,
+                      Element low0,
+                      Element low1,
+                      Element low2,
+                      Element low3,
+                      const gf2p8::MultiplicationTables&) {
+  for (size_t i = 0; i < byte_count; ++i) {
+    ScalarIFFTButterfly(x0[i], x1[i], low0);
+    ScalarIFFTButterfly(x2[i], x3[i], low1);
+    ScalarIFFTButterfly(x4[i], x5[i], low2);
+    ScalarIFFTButterfly(x6[i], x7[i], low3);
+    ScalarIFFTButterfly(x0[i], x2[i], middle0);
+    ScalarIFFTButterfly(x1[i], x3[i], middle0);
+    ScalarIFFTButterfly(x4[i], x6[i], middle1);
+    ScalarIFFTButterfly(x5[i], x7[i], middle1);
+    ScalarIFFTButterfly(x0[i], x4[i], top);
+    ScalarIFFTButterfly(x1[i], x5[i], top);
+    ScalarIFFTButterfly(x2[i], x6[i], top);
+    ScalarIFFTButterfly(x3[i], x7[i], top);
+  }
+}
+
+void ScalarIFFTRadix8Xor(const Element* x0,
+                         const Element* x1,
+                         const Element* x2,
+                         const Element* x3,
+                         const Element* x4,
+                         const Element* x5,
+                         const Element* x6,
+                         const Element* x7,
+                         Element* output0,
+                         Element* output1,
+                         Element* output2,
+                         Element* output3,
+                         Element* output4,
+                         Element* output5,
+                         Element* output6,
+                         Element* output7,
+                         size_t byte_count,
+                         Element top,
+                         Element middle0,
+                         Element middle1,
+                         Element low0,
+                         Element low1,
+                         Element low2,
+                         Element low3,
+                         const gf2p8::MultiplicationTables& tables) {
+  for (size_t i = 0; i < byte_count; ++i) {
+    std::array<Element, 8> values{x0[i], x1[i], x2[i], x3[i],
+                                  x4[i], x5[i], x6[i], x7[i]};
+    ScalarIFFTRadix8(&values[0], &values[1], &values[2], &values[3], &values[4],
+                     &values[5], &values[6], &values[7], 1, top, middle0,
+                     middle1, low0, low1, low2, low3, tables);
+    output0[i] ^= values[0];
+    output1[i] ^= values[1];
+    output2[i] ^= values[2];
+    output3[i] ^= values[3];
+    output4[i] ^= values[4];
+    output5[i] ^= values[5];
+    output6[i] ^= values[6];
+    output7[i] ^= values[7];
+  }
+}
+
+const Radix8Kernels kScalarRadix8Kernels{ScalarIFFTRadix8, ScalarIFFTRadix8Xor};
+
+struct Radix8Coefficients {
+  Element top;
+  Element middle0;
+  Element middle1;
+  Element low0;
+  Element low1;
+  Element low2;
+  Element low3;
+};
+
+Radix8Coefficients Coefficients(const Context& context,
+                                size_t level,
+                                size_t offset,
+                                size_t block,
+                                size_t distance) {
+  return {
+      context.Skew(level + 2, offset ^ block),
+      context.Skew(level + 1, offset ^ block),
+      context.Skew(level + 1, offset ^ (block + 4 * distance)),
+      context.Skew(level, offset ^ block),
+      context.Skew(level, offset ^ (block + 2 * distance)),
+      context.Skew(level, offset ^ (block + 4 * distance)),
+      context.Skew(level, offset ^ (block + 6 * distance)),
+  };
+}
+
+void RunRadix8Control(std::vector<std::vector<Element>>& shards,
+                      size_t byte_count,
+                      const Radix8Coefficients& coefficients,
+                      const gf2p8::lch::detail::ResolvedKernels& base,
+                      const gf2p8::MultiplicationTables& tables) {
+  auto pointers = Pointers(shards);
+  base.ifft_radix4(pointers[0], pointers[1], pointers[2], pointers[3],
+                   byte_count, coefficients.middle0, coefficients.low0,
+                   coefficients.low1, tables);
+  base.ifft_radix4(pointers[4], pointers[5], pointers[6], pointers[7],
+                   byte_count, coefficients.middle1, coefficients.low2,
+                   coefficients.low3, tables);
+  for (size_t i = 0; i < 4; ++i) {
+    base.ifft_radix2(pointers[i], pointers[i + 4], byte_count, coefficients.top,
+                     tables);
+  }
+}
+
+void RunRadix8Leaf(const Radix8Kernels& kernels,
+                   std::vector<std::vector<Element>>& shards,
+                   size_t byte_count,
+                   const Radix8Coefficients& coefficients,
+                   const gf2p8::MultiplicationTables& tables) {
+  auto pointers = Pointers(shards);
+  kernels.ifft_radix8(
+      pointers[0], pointers[1], pointers[2], pointers[3], pointers[4],
+      pointers[5], pointers[6], pointers[7], byte_count, coefficients.top,
+      coefficients.middle0, coefficients.middle1, coefficients.low0,
+      coefficients.low1, coefficients.low2, coefficients.low3, tables);
+}
+
+void RunRadix8XorLeaf(const Radix8Kernels& kernels,
+                      const std::vector<std::vector<Element>>& input,
+                      std::vector<std::vector<Element>>& output,
+                      size_t byte_count,
+                      const Radix8Coefficients& coefficients,
+                      const gf2p8::MultiplicationTables& tables) {
+  const auto input_pointers = ConstPointers(input);
+  auto output_pointers = Pointers(output);
+  kernels.ifft_radix8_xor(
+      input_pointers[0], input_pointers[1], input_pointers[2],
+      input_pointers[3], input_pointers[4], input_pointers[5],
+      input_pointers[6], input_pointers[7], output_pointers[0],
+      output_pointers[1], output_pointers[2], output_pointers[3],
+      output_pointers[4], output_pointers[5], output_pointers[6],
+      output_pointers[7], byte_count, coefficients.top, coefficients.middle0,
+      coefficients.middle1, coefficients.low0, coefficients.low1,
+      coefficients.low2, coefficients.low3, tables);
+}
+#endif
 
 Element Multiply11d(Element a, Element b) {
   Element result = 0;
@@ -407,6 +576,219 @@ TEST(LCHKernels, ResolvedTablesCoverEveryBackend) {
     EXPECT_EQ(avx2_tailed, nullptr);
   }
 }
+
+TEST(LCHKernels, TunedBackendUsesFinalByteThresholds) {
+  const Backend at_16 = gf2p8::lch::BackendAvailable(Backend::ssse3)
+                            ? Backend::ssse3
+                            : Backend::scalar;
+  const Backend at_32 =
+      gf2p8::lch::BackendAvailable(Backend::avx2) ? Backend::avx2 : at_16;
+  const Backend at_128 = gf2p8::lch::BackendAvailable(Backend::gfni256_affine)
+                             ? Backend::gfni256_affine
+                             : at_32;
+
+  EXPECT_EQ(gf2p8::lch::SelectBackend(0), Backend::scalar);
+  EXPECT_EQ(gf2p8::lch::SelectBackend(15), Backend::scalar);
+  EXPECT_EQ(gf2p8::lch::SelectBackend(16), at_16);
+  EXPECT_EQ(gf2p8::lch::SelectBackend(31), at_16);
+  EXPECT_EQ(gf2p8::lch::SelectBackend(32), at_32);
+  EXPECT_EQ(gf2p8::lch::SelectBackend(127), at_32);
+  EXPECT_EQ(gf2p8::lch::SelectBackend(128), at_128);
+  EXPECT_EQ(gf2p8::lch::SelectBackend(std::numeric_limits<size_t>::max()),
+            at_128);
+}
+
+#if defined(GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT)
+TEST(LCHRadix8Experiment, ResolverMatchesGFNI512Gate) {
+  const auto* kernels =
+      gf2p8::lch::detail::experiment::radix8::ResolveKernels();
+  EXPECT_EQ(kernels != nullptr,
+            gf2p8::lch::BackendAvailable(Backend::gfni512_affine));
+  if (kernels != nullptr) {
+    EXPECT_NE(kernels->ifft_radix8, nullptr);
+    EXPECT_NE(kernels->ifft_radix8_xor, nullptr);
+  }
+}
+
+TEST(LCHRadix8Experiment, LeafMatchesExactRadix4AndRadix2Decomposition) {
+  const Context& context = Context::Shared();
+  const auto& base =
+      *gf2p8::lch::detail::ResolveKernels(Backend::scalar, size_t{1});
+  std::vector<const Radix8Kernels*> candidates{&kScalarRadix8Kernels};
+  if (const auto* handwritten =
+          gf2p8::lch::detail::experiment::radix8::ResolveKernels()) {
+    candidates.push_back(handwritten);
+  }
+  std::mt19937 random(46);
+  for (const size_t length :
+       {size_t{0}, size_t{1}, size_t{63}, size_t{64}, size_t{65}, size_t{127},
+        size_t{128}, size_t{129}}) {
+    for (const size_t offset : {size_t{0}, size_t{8}}) {
+      const Radix8Coefficients coefficients =
+          Coefficients(context, 0, offset, 0, 1);
+      if (offset == 0) {
+        EXPECT_EQ(coefficients.low0, 0);
+        EXPECT_EQ(coefficients.middle0, 0);
+        EXPECT_EQ(coefficients.top, 0);
+      }
+      std::vector<std::vector<Element>> input(8, std::vector<Element>(length));
+      for (auto& shard : input) {
+        std::generate(shard.begin(), shard.end(),
+                      [&random] { return static_cast<Element>(random()); });
+      }
+      auto expected = input;
+      RunRadix8Control(expected, length, coefficients, base, context.Tables());
+
+      for (const Radix8Kernels* candidate : candidates) {
+        auto actual = input;
+        RunRadix8Leaf(*candidate, actual, length, coefficients,
+                      context.Tables());
+        EXPECT_EQ(actual, expected)
+            << "length=" << length << " offset=" << offset;
+
+        std::vector<std::vector<Element>> accumulator(
+            8, std::vector<Element>(length));
+        for (auto& shard : accumulator) {
+          std::generate(shard.begin(), shard.end(),
+                        [&random] { return static_cast<Element>(random()); });
+        }
+        auto expected_accumulator = accumulator;
+        for (size_t shard = 0; shard < 8; ++shard) {
+          for (size_t byte = 0; byte < length; ++byte) {
+            expected_accumulator[shard][byte] ^= expected[shard][byte];
+          }
+        }
+        const auto immutable_input = input;
+        RunRadix8XorLeaf(*candidate, input, accumulator, length, coefficients,
+                         context.Tables());
+        EXPECT_EQ(accumulator, expected_accumulator)
+            << "length=" << length << " offset=" << offset;
+        EXPECT_EQ(input, immutable_input);
+      }
+    }
+  }
+}
+
+TEST(LCHRadix8Experiment, FullSchedulerMatchesCurrentRadix4) {
+  const Context& context = Context::Shared();
+  const auto& base =
+      *gf2p8::lch::detail::ResolveKernels(Backend::scalar, size_t{65});
+  std::vector<const Radix8Kernels*> candidates{&kScalarRadix8Kernels};
+  const auto* handwritten =
+      gf2p8::lch::detail::experiment::radix8::ResolveKernels();
+  if (handwritten != nullptr) {
+    candidates.push_back(handwritten);
+  }
+  std::mt19937 random(47);
+  for (const size_t shard_count : {size_t{8}, size_t{16}, size_t{32},
+                                   size_t{64}, size_t{128}, size_t{256}}) {
+    for (size_t offset = 0; offset + shard_count <= Context::kFieldSize;
+         offset += shard_count) {
+      std::vector<std::vector<Element>> source(shard_count,
+                                               std::vector<Element>(65));
+      for (auto& shard : source) {
+        std::generate(shard.begin(), shard.end(),
+                      [&random] { return static_cast<Element>(random()); });
+      }
+      for (const size_t input_count : BoundaryCounts(shard_count)) {
+        auto padded = source;
+        for (size_t i = input_count; i < shard_count; ++i) {
+          std::fill(padded[i].begin(), padded[i].end(), 0);
+        }
+        auto expected = padded;
+        auto expected_pointers = Pointers(expected);
+        ASSERT_EQ(gf2p8::lch::detail::IFFTResolved(context, expected_pointers,
+                                                   65, offset, input_count,
+                                                   base, Radix::radix4),
+                  Status::ok);
+
+        for (const Radix8Kernels* candidate : candidates) {
+          const auto& candidate_base =
+              candidate == handwritten
+                  ? *gf2p8::lch::detail::ResolveKernels(Backend::gfni512_affine,
+                                                        size_t{65})
+                  : base;
+          auto in_place = padded;
+          auto in_place_pointers = Pointers(in_place);
+          ASSERT_EQ(gf2p8::lch::detail::experiment::radix8::IFFTResolved(
+                        context, in_place_pointers, 65, offset, input_count,
+                        candidate_base, *candidate),
+                    Status::ok);
+          EXPECT_EQ(in_place, expected)
+              << "N=" << shard_count << " offset=" << offset
+              << " input=" << input_count;
+
+          const auto immutable_source = source;
+          const auto source_pointers = ConstPointers(source);
+          auto work = source;
+          auto work_pointers = Pointers(work);
+          ASSERT_EQ(gf2p8::lch::detail::experiment::radix8::IFFTResolved(
+                        context,
+                        std::span<const Element* const>(source_pointers)
+                            .first(input_count),
+                        work_pointers, 65, offset, candidate_base, *candidate),
+                    Status::ok);
+          EXPECT_EQ(work, expected)
+              << "N=" << shard_count << " offset=" << offset
+              << " input=" << input_count;
+          EXPECT_EQ(source, immutable_source);
+
+          std::vector<std::vector<Element>> accumulator(
+              shard_count, std::vector<Element>(65));
+          for (auto& shard : accumulator) {
+            std::generate(shard.begin(), shard.end(),
+                          [&random] { return static_cast<Element>(random()); });
+          }
+          auto expected_accumulator = accumulator;
+          for (size_t shard = 0; shard < shard_count; ++shard) {
+            for (size_t byte = 0; byte < 65; ++byte) {
+              expected_accumulator[shard][byte] ^= expected[shard][byte];
+            }
+          }
+          work = source;
+          work_pointers = Pointers(work);
+          auto accumulator_pointers = Pointers(accumulator);
+          ASSERT_EQ(gf2p8::lch::detail::experiment::radix8::IFFTResolved(
+                        context,
+                        std::span<const Element* const>(source_pointers)
+                            .first(input_count),
+                        work_pointers, accumulator_pointers, 65, offset,
+                        candidate_base, *candidate),
+                    Status::ok);
+          EXPECT_EQ(accumulator, expected_accumulator)
+              << "N=" << shard_count << " offset=" << offset
+              << " input=" << input_count;
+          EXPECT_EQ(source, immutable_source);
+        }
+      }
+    }
+  }
+}
+
+TEST(LCHRadix8Experiment, ZeroBytesTouchNoPointers) {
+  const Context& context = Context::Shared();
+  const auto& base =
+      *gf2p8::lch::detail::ResolveKernels(Backend::scalar, size_t{0});
+  std::array<Element*, 8> null_work{};
+  std::array<Element*, 8> null_accumulator{};
+  std::array<const Element*, 8> null_input{};
+  EXPECT_EQ(gf2p8::lch::detail::experiment::radix8::IFFTResolved(
+                context, std::span<Element* const>(null_work), 0, 0, 8, base,
+                kScalarRadix8Kernels),
+            Status::ok);
+  EXPECT_EQ(gf2p8::lch::detail::experiment::radix8::IFFTResolved(
+                context, std::span<const Element* const>(null_input),
+                std::span<Element* const>(null_work), 0, 0, base,
+                kScalarRadix8Kernels),
+            Status::ok);
+  EXPECT_EQ(gf2p8::lch::detail::experiment::radix8::IFFTResolved(
+                context, std::span<const Element* const>(null_input),
+                std::span<Element* const>(null_work),
+                std::span<Element* const>(null_accumulator), 0, 0, base,
+                kScalarRadix8Kernels),
+            Status::ok);
+}
+#endif
 
 TEST(LCHKernels, CopyFirstPropagatesResolvedKernelFailure) {
   auto kernels =

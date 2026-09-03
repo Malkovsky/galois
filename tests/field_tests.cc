@@ -106,7 +106,7 @@ TEST(GF2P8, NativeCantorCoordinateMapsAndTables) {
 TEST(GF2P8, RowMulAdd) {
   std::mt19937 rng(42);
   constexpr size_t length = 1000;
-  std::array<gf2p8::Element, length> data, x, y, result, ref;
+  std::array<gf2p8::Element, length> data, x, y, ref;
   for (size_t i = 0; i < length; ++i) {
     for (size_t j = 0; j < length; ++j) {
       data[j] = rng();

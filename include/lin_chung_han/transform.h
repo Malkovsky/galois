@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <span>
 
-#include "reed_solomon/lin_chung_han/kernels.h"
+#include "lin_chung_han/kernels.h"
 
 namespace gf2p8::lch {
 

@@ -1,4 +1,4 @@
-#include "reed_solomon/lin_chung_han/kernels_internal.h"
+#include "lin_chung_han/kernels_internal.h"
 
 // The radix-2/radix-4 butterfly scheduling follows Christopher A. Taylor's
 // Leopard-RS kernels (BSD-3-Clause); this is an independent Cantor-coordinate,

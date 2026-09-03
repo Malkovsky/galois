@@ -19,7 +19,7 @@
     {
       "name": "benchmarks",
       "displayName": "Native RS Benchmarks",
-      "description": "Configure concise and verbose RS benchmarks with native Leopard and XDRS baselines",
+      "description": "Configure concise and verbose RS benchmarks with ISA-L, Leopard, and XDRS baselines",
       "binaryDir": "${sourceDir}/build/benchmarks-preset",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
@@ -28,6 +28,21 @@
         "GF256_BUILD_BENCHMARKS": "ON",
         "GF256_BUILD_REFERENCE_BENCHMARKS": "ON",
         "GF256_ENABLE_NATIVE_ISA": "ON"
+      }
+    },
+    {
+      "name": "gfni512-radix8-experiment",
+      "displayName": "GFNI512 Radix-8 Experiment",
+      "description": "Build and test the retained native GFNI512 radix-8 experiment",
+      "binaryDir": "${sourceDir}/build/gfni512-radix8-experiment-preset",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "GF256_BUILD_TESTS": "ON",
+        "GF256_BUILD_BENCHMARKS": "ON",
+        "GF256_BUILD_REFERENCE_BENCHMARKS": "OFF",
+        "GF256_ENABLE_NATIVE_ISA": "ON",
+        "GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT": "ON"
       }
     }
   ],
@@ -45,6 +60,16 @@
         "rs_benchmarks",
         "rs_verbose_benchmarks"
       ]
+    },
+    {
+      "name": "gfni512-radix8-experiment",
+      "displayName": "Build GFNI512 Radix-8 Experiment",
+      "configurePreset": "gfni512-radix8-experiment",
+      "targets": [
+        "gf_unittests",
+        "lch_rs_unittests",
+        "rs_verbose_benchmarks"
+      ]
     }
   ],
   "testPresets": [
@@ -52,6 +77,14 @@
       "name": "release",
       "displayName": "Test Release",
       "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "gfni512-radix8-experiment",
+      "displayName": "Test GFNI512 Radix-8 Experiment",
+      "configurePreset": "gfni512-radix8-experiment",
       "output": {
         "outputOnFailure": true
       }

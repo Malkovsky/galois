@@ -20,8 +20,8 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
   kernels.
 - Public RS APIs live under `include/reed_solomon`; implementations and private
   orchestration live under the mirrored `src/reed_solomon` tree.
-- LCH public APIs live under `include/reed_solomon/lin_chung_han`; private
-  dispatch and schedule declarations stay under `src/reed_solomon/lin_chung_han`.
+- LCH transform APIs live under `include/lin_chung_han`; private dispatch and
+  schedule declarations stay under `src/lin_chung_han`.
 - `benchmarks/matrix_multiplication.cc` owns Google Benchmark coverage.
 - `tests/field_tests.cc` owns current correctness tests.
 - `third_party/gf256` is a reference implementation; do not edit it unless the
@@ -32,10 +32,16 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
   tails, and no `Algorithm4` definition; isolate it behind benchmark adapters.
 - XDRS standalone builds need a forced `<cstring>` include; high-rate encode
   needs `2 * (256 - K)` parity buffers because its second half is scratch.
+- ISA-L reference rows use its full systematic Cauchy RS path; top-level decode
+  timing includes survivor selection, matrix inversion, table setup, and repair.
+- ISA-L's 32-byte `[low16][high16]` multiply-table ABI can consume Cantor
+  products repacked from shared shuffle-row offsets 0 and 32.
+- `third_party/isa-l` is benchmark-only and requires NASM on x86; its standard
+  Cauchy code is a performance reference, not owned-LCH codeword-compatible.
 - `gf2p8::Element` is basis-neutral byte storage; scalar field APIs explicitly
   distinguish standard polynomial coordinates from Cantor coordinates.
-- Owned LCH, matrix, Leopard, and XDRS code uses one immutable
-  Cantor-coordinate domain.
+- Owned transforms, matrices, and `rs::LCHEncoder`/`rs::LCHDecoder` use one
+  immutable Cantor-coordinate domain.
   Native XDRS remains polynomial-coordinate and is not codeword-compatible.
 - Native Cantor coordinates make XDRS derivative `B` scales identity, but its
   low-rate clear-and-XOR derivative still differs from Leopard's derivative.
@@ -61,12 +67,27 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
   through scalar-tail-capable entries costs roughly 2-4% retired instructions.
 - Full-prefix immutable AVX2/GFNI IFFT should fuse its source copy into the
   first radix layer; separate copy and fold passes dominate RS encode.
-- High-rate XDRS decode should fuse present/zero source-block IFFTs into the
+- Retained GFNI512 radix-8 work is private and opt-in: keep its resolver,
+  scheduler, encoder, and verbose rows under `experiment/`, outside
+  `gf256_core`, production dispatch, and public APIs.
+- Its handwritten leaves use affine Cantor products, exact scalar tails, and
+  must stay differential-tested against two radix-4 plus four radix-2 calls.
+- Treat non-Intel timings as local evidence; rerun the opt-in rows pinned on an
+  Intel GFNI/AVX-512 host before considering production promotion.
+- Final local selection keeps AVX2 for 32-127-byte rows and GFNI256 affine from
+  128 bytes; integrated tests did not justify promoting GFNI512 radix-8.
+- `rs::LCHEncoder` uses folded recovery-subspace encoding for `R<K` and a
+  shortened coefficient fan-out mother code for `R>=K`.
+- `rs::LCHDecoder` embeds arbitrary supported dimensions into a power-of-two
+  mother code, then dispatches exactly once to XDRS-derived low/high decoding.
+- Low-rate shortening uses `D=nextPow2(K)`, known-zero positions `[K,D)`, and
+  punctured recovery positions after `D+R`; its derivative runs over D shards.
+- High-rate decode should fuse present/zero source-block IFFTs into the
   companion accumulator and sparse-evaluate only blocks with missing data.
-- Leopard and high-rate XDRS encode share `rs::detail::EncodeLCH`; low-rate XDRS
-  remains a separate coefficient fan-out algorithm.
-- Concise owned/native RS rows share `benchmarks/rs_benchmark_cases.h`; XDRS
-  uses the full log grid while Leopard uses only its `R<=K` subset.
+- High-rate shortening uses `M=nextPow2(R)`, punctured recovery `[R,M)`, known
+  zero data `[M+K,N)`, and Algorithm 3 coefficients derived from padded `M,N`.
+- Concise owned/native RS rows share `benchmarks/rs_benchmark_cases.h`; owned
+  LCH and native XDRS use the full grid while native Leopard uses `R<=K` only.
 - Pinned XDRS decode timing shuffles exactly `N-K` erasures across the full
   codeword; top-level `DecodeMax` must use the shared equivalent workload.
 - The XDRS paper plots decode input throughput (`K * bytes / time`), not the
@@ -91,8 +112,9 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
 ## Common Checks
 
 ```bash
-cmake --build /tmp/gf256-linux --target gf_unittests benchmarks
+cmake --build /tmp/gf256-linux --target gf_unittests lch_rs_unittests benchmarks
 /tmp/gf256-linux/gf_unittests
+/tmp/gf256-linux/lch_rs_unittests
 ```
 
 Compile fallback checks when touching SIMD gates:
