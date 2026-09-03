@@ -10,7 +10,7 @@ code, it enables practical encoding and erasure decoding in
 $\mathcal{O}(n\log\min(k, n-k))$ time. A canonical implementation is
 [Leopard-RS](https://github.com/catid/leopard). This library provides:
 
-- XDRS-derived low- and high-rate LCH decoders.
+- [XDRS](https://github.com/fastecc/xdrs)-derived low- and high-rate LCH decoders.
 - Arbitrary positive data/recovery dimensions whose normalized power-of-two
   mother code fits 256 symbols.
 - Fine-tuned AVX2 and [GFNI](https://builders.intel.com/docs/networkbuilders/galois-field-new-instructions-gfni-technology-guide-1-1639042826.pdf) kernels.
