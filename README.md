@@ -4,8 +4,11 @@ Practical library for some common algorithms over $\mathbb{F}_{2^8}$.
 
 ## Lin-Chung-Han variant of Reed-Solomon codes
 
-[Lin-Chung-Han](https://arxiv.org/abs/1404.3458) transform is the basis for several practical algorithms
-in fields $\mathbb{F}_{2^m}$, most notably Reed-Solomon codes with the canonical implementation in [Leopard-RS](https://github.com/catid/leopard). We provide
+The [Lin-Chung-Han (LCH) transform](https://arxiv.org/abs/1404.3458) is an
+additive FFT-like transform over fields $\mathbb{F}_{2^m}$. For an $RS(n, k)$
+code, it enables practical encoding and erasure decoding in
+$\mathcal{O}(n\log\min(k, n-k))$ time. A canonical implementation is
+[Leopard-RS](https://github.com/catid/leopard). This library provides:
 
 - XDRS-derived low- and high-rate LCH decoders.
 - Arbitrary positive data/recovery dimensions whose normalized power-of-two
@@ -16,12 +19,11 @@ High-rate codewords use Leopard-compatible encoding.
 
 ### Benchmarks
 
-Comparison of $RS(256, k)$ code with common libraries
+Performance comparison of $RS(256, k)$ implementations:
 
 ![RS backend comparison](docs/images/rs_backend_comparison.svg)
 
 [Open the benchmark report on GitHub Pages](https://malkovsky.github.io/galois/).
-
 
 ## Build
 
