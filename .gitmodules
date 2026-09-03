@@ -4,3 +4,18 @@
 [submodule "agentic/cpp"]
 	path = agentic/cpp
 	url = https://github.com/Malkovsky/ai_for_cpp.git
+[submodule "third_party/leopard"]
+	path = third_party/leopard
+	url = https://github.com/catid/leopard.git
+[submodule "third_party/xdrs"]
+	path = third_party/xdrs
+	url = https://github.com/fastecc/xdrs.git
+[submodule "third_party/isa-l"]
+	path = third_party/isa-l
+	url = https://github.com/intel/isa-l.git
+[submodule "third_party/gf-complete"]
+	path = third_party/gf-complete
+	url = https://github.com/ceph/gf-complete.git
+[submodule "third_party/jerasure"]
+	path = third_party/jerasure
+	url = https://github.com/ceph/jerasure.git

@@ -14,18 +14,105 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
 
 ## Source Layout
 
-- `src/field.h` and `src/field.cc` own field operations and row FMA primitives.
-- `src/matrix.h` and `src/matrix.cc` own matrix multiplication APIs and kernels.
+- `include/field.h` and `src/field.cc` own field operations and row FMA
+  primitives.
+- `include/matrix.h` and `src/matrix.cc` own matrix multiplication APIs and
+  kernels.
+- Public RS APIs live under `include/reed_solomon`; implementations and private
+  orchestration live under the mirrored `src/reed_solomon` tree.
+- LCH transform APIs live under `include/lin_chung_han`; private dispatch and
+  schedule declarations stay under `src/lin_chung_han`.
 - `benchmarks/matrix_multiplication.cc` owns Google Benchmark coverage.
 - `tests/field_tests.cc` owns current correctness tests.
 - `third_party/gf256` is a reference implementation; do not edit it unless the
   task explicitly targets that submodule.
+- `third_party/gf256` emits SSSE3 intrinsics unconditionally; keep it out of
+  scalar-only core targets or compile it separately with SSSE3 enabled.
+- `third_party/xdrs` has global mutable setup, AVX2-only kernels with unsafe
+  tails, and no `Algorithm4` definition; isolate it behind benchmark adapters.
+- XDRS standalone builds need a forced `<cstring>` include; high-rate encode
+  needs `2 * (256 - K)` parity buffers because its second half is scratch.
+- ISA-L reference rows use its full systematic Cauchy RS path; top-level decode
+  timing includes survivor selection, matrix inversion, table setup, and repair.
+- ISA-L's 32-byte `[low16][high16]` multiply-table ABI can consume Cantor
+  products repacked from shared shuffle-row offsets 0 and 32.
+- `third_party/isa-l` is benchmark-only and requires NASM on x86; its standard
+  Cauchy code is a performance reference, not owned-LCH codeword-compatible.
+- `third_party/jerasure` and `third_party/gf-complete` are benchmark-only
+  direct static C builds. Their w=8 Vandermonde rows are standard-coordinate,
+  process-global, single-thread-only references; top-level DecodeMax times
+  decoding-matrix construction/inversion and missing-data repair.
+- The klauspost reference is a standalone Go runner under
+  `benchmarks/reference/klauspost`, not CGo. Keep v1.14.2 pinned, use one
+  goroutine with inversion caching disabled, and preserve the shared erasure
+  shuffle and `K * bytes` throughput normalization.
+- `gf2p8::Element` is basis-neutral byte storage; scalar field APIs explicitly
+  distinguish standard polynomial coordinates from Cantor coordinates.
+- Owned transforms, matrices, and `rs::LCHEncoder`/`rs::LCHDecoder` use one
+  immutable Cantor-coordinate domain.
+  Native XDRS remains polynomial-coordinate and is not codeword-compatible.
+- Native Cantor coordinates make XDRS derivative `B` scales identity, but its
+  low-rate clear-and-XOR derivative still differs from Leopard's derivative.
+- Field shuffle, affine, log, and exponent tables are compile-time-generated
+  once in `src/field.cc`; no production field initialization is required.
+- Leopard forms `FFTSkew - 1` sentinel pointers and triggers UBSan; sanitize the
+  safe XDRS adapter rows and verify Leopard adapters with output-checked smoke.
+- Leopard's speed depends on radix-4 fusion at every layer pair, truncated
+  transforms, fused encoder IFFT/XOR, and sparse decode FFT; leaf-only fusion
+  and full transforms lose most of the kernel-level GFNI gain.
+- Leopard decode should scale-copy each work shard once. Clearing all work and
+  then zeroing again inside multiply-copy adds a major full-shard memory pass.
+- Iterative LCH coefficients are indexed by group start: low uses
+  `Skew(level, offset ^ block)`, high uses `block + 2 * distance`, and top uses
+  the next level. Prefix/sparse schedules must execute whole dependency groups.
+- AVX2 LCH parity needs lane-duplicated 32-byte factor rows in `gf2p8::Tables`;
+  per-kernel broadcasts and multiplying zero skew factors cost several percent.
+- Validated RS loops should use resolved-backend scale/XOR internals; repeating
+  public backend checks across every shard or derivative batch is measurable.
+- Resolve ISA and byte-count kernel tables once per transform/RS operation;
+  repeating enum dispatch inside every butterfly measurably raises branches.
+- AVX2 rows divisible by 32 should use exact-vector radix entries; routing them
+  through scalar-tail-capable entries costs roughly 2-4% retired instructions.
+- Full-prefix immutable AVX2/GFNI IFFT should fuse its source copy into the
+  first radix layer; separate copy and fold passes dominate RS encode.
+- Retained GFNI512 radix-8 work is private and opt-in: keep its resolver,
+  scheduler, encoder, and verbose rows under `experiment/`, outside
+  `gf256_core`, production dispatch, and public APIs.
+- Its handwritten leaves use affine Cantor products, exact scalar tails, and
+  must stay differential-tested against two radix-4 plus four radix-2 calls.
+- Treat non-Intel timings as local evidence; rerun the opt-in rows pinned on an
+  Intel GFNI/AVX-512 host before considering production promotion.
+- Final local selection keeps AVX2 for 32-127-byte rows and GFNI256 affine from
+  128 bytes; integrated tests did not justify promoting GFNI512 radix-8.
+- `rs::LCHEncoder` uses folded recovery-subspace encoding for `R<K` and a
+  shortened coefficient fan-out mother code for `R>=K`.
+- `rs::LCHDecoder` embeds arbitrary supported dimensions into a power-of-two
+  mother code, then dispatches exactly once to XDRS-derived low/high decoding.
+- Low-rate shortening uses `D=nextPow2(K)`, known-zero positions `[K,D)`, and
+  punctured recovery positions after `D+R`; its derivative runs over D shards.
+- High-rate decode should fuse present/zero source-block IFFTs into the
+  companion accumulator and sparse-evaluate only blocks with missing data.
+- High-rate shortening uses `M=nextPow2(R)`, punctured recovery `[R,M)`, known
+  zero data `[M+K,N)`, and Algorithm 3 coefficients derived from padded `M,N`.
+- Concise owned/native RS rows share `benchmarks/rs_benchmark_cases.h`; owned
+  LCH and native XDRS use the full grid while native Leopard uses `R<=K` only.
+- Pinned XDRS decode timing shuffles exactly `N-K` erasures across the full
+  codeword; top-level `DecodeMax` must use the shared equivalent workload.
+- The XDRS paper plots decode input throughput (`K * bytes / time`), not the
+  artifact's separate recovered-output metric (`K * (N-K) / N`).
+- The XDRS paper's Leopard comparison harness is absent from the released XDRS
+  artifact; do not treat its plotted Leopard series as source-reproducible.
+- Combined report legends name the owned implementations `LCH+AVX2` and
+  `LCH+GFNI`; external library names identify standard-coordinate references.
 
 ## Matrix/GF(256) Guidance
 
 - Keep exact GF(256) semantics: field addition is XOR, not integer addition.
 - For lookup-table SIMD paths, use the low/high-nibble `pshufb` decomposition:
   `product = table_lo[a][b & 0x0f] ^ table_hi[a][b >> 4]`.
+- Native Cantor-coordinate GFNI uses generated fixed-factor affine matrices;
+  direct `GF2P8MULB` uses AES polynomial `0x11B`, not standard `0x11D` or
+  Cantor coordinates.
 - GFNI paths must have correct non-GFNI fallbacks.
 - Remove or isolate slow experimental variants before committing production
   kernels.
@@ -35,17 +122,18 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
 ## Common Checks
 
 ```bash
-cmake --build /tmp/gf256-linux --target gf_unittests benchmarks
+cmake --build /tmp/gf256-linux --target gf_unittests lch_rs_unittests benchmarks
 /tmp/gf256-linux/gf_unittests
+/tmp/gf256-linux/lch_rs_unittests
 ```
 
 Compile fallback checks when touching SIMD gates:
 
 ```bash
-g++ -std=c++20 -I src -I third_party -mno-gfni -mno-avx512f -mno-avx512bw -c src/field.cc -o /tmp/gf256-field-nogfni.o
-g++ -std=c++20 -I src -I third_party -mno-gfni -mno-avx512f -mno-avx512bw -c src/matrix.cc -o /tmp/gf256-matrix-nogfni.o
-g++ -std=c++20 -I src -I third_party -mno-avx2 -mssse3 -c src/field.cc -o /tmp/gf256-field-ssse3.o
-g++ -std=c++20 -I src -I third_party -mno-avx2 -mssse3 -c src/matrix.cc -o /tmp/gf256-matrix-ssse3.o
-g++ -std=c++20 -I src -I third_party -mno-avx2 -mno-ssse3 -c src/field.cc -o /tmp/gf256-field-scalar.o
-g++ -std=c++20 -I src -I third_party -mno-avx2 -mno-ssse3 -c src/matrix.cc -o /tmp/gf256-matrix-scalar.o
+g++ -std=c++20 -I include -I src -mno-gfni -mno-avx512f -mno-avx512bw -c src/field.cc -o /tmp/gf256-field-nogfni.o
+g++ -std=c++20 -I include -I src -mno-gfni -mno-avx512f -mno-avx512bw -c src/matrix.cc -o /tmp/gf256-matrix-nogfni.o
+g++ -std=c++20 -I include -I src -mno-avx2 -mssse3 -c src/field.cc -o /tmp/gf256-field-ssse3.o
+g++ -std=c++20 -I include -I src -mno-avx2 -mssse3 -c src/matrix.cc -o /tmp/gf256-matrix-ssse3.o
+g++ -std=c++20 -I include -I src -mno-avx2 -mno-ssse3 -c src/field.cc -o /tmp/gf256-field-scalar.o
+g++ -std=c++20 -I include -I src -mno-avx2 -mno-ssse3 -c src/matrix.cc -o /tmp/gf256-matrix-scalar.o
 ```

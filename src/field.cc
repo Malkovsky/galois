@@ -1,321 +1,253 @@
 #include "field.h"
 
-#include <cstring>
 #include <immintrin.h>
 
-namespace gf_2_8 {
+namespace gf2p8 {
+namespace {
 
-/**
- * Irreducible polynomial defining the field, compatible with VAES/GFNI
- */
-const element_t irreducible_poly = 0x1b; // x^4+x^3+x+1
+template <typename MultiplyFunction>
+consteval LogarithmTables MakeLogarithmTables(Element primitive,
+                                              MultiplyFunction multiply) {
+  LogarithmTables tables;
+  tables.logarithm.fill(255);
+  tables.exponent[0] = 1;
+  for (size_t i = 1; i < 255; ++i) {
+    tables.exponent[i] = multiply(tables.exponent[i - 1], primitive);
+  }
+  tables.exponent[255] = 1;
+  for (size_t i = 0; i < 255; ++i) {
+    tables.logarithm[tables.exponent[i]] = static_cast<Element>(i);
+  }
+  return tables;
+}
 
-/**
- * Primitive element α used in the operations. Note that for
- * irreducible polynomial 0x1b the minimum primitive element is
- * x + 1, i.e. `3` in binary.
- */
-const element_t primitive_element = 3; // x
-
-/**
- * Binary multiplication tables
- */
-static element_t binary_table[256 * 256];
-
-/* GF(256) tables */
-static element_t exp[256]; /* α^i */
-static element_t log[256]; /* log_α(i) */
-
-/* 8x8 Matrices for multiplying on particular element */
-static uint64_t gfni_matrix[256];
-
-#if defined(__SSSE3__)
-static __m128i simd_table_lo[256];
-static __m128i simd_table_hi[256];
-#if defined(__AVX2__)
-__m256i simd256_table_lo[256];
-__m256i simd256_table_hi[256];
-#endif
-#endif
-
-void Init(void) {
-  element_t x = 1;
-
-  /* Generate exponential table and logarithm table */
-  for (size_t i = 0; i < 255; i++) {
-    exp[i] = x;
-    log[x] = i;
-
-    x = Multiply(x, primitive_element);
+consteval uint64_t AffineMatrix(Element coefficient) {
+  uint64_t columns = 0;
+  for (size_t bit = 0; bit < 8; ++bit) {
+    columns |= static_cast<uint64_t>(detail::MultiplyCantorDirect(
+                   coefficient, static_cast<Element>(1U << bit)))
+               << (8 * bit);
   }
 
-  exp[255] = 1;
-
-  for (size_t i = 0; i < 256; ++i) {
-    for (size_t j = 0; j < 256; ++j) {
-      binary_table[256 * i + j] = Multiply(i, j);
+  uint64_t matrix = 0;
+  for (size_t row = 0; row < 8; ++row) {
+    for (size_t column = 0; column < 8; ++column) {
+      const uint64_t bit = (columns >> (8 * column + row)) & 1U;
+      matrix |= bit << (8 * (7 - row) + column);
     }
   }
+  return matrix;
+}
 
-#if defined(__SSSE3__)
-  for (size_t z = 0; z < 256; ++z) {
-    alignas(16) element_t lo[16];
-    alignas(16) element_t hi[16];
-    const element_t *z_table = binary_table + 256 * z;
+consteval MultiplicationTables MakeTables() {
+  MultiplicationTables tables;
+  tables.standard = MakeLogarithmTables(2, [](Element a, Element b) {
+    return detail::MultiplyStandardDirect(a, b);
+  });
+  tables.cantor = MakeLogarithmTables(
+      StandardToCantor(2),
+      [](Element a, Element b) { return detail::MultiplyCantorDirect(a, b); });
+
+  for (size_t coefficient = 0; coefficient < 256; ++coefficient) {
     for (size_t nibble = 0; nibble < 16; ++nibble) {
-      lo[nibble] = z_table[nibble];
-      hi[nibble] = z_table[nibble << 4];
+      const Element low = detail::MultiplyCantorDirect(
+          static_cast<Element>(coefficient), static_cast<Element>(nibble));
+      const Element high = detail::MultiplyCantorDirect(
+          static_cast<Element>(coefficient), static_cast<Element>(nibble << 4));
+      tables.shuffle[coefficient][nibble] = low;
+      tables.shuffle[coefficient][16 + nibble] = low;
+      tables.shuffle[coefficient][32 + nibble] = high;
+      tables.shuffle[coefficient][48 + nibble] = high;
     }
-
-    simd_table_lo[z] =
-        _mm_load_si128(reinterpret_cast<const __m128i *>(lo));
-    simd_table_hi[z] =
-        _mm_load_si128(reinterpret_cast<const __m128i *>(hi));
-#if defined(__AVX2__)
-    simd256_table_lo[z] = _mm256_broadcastsi128_si256(simd_table_lo[z]);
-    simd256_table_hi[z] = _mm256_broadcastsi128_si256(simd_table_hi[z]);
-#endif
+    tables.affine[coefficient] =
+        AffineMatrix(static_cast<Element>(coefficient));
   }
-#endif
+  return tables;
 }
 
-void InitGFNI(void) {
-  for (int16_t y = 0; y < 256; ++y) {
-    uint64_t mt = 0;
-    element_t row = y;
-    for (size_t i = 0, shift = 0; i < 8; ++i, shift += 8) {
-      mt |= ((uint64_t)row << shift);
-      row = (row << 1) ^ ((row >> 7) * irreducible_poly);
-    }
-    gfni_matrix[y] = 0;
+alignas(32) constinit const MultiplicationTables kTables = MakeTables();
 
-    for (size_t i = 0; i < 8; ++i) {
-      for (size_t j = 0; j < 8; ++j) {
-        gfni_matrix[y] |= ((mt >> (8 * i + j)) & 1) << (8 * (7 - j) + i);
-      }
-    }
-  }
+Element Product(const Element* row, Element value) {
+  return row[value & 0x0f] ^ row[32 + (value >> 4)];
 }
 
-element_t Zero() { return 0; }
-
-element_t One() { return 1; }
-
-element_t Add(element_t a, element_t b) {
-  /* Addition in GF(256) is just XOR */
-  return a ^ b;
-}
-
-element_t Sub(element_t a, element_t b) {
-  /* Subtraction is the same as addition in GF(256) */
-  return Add(a, b);
-}
-
-element_t MultiplyLUT(element_t a, element_t b) {
-  /* Handle special case of multiplication by 0 */
-  if (a == 0 || b == 0)
+Element MultiplyWithLogs(Element a, Element b, const LogarithmTables& tables) {
+  if (a == 0 || b == 0) {
     return 0;
-  auto p = log[a] + log[b];
-  // These manipulations substracts 255 when p > 255
-  return exp[(p & 255) + (p >> 8)];
-}
-
-element_t Multiply(element_t a, element_t b) {
-  element_t result = 0;
-  while (a) {
-    result ^= b * (a & 1);
-    a >>= 1;
-    // b << 1 is polynomial multiplication by x
-    // (b >> 7) checks whether b is polynomial of degree 7
-    // ^ (irreducible_poly * (b >> 7)) does polynomial mod
-    // that case
-    b = (b << 1) ^ (irreducible_poly * (b >> 7));
   }
-  return result;
+  const unsigned sum = tables.logarithm[a] + tables.logarithm[b];
+  return tables.exponent[sum >= 255 ? sum - 255 : sum];
 }
 
-// TODO: implement properly for testing/demo purpose
-// element_t MultiplyGFNI(element_t a, element_t b) {
-//     uint64_t x = 0x0101010101010101ULL * b & gfni_matrix[a];
-//     x ^= x >> 4;
-//     x ^= x >> 2;
-//     x ^= x >> 1;
-//     x &= 0x0101010101010101ULL;
-//     return (uint8_t)((x * 0x0102040810204080ULL) >> 56);
-// }
-
-element_t Div(element_t a, element_t b) {
+Element DivWithLogs(Element a, Element b, const LogarithmTables& tables) {
   if (a == 0) {
-    return 0; /* 0 / b = 0 */
+    return 0;
   }
-
-  /* a / b = a * b^(-1) = α^(log(a) - log(b)) */
-  int log_diff = log[a] - log[b];
+  int log_diff = tables.logarithm[a] - tables.logarithm[b];
   if (log_diff < 0) {
     log_diff += 255;
   }
-
-  return exp[log_diff];
+  return tables.exponent[log_diff];
 }
 
-element_t Inv(element_t a) {
+Element InvWithLogs(Element a, const LogarithmTables& tables) {
   if (a == 0) {
     return 0;
   }
-  /* a^(-1) = α^(255 - log(a)) */
-  return exp[255 - log[a]];
+  return tables.exponent[255 - tables.logarithm[a]];
 }
 
-element_t Pow(element_t a, int n) {
+Element PowWithLogs(Element a, int n, const LogarithmTables& tables) {
   if (a == 0) {
-    return (n == 0) ? 1 : 0; /* 0^0 = 1, 0^n = 0 for n > 0 */
+    return n == 0 ? 1 : 0;
   }
 
-  /* If n is negative, we compute the inverse raised to |n| */
-  if (n < 0) {
-    a = Inv(a);
-    n = -n;
+  int64_t exponent = n;
+  if (exponent < 0) {
+    a = InvWithLogs(a, tables);
+    exponent = -exponent;
   }
-
-  /* a^n = α^(log(a) * n mod 255) */
-  int log_res = (log[a] * n) % 255;
-  return exp[log_res];
+  const auto index =
+      static_cast<size_t>((static_cast<uint64_t>(tables.logarithm[a]) *
+                           static_cast<uint64_t>(exponent)) %
+                          255);
+  return tables.exponent[index];
 }
 
-void AddScaledRowBase(element_t *x, const element_t *y, element_t z,
-                      size_t length) {
-  if (z == 0) {
-    return;
-  }
-  element_t *z_table = binary_table + 256 * z;
-  for (size_t i = 0; i < length; ++i) {
-    x[i] ^= z_table[y[i]];
-  }
+}  // namespace
+
+const MultiplicationTables& Tables() {
+  return kTables;
 }
 
-void AddScaledRowSIMD(element_t *x, const element_t *y, element_t z,
-                      size_t length) {
-  if (z == 0) {
+Element MultiplyStandard(Element a, Element b) {
+  return MultiplyWithLogs(a, b, Tables().standard);
+}
+
+Element MultiplyCantor(Element a, Element b) {
+  return MultiplyWithLogs(a, b, Tables().cantor);
+}
+
+Element DivStandard(Element a, Element b) {
+  return DivWithLogs(a, b, Tables().standard);
+}
+
+Element DivCantor(Element a, Element b) {
+  return DivWithLogs(a, b, Tables().cantor);
+}
+
+Element InvStandard(Element a) {
+  return InvWithLogs(a, Tables().standard);
+}
+
+Element InvCantor(Element a) {
+  return InvWithLogs(a, Tables().cantor);
+}
+
+Element PowStandard(Element a, int n) {
+  return PowWithLogs(a, n, Tables().standard);
+}
+
+Element PowCantor(Element a, int n) {
+  return PowWithLogs(a, n, Tables().cantor);
+}
+
+void AddScaledRow(Element* destination,
+                  const Element* source,
+                  Element coefficient,
+                  size_t length) {
+  if (coefficient == 0) {
     return;
   }
-
+  const Element* const row = Tables().shuffle[coefficient].data();
   size_t processed = 0;
 #if defined(__AVX2__)
   const __m256i mask = _mm256_set1_epi8(0x0f);
-  const __m256i table_lo = simd256_table_lo[z];
-  const __m256i table_hi = simd256_table_hi[z];
+  const __m256i table_lo =
+      _mm256_load_si256(reinterpret_cast<const __m256i*>(row));
+  const __m256i table_hi =
+      _mm256_load_si256(reinterpret_cast<const __m256i*>(row + 32));
   while (processed + 32 <= length) {
-    const __m256i y_reg =
-        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y + processed));
-    const __m256i lo = _mm256_shuffle_epi8(table_lo,
-                                           _mm256_and_si256(y_reg, mask));
+    const __m256i source_vector = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(source + processed));
+    const __m256i lo =
+        _mm256_shuffle_epi8(table_lo, _mm256_and_si256(source_vector, mask));
     const __m256i hi = _mm256_shuffle_epi8(
-        table_hi, _mm256_and_si256(_mm256_srli_epi64(y_reg, 4), mask));
-    const __m256i x_reg =
-        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(x + processed));
-    _mm256_storeu_si256(reinterpret_cast<__m256i *>(x + processed),
-                        _mm256_xor_si256(x_reg, _mm256_xor_si256(lo, hi)));
+        table_hi, _mm256_and_si256(_mm256_srli_epi64(source_vector, 4), mask));
+    const __m256i destination_vector = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(destination + processed));
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(destination + processed),
+        _mm256_xor_si256(destination_vector, _mm256_xor_si256(lo, hi)));
     processed += 32;
   }
 #elif defined(__SSSE3__)
   const __m128i mask = _mm_set1_epi8(0x0f);
-  const __m128i table_lo = simd_table_lo[z];
-  const __m128i table_hi = simd_table_hi[z];
+  const __m128i table_lo =
+      _mm_load_si128(reinterpret_cast<const __m128i*>(row));
+  const __m128i table_hi =
+      _mm_load_si128(reinterpret_cast<const __m128i*>(row + 32));
   while (processed + 16 <= length) {
-    const __m128i y_reg =
-        _mm_loadu_si128(reinterpret_cast<const __m128i *>(y + processed));
+    const __m128i source_vector =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(source + processed));
     const __m128i lo =
-        _mm_shuffle_epi8(table_lo, _mm_and_si128(y_reg, mask));
+        _mm_shuffle_epi8(table_lo, _mm_and_si128(source_vector, mask));
     const __m128i hi = _mm_shuffle_epi8(
-        table_hi, _mm_and_si128(_mm_srli_epi64(y_reg, 4), mask));
-    const __m128i x_reg =
-        _mm_loadu_si128(reinterpret_cast<const __m128i *>(x + processed));
-    _mm_storeu_si128(reinterpret_cast<__m128i *>(x + processed),
-                     _mm_xor_si128(x_reg, _mm_xor_si128(lo, hi)));
+        table_hi, _mm_and_si128(_mm_srli_epi64(source_vector, 4), mask));
+    const __m128i destination_vector = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(destination + processed));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(destination + processed),
+                     _mm_xor_si128(destination_vector, _mm_xor_si128(lo, hi)));
     processed += 16;
   }
 #endif
-
-  AddScaledRowBase(x + processed, y + processed, z, length - processed);
+  for (; processed < length; ++processed) {
+    destination[processed] ^= Product(row, source[processed]);
+  }
 }
 
-void AddScaledRowGFNIGeneral(element_t *x, const element_t *y, element_t z,
-                             size_t length) {
-  if (z == 0) {
-    return;
-  }
-  size_t processed = 0;
-#if defined(__GFNI__) and defined(__AVX512F__)
-  __m512i z_matrix = _mm512_set1_epi64(gfni_matrix[z]);
-  while (processed + 64 <= length) {
-    auto x_reg = _mm512_loadu_epi8(x);
-    auto y_reg = _mm512_loadu_epi8(y);
-    x_reg = _mm512_xor_epi64(x_reg,
-                             _mm512_gf2p8affine_epi64_epi8(y_reg, z_matrix, 0));
-    _mm512_storeu_epi8(x, x_reg);
-    x += 64;
-    y += 64;
-    processed += 64;
-  }
-#endif
-  AddScaledRowBase(x, y, z, length - processed);
+}  // namespace gf2p8
+
+namespace gf2p16 {
+
+constexpr gf2p8::Element delta = 0xf0;
+
+Element Zero() {
+  return 0;
 }
 
-void AddScaledRowGFNIDedicated(element_t *x, const element_t *y, element_t z,
-                               size_t length) {
-  if (z == 0) {
-    return;
-  }
-  size_t processed = 0;
-#if defined(__GFNI__) and defined(__AVX512F__)
-  __m512i z_reg = _mm512_set1_epi8(z);
-  while (processed + 64 <= length) {
-    auto x_reg = _mm512_loadu_epi8(x);
-    auto y_reg = _mm512_loadu_epi8(y);
-    x_reg = _mm512_xor_epi64(x_reg, _mm512_gf2p8mul_epi8(y_reg, z_reg));
-    _mm512_storeu_epi8(x, x_reg);
-    x += 64;
-    y += 64;
-    processed += 64;
-  }
-#endif
-  AddScaledRowBase(x, y, z, length - processed);
+Element One() {
+  return 1;
 }
 
-} // namespace gf_2_8
+Element Add(Element a, Element b) {
+  return a ^ b;
+}
 
-namespace gf_2_16 {
+Element Sub(Element a, Element b) {
+  return a ^ b;
+}
 
-gf_2_8::element_t delta = 0x20;
-
-element_t Zero() { return 0; }
-
-element_t One() { return 1; }
-
-element_t Add(element_t a, element_t b) { return a ^ b; }
-
-element_t Sub(element_t a, element_t b) { return a ^ b; }
-
-element_t Multiply(element_t a, element_t b) {
+Element Multiply(Element a, Element b) {
   // a = a_0 + a_1x, b = b_0 + b_1x
   // all four are from GF(256)
-  gf_2_8::element_t a_0 = a & 255;
-  gf_2_8::element_t a_1 = a >> 8;
-  gf_2_8::element_t b_0 = b & 255;
-  gf_2_8::element_t b_1 = b >> 8;
+  gf2p8::Element a_0 = a & 255;
+  gf2p8::Element a_1 = a >> 8;
+  gf2p8::Element b_0 = b & 255;
+  gf2p8::Element b_1 = b >> 8;
 
-  auto t = gf_2_8::MultiplyLUT(a_1, b_1);
-  auto low_bits =
-      gf_2_8::Add(gf_2_8::MultiplyLUT(a_0, b_0), gf_2_8::MultiplyLUT(t, delta));
-  auto high_bits = gf_2_8::Add(
-      gf_2_8::Add(gf_2_8::MultiplyLUT(a_0, b_1), gf_2_8::MultiplyLUT(a_1, b_0)),
-      t);
+  auto t = gf2p8::MultiplyCantor(a_1, b_1);
+  auto low_bits = gf2p8::Add(gf2p8::MultiplyCantor(a_0, b_0),
+                             gf2p8::MultiplyCantor(t, delta));
+  auto high_bits = gf2p8::Add(gf2p8::Add(gf2p8::MultiplyCantor(a_0, b_1),
+                                         gf2p8::MultiplyCantor(a_1, b_0)),
+                              t);
   return low_bits + (high_bits << 8);
 }
 
-element_t Inv(element_t a) {
-  element_t result = One();
-  element_t b = Multiply(a, a);
+Element Inv(Element a) {
+  Element result = One();
+  Element b = Multiply(a, a);
   for (size_t i = 1; i < 16; ++i) {
     result = Multiply(result, b);
     b = Multiply(b, b);
@@ -323,10 +255,12 @@ element_t Inv(element_t a) {
   return result;
 }
 
-element_t Div(element_t a, element_t b) { return Multiply(a, Inv(b)); }
+Element Div(Element a, Element b) {
+  return Multiply(a, Inv(b));
+}
 
-element_t Pow(element_t a, size_t n) {
-  element_t result = One();
+Element Pow(Element a, size_t n) {
+  Element result = One();
   while (n) {
     if (n & 1) {
       result = Multiply(result, a);
@@ -337,13 +271,13 @@ element_t Pow(element_t a, size_t n) {
   return result;
 }
 
-element_t InvIT(element_t a) {
-  element_t a_r = a;
+Element InvIT(Element a) {
+  Element a_r = a;
   for (size_t i = 0; i < 8; ++i) {
     a_r = Multiply(a_r, a_r);
   }
-  gf_2_8::element_t a_r1 = Multiply(a_r, a);
-  return Multiply(a_r, gf_2_8::Inv(a_r1));
+  gf2p8::Element a_r1 = Multiply(a_r, a);
+  return Multiply(a_r, gf2p8::InvCantor(a_r1));
 }
 
-} // namespace gf_2_16
+}  // namespace gf2p16

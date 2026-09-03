@@ -1,0 +1,93 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "Release",
+      "description": "Configure an optimized release build",
+      "binaryDir": "${sourceDir}/build/release-preset",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "benchmarks",
+      "displayName": "Native RS Benchmarks",
+      "description": "Configure RS benchmarks with native ISA-L, Leopard, XDRS, Jerasure, and optional klauspost references",
+      "binaryDir": "${sourceDir}/build/benchmarks-preset",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "GF256_BUILD_TESTS": "OFF",
+        "GF256_BUILD_BENCHMARKS": "ON",
+        "GF256_BUILD_REFERENCE_BENCHMARKS": "ON",
+        "GF256_ENABLE_NATIVE_ISA": "ON"
+      }
+    },
+    {
+      "name": "gfni512-radix8-experiment",
+      "displayName": "GFNI512 Radix-8 Experiment",
+      "description": "Build and test the retained native GFNI512 radix-8 experiment",
+      "binaryDir": "${sourceDir}/build/gfni512-radix8-experiment-preset",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "GF256_BUILD_TESTS": "ON",
+        "GF256_BUILD_BENCHMARKS": "ON",
+        "GF256_BUILD_REFERENCE_BENCHMARKS": "OFF",
+        "GF256_ENABLE_NATIVE_ISA": "ON",
+        "GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "displayName": "Build Release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "benchmarks",
+      "displayName": "Build Native RS Benchmarks",
+      "configurePreset": "benchmarks",
+      "targets": [
+        "rs_benchmarks",
+        "rs_verbose_benchmarks"
+      ]
+    },
+    {
+      "name": "gfni512-radix8-experiment",
+      "displayName": "Build GFNI512 Radix-8 Experiment",
+      "configurePreset": "gfni512-radix8-experiment",
+      "targets": [
+        "gf_unittests",
+        "lch_rs_unittests",
+        "rs_verbose_benchmarks"
+      ]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "release",
+      "displayName": "Test Release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "gfni512-radix8-experiment",
+      "displayName": "Test GFNI512 Radix-8 Experiment",
+      "configurePreset": "gfni512-radix8-experiment",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
