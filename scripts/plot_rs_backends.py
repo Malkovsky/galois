@@ -2,8 +2,8 @@
 """Generate the LCH and external RS backend comparison report graphs.
 
 The combined report accepts matched C++ and Go JSON inputs and labels the owned
-implementations LCH+AVX2 and LCH+GFNI. The focused XDRS and GFNI-width reports
-retain their separate matched inputs so system-load windows are not mixed.
+implementations LCH+AVX2 and LCH+GFNI. The GFNI-width report retains its separate
+matched input so system-load windows are not mixed.
 """
 
 import argparse
@@ -266,12 +266,6 @@ def make_figure(title):
 def save_figure(figure, output_dir, stem):
     metadata = {"Creator": "scripts/plot_rs_backends.py", "Date": None}
     figure.savefig(
-        output_dir / f"{stem}.png",
-        dpi=180,
-        facecolor="white",
-        metadata={"Software": metadata["Creator"]},
-    )
-    figure.savefig(
         output_dir / f"{stem}.svg",
         facecolor="white",
         metadata=metadata,
@@ -283,30 +277,6 @@ def save_figure(figure, output_dir, stem):
         encoding="utf-8",
     )
     plt.close(figure)
-
-
-def generate_xdrs_report(data, output_dir):
-    figure, axes = make_figure("LCH versus native XDRS RS(256, K)")
-    for operation, axis in (("Encode", axes[0]), ("DecodeMax", axes[1])):
-        for backend, label in (
-            ("Native", "Native"),
-            ("AVX2", "LCH+AVX2"),
-            ("GFNI256", "LCH+GFNI"),
-        ):
-            plot_line(axis, data, backend, operation, K_VALUES, label)
-    handles, labels = axes[0].get_legend_handles_labels()
-    figure.legend(
-        handles,
-        labels,
-        loc="lower center",
-        ncol=3,
-        frameon=False,
-        bbox_to_anchor=(0.5, 0.035),
-    )
-    figure.subplots_adjust(
-        top=0.91, bottom=0.11, left=0.11, right=0.97, hspace=0.28
-    )
-    save_figure(figure, output_dir, "xdrs_backend_comparison")
 
 
 def generate_combined_report(data, leopard, backends, output_dir):
@@ -491,7 +461,6 @@ def main():
             K_VALUES,
             "GFNI width results",
         )
-        generate_xdrs_report(xdrs, args.output_dir)
         generate_gfni_report(gfni, args.output_dir)
 
 
