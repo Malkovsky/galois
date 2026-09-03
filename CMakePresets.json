@@ -19,7 +19,7 @@
     {
       "name": "benchmarks",
       "displayName": "Native RS Benchmarks",
-      "description": "Configure concise and verbose RS benchmarks with ISA-L, Leopard, and XDRS baselines",
+      "description": "Configure RS benchmarks with native ISA-L, Leopard, XDRS, Jerasure, and optional klauspost references",
       "binaryDir": "${sourceDir}/build/benchmarks-preset",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",

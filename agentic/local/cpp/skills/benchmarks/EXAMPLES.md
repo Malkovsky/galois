@@ -88,15 +88,16 @@ taskset -c "${BENCH_CPU}" /tmp/gf256-linux/rs_benchmarks \
   --benchmark_display_aggregates_only=true
 ```
 
-With native references enabled, this registers ten top-level families: owned
-LCH AVX2/GFNI256 encode/decode plus native Leopard, XDRS, and ISA-L
-encode/decode. Owned LCH, XDRS, and ISA-L use the full logarithmic grid from
-`8/248` through `248/8`; native Leopard uses its valid `R<=K` subset from
-`128/128` through `248/8`. `DecodeMax` uses exactly `R=N-K` deterministic
-shuffled erasures across data and recovery symbols. Decode throughput uses the
-paper's input normalization, `K*bytes` per codeword, rather than its separate
-recovered-output metric. ISA-L's top-level decode includes matrix inversion and
-table setup.
+With native references enabled, the C++ binary registers twelve top-level
+families: owned LCH AVX2/GFNI256 encode/decode plus native Leopard, XDRS,
+ISA-L, and Jerasure encode/decode. The standalone klauspost runner adds two
+more families. Owned LCH, XDRS, ISA-L, Jerasure, and klauspost use the full
+logarithmic grid from `8/248` through `248/8`; native Leopard uses its valid
+`R<=K` subset from `128/128` through `248/8`. `DecodeMax` uses exactly `R=N-K`
+deterministic shuffled erasures across data and recovery symbols. Decode
+throughput uses the paper's input normalization, `K*bytes` per codeword, rather
+than its separate recovered-output metric. ISA-L and Jerasure top-level decode
+include matrix construction/inversion and data repair.
 
 Use the exhaustive binary only when comparing kernels or tuning thresholds:
 
@@ -115,16 +116,24 @@ taskset -c "${BENCH_CPU}" /tmp/gf256-linux/rs_verbose_benchmarks \
 ```
 
 Build with `-DGF256_BUILD_REFERENCE_BENCHMARKS=ON` to add
-`RS/{Leopard,XDRS}/Native/{Encode,DecodeMax}` and
-`RS/ISA-L/Native/{Encode,DecodeMax}` rows. This requires x86 GNU/Clang and
-NASM because the pinned XDRS artifact and ISA-L kernels are ISA-specific.
+`RS/{Leopard,XDRS,ISA-L,Jerasure}/Native/{Encode,DecodeMax}` rows. This requires
+x86 GNU/Clang and NASM because the pinned XDRS artifact and ISA-L kernels are
+ISA-specific. Jerasure/GF-Complete are direct static source builds.
 
 The repository preset configures and builds both concise and verbose binaries
-with native ISA and all three reference backends:
+with native ISA and all four C/C++ reference backends:
 
 ```bash
 cmake --preset benchmarks
 cmake --build --preset benchmarks
+```
+
+Build the standalone pinned klauspost runner when Go 1.24+ is available:
+
+```bash
+cmake --preset benchmarks -DGF256_GO_EXECUTABLE="$(command -v go)"
+cmake --build build/benchmarks-preset --target klauspost_benchmark
+build/benchmarks-preset/klauspost_rs_benchmarks --list
 ```
 
 Compare every owned backend/radix row with the pinned native adapters:

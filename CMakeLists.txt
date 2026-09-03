@@ -22,7 +22,7 @@ endif()
 
 option(GF256_BUILD_TESTS "Build unit tests" ON)
 option(GF256_BUILD_BENCHMARKS "Build benchmarks" ON)
-option(GF256_BUILD_REFERENCE_BENCHMARKS "Build native RS baselines" OFF)
+option(GF256_BUILD_REFERENCE_BENCHMARKS "Build external RS baselines" OFF)
 option(GF256_ENABLE_NATIVE_ISA "Compile owned sources for the build host" OFF)
 option(GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT
   "Build retained GFNI512 radix-8 tests and verbose benchmarks" OFF)
@@ -161,6 +161,8 @@ if(GF256_BUILD_BENCHMARKS)
       message(FATAL_ERROR
         "GF256_BUILD_REFERENCE_BENCHMARKS requires NASM for ISA-L")
     endif()
+    find_program(GF256_GO_EXECUTABLE NAMES go
+      DOC "Go compiler used for the standalone klauspost benchmark")
     set(ISAL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(ISAL_BUILD_PERF_TESTS OFF CACHE BOOL "" FORCE)
     set(ISAL_BUILD_FUZZ_TESTS OFF CACHE BOOL "" FORCE)
@@ -198,15 +200,81 @@ if(GF256_BUILD_BENCHMARKS)
     target_compile_options(gf256_xdrs_reference PRIVATE
       -mavx2 -include cstring)
 
+    add_library(gf256_gf_complete_reference STATIC
+      third_party/gf-complete/src/gf.c
+      third_party/gf-complete/src/gf_wgen.c
+      third_party/gf-complete/src/gf_w4.c
+      third_party/gf-complete/src/gf_w8.c
+      third_party/gf-complete/src/gf_w16.c
+      third_party/gf-complete/src/gf_w32.c
+      third_party/gf-complete/src/gf_w64.c
+      third_party/gf-complete/src/gf_w128.c
+      third_party/gf-complete/src/gf_cpu.c)
+    target_include_directories(gf256_gf_complete_reference PUBLIC
+      third_party/gf-complete/include)
+    target_compile_features(gf256_gf_complete_reference PRIVATE c_std_99)
+    target_compile_options(gf256_gf_complete_reference PRIVATE
+      -march=native -include
+      ${PROJECT_SOURCE_DIR}/benchmarks/reference/gf_complete_config.h)
+
+    add_library(gf256_jerasure_reference STATIC
+      third_party/jerasure/src/galois.c
+      third_party/jerasure/src/jerasure.c
+      third_party/jerasure/src/reed_sol.c
+      third_party/jerasure/src/cauchy.c
+      third_party/jerasure/src/liberation.c)
+    target_include_directories(gf256_jerasure_reference PUBLIC
+      third_party/jerasure/include)
+    target_compile_features(gf256_jerasure_reference PRIVATE c_std_99)
+    target_link_libraries(gf256_jerasure_reference PUBLIC
+      gf256_gf_complete_reference)
+
     foreach(benchmark_target IN ITEMS rs_verbose_benchmarks rs_benchmarks)
       target_sources(${benchmark_target} PRIVATE
         benchmarks/reference/isal_benchmarks.cc
+        benchmarks/reference/jerasure_benchmarks.cc
         benchmarks/reference/leopard_benchmarks.cc
         benchmarks/reference/xdrs_benchmarks.cc)
       target_link_libraries(${benchmark_target} PRIVATE
-        gf256_leopard_reference gf256_xdrs_reference isal)
+        gf256_leopard_reference gf256_xdrs_reference
+        gf256_jerasure_reference isal)
       target_compile_definitions(${benchmark_target} PRIVATE
         GF256_HAVE_REFERENCE_BENCHMARKS=1)
     endforeach()
+
+    if(GF256_GO_EXECUTABLE)
+      set(GF256_KLAUSPOST_SOURCE_DIR
+        ${PROJECT_SOURCE_DIR}/benchmarks/reference/klauspost)
+      set(GF256_KLAUSPOST_EXECUTABLE
+        ${PROJECT_BINARY_DIR}/klauspost_rs_benchmarks)
+      add_custom_command(
+        OUTPUT ${GF256_KLAUSPOST_EXECUTABLE}
+        COMMAND ${CMAKE_COMMAND} -E env
+          GOCACHE=${PROJECT_BINARY_DIR}/go-build-cache
+          GOMODCACHE=${PROJECT_BINARY_DIR}/go-module-cache
+          GOTOOLCHAIN=local
+          GOFLAGS=-mod=readonly
+          ${GF256_GO_EXECUTABLE} test ./...
+        COMMAND ${CMAKE_COMMAND} -E env
+          GOCACHE=${PROJECT_BINARY_DIR}/go-build-cache
+          GOMODCACHE=${PROJECT_BINARY_DIR}/go-module-cache
+          GOTOOLCHAIN=local
+          GOFLAGS=-mod=readonly
+          ${GF256_GO_EXECUTABLE} build -trimpath -ldflags=-s\ -w
+            -o ${GF256_KLAUSPOST_EXECUTABLE} .
+        DEPENDS
+          ${GF256_KLAUSPOST_SOURCE_DIR}/go.mod
+          ${GF256_KLAUSPOST_SOURCE_DIR}/go.sum
+          ${GF256_KLAUSPOST_SOURCE_DIR}/main.go
+          ${GF256_KLAUSPOST_SOURCE_DIR}/main_test.go
+        WORKING_DIRECTORY ${GF256_KLAUSPOST_SOURCE_DIR}
+        COMMENT "Building standalone klauspost Reed-Solomon benchmark"
+        VERBATIM)
+      add_custom_target(klauspost_benchmark
+        DEPENDS ${GF256_KLAUSPOST_EXECUTABLE})
+    else()
+      message(STATUS
+        "Go not found: klauspost_benchmark target will not be available")
+    endif()
   endif()
 endif()

@@ -38,6 +38,14 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
   products repacked from shared shuffle-row offsets 0 and 32.
 - `third_party/isa-l` is benchmark-only and requires NASM on x86; its standard
   Cauchy code is a performance reference, not owned-LCH codeword-compatible.
+- `third_party/jerasure` and `third_party/gf-complete` are benchmark-only
+  direct static C builds. Their w=8 Vandermonde rows are standard-coordinate,
+  process-global, single-thread-only references; top-level DecodeMax times
+  decoding-matrix construction/inversion and missing-data repair.
+- The klauspost reference is a standalone Go runner under
+  `benchmarks/reference/klauspost`, not CGo. Keep v1.14.2 pinned, use one
+  goroutine with inversion caching disabled, and preserve the shared erasure
+  shuffle and `K * bytes` throughput normalization.
 - `gf2p8::Element` is basis-neutral byte storage; scalar field APIs explicitly
   distinguish standard polynomial coordinates from Cantor coordinates.
 - Owned transforms, matrices, and `rs::LCHEncoder`/`rs::LCHDecoder` use one
@@ -94,6 +102,8 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
   artifact's separate recovered-output metric (`K * (N-K) / N`).
 - The XDRS paper's Leopard comparison harness is absent from the released XDRS
   artifact; do not treat its plotted Leopard series as source-reproducible.
+- Combined report legends name the owned implementations `LCH+AVX2` and
+  `LCH+GFNI`; external library names identify standard-coordinate references.
 
 ## Matrix/GF(256) Guidance
 

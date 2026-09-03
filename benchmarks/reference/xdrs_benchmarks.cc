@@ -71,6 +71,48 @@ void InitializeXDRS(XDRSTables& tables, unsigned bytes, unsigned k) {
   ::function::init_dec();
 }
 
+bool VerifyXDRSRecovery(
+    unsigned k, unsigned bytes, bool low_rate,
+    const std::vector<std::vector<GFSymbol>>& data,
+    const std::vector<std::vector<GFSymbol>>& recovery) {
+  const unsigned recovery_count = Size - k;
+  auto data_pointers = ConstPointers(data);
+  auto recovery_pointers = ConstPointers(recovery);
+  auto codeword = MakeBuffers(Size, bytes);
+  auto codeword_pointers = MutablePointers(codeword);
+  std::unique_ptr<bool[]> erasure(new bool[Size]{});
+  const auto erased = XDRSMaxErasurePattern(k, recovery_count);
+  size_t missing_data_count = 0;
+  for (size_t i = 0; i < erased.size(); ++i) {
+    erasure[i] = erased[i] != 0;
+  }
+  for (size_t i = 0; i < k; ++i) {
+    const size_t codeword_index = low_rate ? i : recovery_count + i;
+    missing_data_count += erased[codeword_index] != 0;
+  }
+  std::array<GFSymbol, Size> locator{};
+  if (low_rate) {
+    ::function::Algorithm2::ReedSolomondecodeL(
+        data_pointers.data(), recovery_pointers.data(),
+        codeword_pointers.data(), erasure.get(), locator.data());
+  } else {
+    ::function::Algorithm3::ReedSolomondecodeH(
+        data_pointers.data(), recovery_pointers.data(),
+        codeword_pointers.data(), erasure.get(), locator.data());
+  }
+  if (std::count(erased.begin(), erased.end(), uint8_t{1}) != recovery_count ||
+      missing_data_count == 0) {
+    return false;
+  }
+  for (size_t i = 0; i < k; ++i) {
+    const size_t codeword_index = low_rate ? i : recovery_count + i;
+    if (erased[codeword_index] && codeword[codeword_index] != data[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void NativeXDRSEncode(benchmark::State& state,
                       bool low_rate,
                       size_t bytes_range = 1) {
@@ -85,8 +127,7 @@ void NativeXDRSEncode(benchmark::State& state,
   auto recovery = MakeBuffers(parity_workspace_count, bytes);
   auto data_pointers = ConstPointers(data);
   auto recovery_pointers = MutablePointers(recovery);
-
-  for (auto _ : state) {
+  const auto encode = [&] {
     if (low_rate) {
       ::function::ReedSolomonEncodeL(data_pointers.data(),
                                      recovery_pointers.data());
@@ -94,7 +135,20 @@ void NativeXDRSEncode(benchmark::State& state,
       ::function::ReedSolomonEncodeH(data_pointers.data(),
                                      recovery_pointers.data());
     }
+  };
+  encode();
+  if (!VerifyXDRSRecovery(k, bytes, low_rate, data, recovery)) {
+    state.SkipWithError("native XDRS encode verification failed");
+    return;
+  }
+
+  for (auto _ : state) {
+    encode();
     benchmark::ClobberMemory();
+  }
+  if (!VerifyXDRSRecovery(k, bytes, low_rate, data, recovery)) {
+    state.SkipWithError("native XDRS encode verification failed");
+    return;
   }
   state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * k * bytes);
 }

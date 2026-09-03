@@ -13,3 +13,9 @@
 [submodule "third_party/isa-l"]
 	path = third_party/isa-l
 	url = https://github.com/intel/isa-l.git
+[submodule "third_party/gf-complete"]
+	path = third_party/gf-complete
+	url = https://github.com/ceph/gf-complete.git
+[submodule "third_party/jerasure"]
+	path = third_party/jerasure
+	url = https://github.com/ceph/jerasure.git

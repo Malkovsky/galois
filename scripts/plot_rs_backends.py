@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the LCH RS backend comparison report graphs.
+"""Generate the LCH and external RS backend comparison report graphs.
 
-The XDRS report compares native XDRS with owned LCH AVX2/GFNI256 rows. The
-GFNI width report uses its separate matched GFNI256/GFNI512 run, so
-measurements from different system-load windows are not mixed.
+The combined report accepts matched C++ and Go JSON inputs and labels the owned
+implementations LCH+AVX2 and LCH+GFNI. The focused XDRS and GFNI-width reports
+retain their separate matched inputs so system-load windows are not mixed.
 """
 
 import argparse
@@ -27,8 +27,35 @@ COLORS = {
     "AVX2": "#2563eb",
     "GFNI256": "#7c3aed",
     "GFNI512": "#db2777",
+    "LCH+AVX2": "#2563eb",
+    "LCH+GFNI": "#7c3aed",
+    "XDRS": "#5f6368",
+    "ISA-L": "#ea580c",
+    "Jerasure": "#16a34a",
+    "Klauspost": "#dc2626",
+    "Leopard": "#111827",
 }
-MARKERS = {"Native": "o", "AVX2": "s", "GFNI256": "D", "GFNI512": "^"}
+MARKERS = {
+    "Native": "o",
+    "AVX2": "s",
+    "GFNI256": "D",
+    "GFNI512": "^",
+    "LCH+AVX2": "s",
+    "LCH+GFNI": "D",
+    "XDRS": "o",
+    "ISA-L": "v",
+    "Jerasure": "P",
+    "Klauspost": "X",
+    "Leopard": "h",
+}
+COMPARISON_BACKENDS = (
+    "LCH+AVX2",
+    "LCH+GFNI",
+    "XDRS",
+    "ISA-L",
+    "Jerasure",
+    "Klauspost",
+)
 
 plt.rcParams.update(
     {
@@ -72,6 +99,52 @@ def load_lch_and_xdrs(path):
     )
 
 
+def load_comparison(paths):
+    values = defaultdict(list)
+    aggregate_medians = {}
+    regex = re.compile(
+        r"^RS/(?:(?:LCH|XDRS)/Owned/(AVX2|GFNI256)|"
+        r"(XDRS|ISA-L|Jerasure|Klauspost)/Native)/"
+        r"(Encode|DecodeMax)/K:(\d+)/"
+    )
+    for path in paths:
+        for row in load_json(path)["benchmarks"]:
+            run_name = row.get("run_name", row["name"])
+            match = regex.match(run_name)
+            if not match:
+                continue
+            if match.group(1) == "AVX2":
+                backend = "LCH+AVX2"
+            elif match.group(1) == "GFNI256":
+                backend = "LCH+GFNI"
+            else:
+                backend = match.group(2)
+            key = (match.group(3), int(match.group(4)), backend)
+            throughput = row["bytes_per_second"] / GIB
+            if "aggregate_name" not in row:
+                values[key].append(throughput)
+            elif row.get("aggregate_name") == "median":
+                aggregate_medians[key] = throughput
+
+    result = dict(aggregate_medians)
+    result.update(
+        {key: statistics.median(samples) for key, samples in values.items()}
+    )
+    return result
+
+
+def validate_comparison_contexts(paths):
+    contexts = [load_json(path).get("context", {}) for path in paths]
+    hosts = {context.get("host_name") for context in contexts}
+    if None in hosts or len(hosts) != 1:
+        raise ValueError(f"comparison inputs use different hosts: {hosts}")
+    pinning = {context.get("cpu_pinning") for context in contexts}
+    if None in pinning or len(pinning) != 1:
+        raise ValueError(
+            f"comparison inputs use different CPU-pinning states: {pinning}"
+        )
+
+
 def load_gfni_widths(path):
     return load_raw_medians(
         path,
@@ -86,22 +159,23 @@ def load_gfni_widths(path):
 
 
 def load_leopard(path):
-    result = {}
-    regex = re.compile(
-        r"^RS/Leopard/(Owned/(AVX2|GFNI256)|Native)/"
-        r"(Encode|DecodeMax)/K:(\d+)/"
-    )
+    values = defaultdict(list)
+    aggregate_medians = {}
+    regex = re.compile(r"^RS/Leopard/Native/(Encode|DecodeMax)/K:(\d+)/")
     for row in load_json(path)["benchmarks"]:
-        if row.get("aggregate_name") != "median":
-            continue
         match = regex.match(row.get("run_name", row["name"]))
-        if match:
-            backend = (
-                "Native" if match.group(1) == "Native" else match.group(2)
-            )
-            result[(match.group(3), int(match.group(4)), backend)] = (
-                row["bytes_per_second"] / GIB
-            )
+        if not match:
+            continue
+        key = (match.group(1), int(match.group(2)), "Leopard")
+        throughput = row["bytes_per_second"] / GIB
+        if "aggregate_name" not in row:
+            values[key].append(throughput)
+        elif row.get("aggregate_name") == "median":
+            aggregate_medians[key] = throughput
+    result = dict(aggregate_medians)
+    result.update(
+        {key: statistics.median(samples) for key, samples in values.items()}
+    )
     return result
 
 
@@ -176,14 +250,14 @@ def make_figure(title):
     configure_axis(
         axes[0],
         "Encode throughput",
-        (0.25, 0.5, 1, 2, 4, 8, 16, 32),
-        (0.22, 32),
+        (0.0625, 0.125, 0.25, 0.5, 1, 2, 4, 8, 16, 32),
+        (0.05, 32),
     )
     configure_axis(
         axes[1],
         "DecodeMax input throughput",
-        (0.25, 0.5, 1, 2, 4, 8, 16),
-        (0.22, 16),
+        (0.015625, 0.03125, 0.0625, 0.125, 0.25, 0.5, 1, 2, 4, 8, 16),
+        (0.012, 16),
     )
     axes[1].set_xlabel("Dimension K")
     return figure, axes
@@ -216,8 +290,8 @@ def generate_xdrs_report(data, output_dir):
     for operation, axis in (("Encode", axes[0]), ("DecodeMax", axes[1])):
         for backend, label in (
             ("Native", "Native"),
-            ("AVX2", "Owned LCH AVX2"),
-            ("GFNI256", "Owned LCH GFNI256"),
+            ("AVX2", "LCH+AVX2"),
+            ("GFNI256", "LCH+GFNI"),
         ):
             plot_line(axis, data, backend, operation, K_VALUES, label)
     handles, labels = axes[0].get_legend_handles_labels()
@@ -235,51 +309,48 @@ def generate_xdrs_report(data, output_dir):
     save_figure(figure, output_dir, "xdrs_backend_comparison")
 
 
-def generate_combined_report(xdrs, leopard, output_dir):
+def generate_combined_report(data, leopard, backends, output_dir):
     figure, axes = make_figure("RS(256, K) backend comparison")
-    for backend in ("Native", "AVX2", "GFNI256"):
-        qualifier = "Native XDRS" if backend == "Native" else f"Owned LCH {backend}"
+    for backend in backends:
         plot_line(
             axes[0],
-            xdrs,
+            data,
             backend,
             "Encode",
             K_VALUES,
-            qualifier,
+            backend,
         )
 
     handles = []
     labels = []
-    for backend in ("Native", "AVX2", "GFNI256"):
-        qualifier = "Native XDRS" if backend == "Native" else f"Owned LCH {backend}"
-        xdrs_line = plot_line(
+    for backend in backends:
+        line = plot_line(
             axes[1],
-            xdrs,
+            data,
             backend,
             "DecodeMax",
             K_VALUES,
-            qualifier,
+            backend,
         )
-        handles.append(xdrs_line)
-        labels.append(xdrs_line.get_label())
-        if backend == "Native":
-            leopard_line = plot_line(
-                axes[1],
-                leopard,
-                backend,
-                "DecodeMax",
-                LEOPARD_K_VALUES,
-                "Native Leopard",
-                dashed=True,
-            )
-            handles.append(leopard_line)
-            labels.append(leopard_line.get_label())
+        handles.append(line)
+        labels.append(line.get_label())
+    leopard_line = plot_line(
+        axes[1],
+        leopard,
+        "Leopard",
+        "DecodeMax",
+        LEOPARD_K_VALUES,
+        "Leopard",
+        dashed=True,
+    )
+    handles.append(leopard_line)
+    labels.append(leopard_line.get_label())
 
     figure.legend(
         handles,
         labels,
         loc="lower center",
-        ncol=3,
+        ncol=4,
         frameon=False,
         bbox_to_anchor=(0.5, 0.025),
     )
@@ -327,6 +398,17 @@ def parse_arguments():
     project_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--comparison-results",
+        type=Path,
+        nargs="+",
+        help="matched C++ and Go JSON files for the full backend report",
+    )
+    parser.add_argument(
+        "--combined-only",
+        action="store_true",
+        help="generate only rs_backend_comparison from comparison inputs",
+    )
+    parser.add_argument(
         "--xdrs-results",
         type=Path,
         default=project_root
@@ -355,35 +437,62 @@ def parse_arguments():
 def main():
     args = parse_arguments()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    xdrs = load_lch_and_xdrs(args.xdrs_results)
-    gfni = load_gfni_widths(args.gfni_results)
-    leopard = load_leopard(args.leopard_results)
+    xdrs = None
+    if args.comparison_results:
+        validate_comparison_contexts(args.comparison_results)
+        comparison = load_comparison(args.comparison_results)
+        leopard = {}
+        for path in args.comparison_results:
+            leopard.update(load_leopard(path))
+        comparison_backends = COMPARISON_BACKENDS
+    else:
+        xdrs = load_lch_and_xdrs(args.xdrs_results)
+        comparison = {
+            (operation, k, "XDRS" if backend == "Native" else
+             "LCH+AVX2" if backend == "AVX2" else "LCH+GFNI"): value
+            for (operation, k, backend), value in xdrs.items()
+        }
+        leopard = load_leopard(args.leopard_results)
+        comparison_backends = ("LCH+AVX2", "LCH+GFNI", "XDRS")
 
-    require_points(
-        xdrs,
-        ("Encode", "DecodeMax"),
-        ("Native", "AVX2", "GFNI256"),
-        K_VALUES,
-        "XDRS results",
-    )
-    require_points(
-        gfni,
-        ("Encode", "DecodeMax"),
-        ("GFNI256", "GFNI512"),
-        K_VALUES,
-        "GFNI width results",
-    )
     require_points(
         leopard,
         ("DecodeMax",),
-        ("Native",),
+        ("Leopard",),
         LEOPARD_K_VALUES,
         "native Leopard results",
     )
+    require_points(
+        comparison,
+        ("Encode", "DecodeMax"),
+        comparison_backends,
+        K_VALUES,
+        "combined RS results",
+    )
 
-    generate_xdrs_report(xdrs, args.output_dir)
-    generate_combined_report(xdrs, leopard, args.output_dir)
-    generate_gfni_report(gfni, args.output_dir)
+    generate_combined_report(
+        comparison, leopard, comparison_backends, args.output_dir
+    )
+    if not args.combined_only:
+        if xdrs is None:
+            xdrs = load_lch_and_xdrs(args.xdrs_results)
+        gfni = load_gfni_widths(args.gfni_results)
+        require_points(
+            xdrs,
+            ("Encode", "DecodeMax"),
+            ("Native", "AVX2", "GFNI256"),
+            K_VALUES,
+            "XDRS results",
+        )
+        require_points(
+            gfni,
+            ("Encode", "DecodeMax"),
+            ("GFNI256", "GFNI512"),
+            K_VALUES,
+            "GFNI width results",
+        )
+        generate_xdrs_report(xdrs, args.output_dir)
+        generate_gfni_report(gfni, args.output_dir)
 
 
 if __name__ == "__main__":

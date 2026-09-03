@@ -100,16 +100,56 @@ taskset -c "${BENCH_CPU}" /tmp/gf256-lch-native/rs_benchmarks \
   --benchmark_display_aggregates_only=true
 ```
 
-With `GF256_BUILD_REFERENCE_BENCHMARKS=ON`, the concise binary has ten
-top-level families: owned LCH AVX2/GFNI256 encode/decode, plus native
-Leopard, XDRS, and ISA-L encode/decode. Owned LCH, XDRS, and ISA-L use the full
-logarithmic grid, `K=8,16,32,64,128,192,224,240,248`; native Leopard uses only
-the valid `R<=K` range, `K=128,192,224,240,248`. `DecodeMax` uses exactly
-`R=N-K` deterministic shuffled erasures across data and recovery symbols,
-matching the pinned XDRS workload shape.
+With `GF256_BUILD_REFERENCE_BENCHMARKS=ON`, the concise C++ binary has twelve
+top-level families: owned LCH AVX2/GFNI256 encode/decode, plus native Leopard,
+XDRS, ISA-L, and Jerasure encode/decode. The standalone klauspost runner adds
+two more families without CGo. Owned LCH, XDRS, ISA-L, Jerasure, and klauspost
+use the full logarithmic grid, `K=8,16,32,64,128,192,224,240,248`; native
+Leopard uses only the valid `R<=K` range, `K=128,192,224,240,248`. `DecodeMax`
+uses exactly `R=N-K` deterministic shuffled erasures across data and recovery
+symbols, matching the pinned XDRS workload shape.
 Decode throughput uses the paper's input normalization, `K*bytes` per
 codeword. The released XDRS benchmark also reports a separate recovered-output
 rate, `K*R/N*bytes`, but that is not the metric plotted here.
+
+Jerasure 2.0 uses its standard-coordinate systematic Vandermonde matrix. Its
+top-level `DecodeMax` includes survivor selection, temporary matrix
+construction and inversion, and repair of every missing data shard; missing
+recovery shards are deliberately not rebuilt. `Jerasure/Native/RepairPrepared`
+is the verbose repair-only row. Jerasure and GF-Complete have process-global
+mutable field/CPU state and statistics, so their rows are single-thread-only.
+
+Klauspost uses its classic systematic Vandermonde implementation with
+`GOMAXPROCS(1)`, `WithMaxGoroutines(1)`, and the inversion cache disabled. Its
+runner resets preallocated zero-length missing slices outside each accumulated
+timed batch, so repeated `ReconstructData` calls cannot turn into the all-data-
+present fast path. Build it with Go 1.24 or newer:
+
+```bash
+cmake --preset benchmarks -DGF256_GO_EXECUTABLE="$(command -v go)"
+cmake --build --preset benchmarks
+cmake --build build/benchmarks-preset --target klauspost_benchmark
+```
+
+For the deferred long comparison, the runner randomizes ten-repetition C++ and
+Go chunks to reduce backend-correlated thermal/load drift, verifies all 118
+benchmark instances, recomputes Google-compatible aggregates, and emits one
+merged JSON. The report uses the owned labels `LCH+AVX2` and `LCH+GFNI`:
+
+```bash
+BENCH_CPU=${BENCH_CPU:-0}
+python3 scripts/run_rs_long.py \
+  --cpu="${BENCH_CPU}" \
+  --repetitions=100 \
+  --chunk-repetitions=10 \
+  --warmup-seconds=1.0 \
+  --min-time-seconds=0.2 \
+  --output=build/benchmarks-preset/rs_long.json
+
+python3 scripts/plot_rs_backends.py \
+  --combined-only \
+  --comparison-results build/benchmarks-preset/rs_long.json
+```
 
 The exhaustive `rs_verbose_benchmarks` binary remains available for backend,
 vector-width, and radix tuning.
@@ -258,11 +298,13 @@ the acceptance gate as blocked rather than substituting generic cache events.
 
 Reference adapters are benchmark-only. XDRS is compiled with AVX2 and an
 adapter-level forced `<cstring>` include. ISA-L requires NASM and is built as a
-static reference library. Neither is linked into production or ordinary test
-targets. ISA-L uses its standard-coordinate systematic Cauchy code rather than
-the owned LCH code family. Its top-level `DecodeMax` row includes survivor
-selection, decode-matrix construction and inversion, table initialization, and
-repair; `ISA-L/Native/RepairPrepared` is the verbose reconstruction-only row.
+static reference library. Jerasure and GF-Complete are compiled directly as
+static C libraries, avoiding their Autotools installation flow. None is linked
+into production or ordinary test targets. ISA-L uses its standard-coordinate
+systematic Cauchy code rather than the owned LCH code family. Its top-level
+`DecodeMax` row includes survivor selection, decode-matrix construction and
+inversion, table initialization, and repair; `ISA-L/Native/RepairPrepared` is
+the verbose reconstruction-only row.
 When owned AVX2 is compiled, verbose
 `Kernel/{Scale,AddScaled}/{Owned,ISA-L}/AVX2` rows compare ISA-L's 32-byte
 Cantor-table ABI against the project's already-resolved AVX2 entries.
@@ -276,4 +318,10 @@ algorithm structure derives from Chao Chen's XDRS publication artifact, pinned
 under `third_party/xdrs` at `ae05a779e7f44be13c3d34e14d15b08b4bc02404`
 (Apache-2.0). The upstream source and license notices remain unmodified in
 those submodules. Intel ISA-L is pinned under `third_party/isa-l` at
-`7c3479e0a9dac17f448603ec1ad64c7c625f530c` (BSD-3-Clause).
+`7c3479e0a9dac17f448603ec1ad64c7c625f530c` (BSD-3-Clause). Jerasure and
+GF-Complete are pinned under `third_party/jerasure` at
+`de1739cc8483696506829b52e7fda4f6bb195e6a` and
+`third_party/gf-complete` at `a6862d10c9db467148f20eef2c6445ac9afd94d8`
+(BSD-3-Clause). The standalone MIT-licensed klauspost runner pins
+`github.com/klauspost/reedsolomon` v1.14.2, commit
+`af9e2b1b1bad1889954523347758996aafd9c805`, through `go.mod` and `go.sum`.

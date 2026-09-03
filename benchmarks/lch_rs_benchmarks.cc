@@ -595,6 +595,7 @@ int main(int argc, char** argv) {
 #endif
 #if defined(GF256_HAVE_REFERENCE_BENCHMARKS)
   gf256_benchmarks::RegisterISALReferenceBenchmarks();
+  gf256_benchmarks::RegisterJerasureReferenceBenchmarks();
   gf256_benchmarks::RegisterLeopardReferenceBenchmarks();
   gf256_benchmarks::RegisterXDRSReferenceBenchmarks();
 #endif
