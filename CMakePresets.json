@@ -44,6 +44,20 @@
         "GF256_ENABLE_NATIVE_ISA": "ON",
         "GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT": "ON"
       }
+    },
+    {
+      "name": "cli",
+      "displayName": "lch-rs CLI",
+      "description": "Release build of lch-rs with native ISA",
+      "binaryDir": "${sourceDir}/build/cli-preset",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "GF256_BUILD_TOOLS": "ON",
+        "GF256_BUILD_TESTS": "ON",
+        "GF256_BUILD_BENCHMARKS": "OFF",
+        "GF256_ENABLE_NATIVE_ISA": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -70,6 +84,14 @@
         "lch_rs_unittests",
         "rs_verbose_benchmarks"
       ]
+    },
+    {
+      "name": "cli",
+      "displayName": "Build lch-rs",
+      "configurePreset": "cli",
+      "targets": [
+        "lch-rs"
+      ]
     }
   ],
   "testPresets": [
@@ -85,6 +107,14 @@
       "name": "gfni512-radix8-experiment",
       "displayName": "Test GFNI512 Radix-8 Experiment",
       "configurePreset": "gfni512-radix8-experiment",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "cli",
+      "displayName": "Test lch-rs",
+      "configurePreset": "cli",
       "output": {
         "outputOnFailure": true
       }
