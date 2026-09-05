@@ -21,6 +21,7 @@ if(GF256_GIT_DIRTY)
 endif()
 
 option(GF256_BUILD_TESTS "Build unit tests" ON)
+option(GF256_BUILD_TOOLS "Build CLI tools" ON)
 option(GF256_BUILD_BENCHMARKS "Build benchmarks" ON)
 option(GF256_BUILD_REFERENCE_BENCHMARKS "Build external RS baselines" OFF)
 option(GF256_ENABLE_NATIVE_ISA "Compile owned sources for the build host" OFF)
@@ -70,6 +71,37 @@ if(GF256_ENABLE_NATIVE_ISA)
   endif()
 endif()
 
+if(GF256_BUILD_TOOLS)
+  set(XXHASH_BUILD_XXHSUM OFF CACHE BOOL "" FORCE)
+  set(INDICATORS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(INDICATORS_SAMPLES OFF CACHE BOOL "" FORCE)
+  set(INDICATORS_DEMO OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    xxhash
+    GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
+    GIT_TAG v0.8.2
+    SOURCE_SUBDIR cmake_unofficial
+  )
+  FetchContent_Declare(
+    indicators
+    GIT_REPOSITORY https://github.com/p-ranav/indicators.git
+    GIT_TAG v2.3
+  )
+  FetchContent_MakeAvailable(xxhash indicators)
+  if(NOT TARGET xxhash)
+    add_library(xxhash STATIC ${xxhash_SOURCE_DIR}/xxhash.c)
+    target_include_directories(xxhash PUBLIC ${xxhash_SOURCE_DIR})
+  endif()
+
+  find_package(Threads REQUIRED)
+  add_executable(lch-rs tools/lch_rs.cc)
+  target_compile_features(lch-rs PRIVATE cxx_std_20)
+  target_link_libraries(lch-rs PRIVATE
+    gf256_core xxhash indicators::indicators Threads::Threads)
+  include(GNUInstallDirs)
+  install(TARGETS lch-rs RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
 if(GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT)
   if(NOT GF256_ENABLE_NATIVE_ISA)
     message(FATAL_ERROR
@@ -106,6 +138,12 @@ if(GF256_BUILD_TESTS)
       GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT=1)
   endif()
   add_test(NAME LCHRSUnittests COMMAND lch_rs_unittests)
+
+  if(GF256_BUILD_TOOLS)
+    add_test(NAME LCHRSCli
+      COMMAND /bin/bash ${PROJECT_SOURCE_DIR}/tests/lch_rs_cli_test.sh
+              $<TARGET_FILE:lch-rs>)
+  endif()
 endif()
 
 if(GF256_BUILD_BENCHMARKS)
