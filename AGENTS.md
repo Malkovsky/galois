@@ -22,6 +22,10 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
   orchestration live under the mirrored `src/reed_solomon` tree.
 - LCH transform APIs live under `include/lin_chung_han`; private dispatch and
   schedule declarations stay under `src/lin_chung_han`.
+- `tools/lch_rs.cc` is a POSIX zfec-style fragmenter: format v3 writes `K`
+  data shares plus `R` recovery shares, with any `K` valid shares sufficient.
+- Its final stripe uses `ceil(live_bytes / K)` bytes per share; share payload is
+  `(stripe_count - 1) * C + final_chunk_size`, while stream hashes exclude padding.
 - `benchmarks/matrix_multiplication.cc` owns Google Benchmark coverage.
 - `tests/field_tests.cc` owns current correctness tests.
 - `third_party/gf256` is a reference implementation; do not edit it unless the
@@ -51,6 +55,8 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
 - Owned transforms, matrices, and `rs::LCHEncoder`/`rs::LCHDecoder` use one
   immutable Cantor-coordinate domain.
   Native XDRS remains polynomial-coordinate and is not codeword-compatible.
+- The native Cantor tower has `s_i(v_i)=1` at every LCH level, so Tang-Han
+  syndrome formulas need no `p_K` rescaling for full power-of-two codes.
 - Native Cantor coordinates make XDRS derivative `B` scales identity, but its
   low-rate clear-and-XOR derivative still differs from Leopard's derivative.
 - Field shuffle, affine, log, and exponent tables are compile-time-generated
