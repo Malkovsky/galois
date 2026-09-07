@@ -9,6 +9,7 @@
 #if defined(GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT)
 #include "lin_chung_han/experiment/gfni512_radix8.h"
 #endif
+#include "lin_chung_han/codeword_transform_internal.h"
 #include "lin_chung_han/transform.h"
 #include "lin_chung_han/transform_internal.h"
 
@@ -22,6 +23,14 @@ using gf2p8::lch::IFFT;
 using gf2p8::lch::Radix;
 using gf2p8::lch::Status;
 using gf2p8::lch::TransformOptions;
+using gf2p8::lch::detail::FFTCodewordBlocks;
+#if defined(GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT)
+using gf2p8::lch::detail::FFTCodewordBlocksCantorAffine;
+#endif
+using gf2p8::lch::detail::IFFTCodewordBlocks;
+#if defined(GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT)
+using gf2p8::lch::detail::IFFTCodewordBlocksCantorAffine;
+#endif
 #if defined(GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT)
 using Radix8Kernels = gf2p8::lch::detail::experiment::radix8::Kernels;
 
@@ -376,6 +385,133 @@ TEST(LCHTransform, EveryBackendMatchesScalarAndRoundTrips) {
       }
     }
   }
+}
+
+TEST(LCHCodewordTransform, EveryBackendMatchesPointerTransforms) {
+  const Context& context = Context::Shared();
+  std::mt19937 random(0xc0de1234);
+
+  for (size_t value_count = 1; value_count <= Context::kFieldSize;
+       value_count *= 2) {
+    for (size_t block_size = 1; block_size <= value_count; block_size *= 2) {
+      for (size_t evaluation_offset = 0;
+           evaluation_offset + value_count <= Context::kFieldSize;
+           evaluation_offset += block_size) {
+        std::vector<Element> input(value_count);
+        std::generate(input.begin(), input.end(),
+                      [&random] { return static_cast<Element>(random()); });
+
+        for (const bool inverse : {false, true}) {
+          std::vector<Element> expected = input;
+          for (size_t block = 0; block < value_count; block += block_size) {
+            std::vector<Element*> pointers(block_size);
+            for (size_t i = 0; i < block_size; ++i) {
+              pointers[i] = &expected[block + i];
+            }
+            const Status status =
+                inverse ? IFFT(context, pointers, 1, evaluation_offset + block,
+                               {Backend::scalar, Radix::radix2})
+                        : FFT(context, pointers, 1, evaluation_offset + block,
+                              {Backend::scalar, Radix::radix2});
+            ASSERT_EQ(status, Status::ok);
+          }
+
+          for (const Backend backend :
+               {Backend::scalar, Backend::tuned, Backend::avx2,
+                Backend::gfni256_affine}) {
+            if (!gf2p8::lch::BackendAvailable(backend) &&
+                backend != Backend::scalar && backend != Backend::tuned) {
+              continue;
+            }
+            std::vector<Element> actual = input;
+            const Status status =
+                inverse ? IFFTCodewordBlocks(context, actual, block_size,
+                                             evaluation_offset, backend)
+                        : FFTCodewordBlocks(context, actual, block_size,
+                                            evaluation_offset, backend);
+            ASSERT_EQ(status, Status::ok);
+            EXPECT_EQ(actual, expected)
+                << "values=" << value_count << " block=" << block_size
+                << " offset=" << evaluation_offset << " inverse=" << inverse
+                << " backend=" << static_cast<int>(backend);
+          }
+
+#if defined(GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT)
+          if (gf2p8::lch::BackendAvailable(Backend::gfni256_affine)) {
+            std::vector<Element> actual = input;
+            const Status status =
+                inverse ? IFFTCodewordBlocksCantorAffine(
+                              context, actual, block_size, evaluation_offset)
+                        : FFTCodewordBlocksCantorAffine(
+                              context, actual, block_size, evaluation_offset);
+            ASSERT_EQ(status, Status::ok);
+            EXPECT_EQ(actual, expected)
+                << "Cantor affine values=" << value_count
+                << " block=" << block_size << " offset=" << evaluation_offset
+                << " inverse=" << inverse;
+          }
+#endif
+        }
+
+        for (const Backend backend : {Backend::scalar, Backend::tuned,
+                                      Backend::avx2, Backend::gfni256_affine}) {
+          if (!gf2p8::lch::BackendAvailable(backend) &&
+              backend != Backend::scalar && backend != Backend::tuned) {
+            continue;
+          }
+          std::vector<Element> round_trip = input;
+          ASSERT_EQ(FFTCodewordBlocks(context, round_trip, block_size,
+                                      evaluation_offset, backend),
+                    Status::ok);
+          ASSERT_EQ(IFFTCodewordBlocks(context, round_trip, block_size,
+                                       evaluation_offset, backend),
+                    Status::ok);
+          EXPECT_EQ(round_trip, input);
+        }
+
+#if defined(GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT)
+        if (gf2p8::lch::BackendAvailable(Backend::gfni256_affine)) {
+          std::vector<Element> round_trip = input;
+          ASSERT_EQ(FFTCodewordBlocksCantorAffine(
+                        context, round_trip, block_size, evaluation_offset),
+                    Status::ok);
+          ASSERT_EQ(IFFTCodewordBlocksCantorAffine(
+                        context, round_trip, block_size, evaluation_offset),
+                    Status::ok);
+          EXPECT_EQ(round_trip, input);
+        }
+#endif
+      }
+    }
+  }
+}
+
+TEST(LCHCodewordTransform, ValidatesContract) {
+  const Context& context = Context::Shared();
+  std::array<Element, 8> values{};
+  std::array<Element, 12> non_power_of_two{};
+
+  EXPECT_EQ(FFTCodewordBlocks(context, {}, 1, 0, Backend::scalar),
+            Status::invalid_argument);
+  EXPECT_EQ(FFTCodewordBlocks(context, values, 0, 0, Backend::scalar),
+            Status::invalid_argument);
+  EXPECT_EQ(FFTCodewordBlocks(context, values, 3, 0, Backend::scalar),
+            Status::invalid_argument);
+  EXPECT_EQ(FFTCodewordBlocks(context, values, 16, 0, Backend::scalar),
+            Status::invalid_argument);
+  EXPECT_EQ(FFTCodewordBlocks(context, std::span(values).first(6), 4, 0,
+                              Backend::scalar),
+            Status::invalid_argument);
+  EXPECT_EQ(FFTCodewordBlocks(context, non_power_of_two, 4, 0, Backend::scalar),
+            Status::invalid_argument);
+  EXPECT_EQ(FFTCodewordBlocks(context, values, 4, 1, Backend::scalar),
+            Status::invalid_argument);
+  EXPECT_EQ(FFTCodewordBlocks(context, values, 4, 252, Backend::scalar),
+            Status::invalid_argument);
+  EXPECT_EQ(FFTCodewordBlocks(context, values, 4, 0, Backend::ssse3),
+            Status::unsupported_backend);
+  EXPECT_EQ(FFTCodewordBlocks(context, values, 4, 0, Backend::tuned),
+            Status::ok);
 }
 
 TEST(LCHTransform, AdvancedOverloadsMatchFullTransforms) {

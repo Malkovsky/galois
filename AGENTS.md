@@ -57,10 +57,39 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
   Native XDRS remains polynomial-coordinate and is not codeword-compatible.
 - The native Cantor tower has `s_i(v_i)=1` at every LCH level, so Tang-Han
   syndrome formulas need no `p_K` rescaling for full power-of-two codes.
+- The same identity makes Lin's monic and normalized novel bases coincide:
+  every coefficient normalization product `p_i` is one.
+- Tang-Han FMA recursion must retain all four polynomial components of its 2x2
+  basis matrix; the FDMA prototype's locator-column-only state is insufficient.
+- FDMA reconstructs evaluator `z` for direct magnitudes: outside the syndrome
+  subspace use `z/(s_mu*lambda')`; inside use `u+z'/lambda'` since `s_mu'=1`.
+- Native GFNI FDMA keeps discrepancy and locator rows in the AES-isomorphic
+  basis and vectorizes inner updates for `R>=64`; smaller redundancy stays scalar.
+- Batched independent codewords can use bytes as SIMD lanes despite differing
+  locators: mask each lane's MA branch and FFT locator derivatives instead of
+  iterating divergent root lists.
+- Private `CorrectBatch` uses SIMD on complete 32-byte chunks and `CorrectOne`
+  tails; its scratch frame is about 31 KiB, and masks are position-major.
+- Without GFNI, AVX2 FDMA stays in Cantor coordinates and prepares eight basis
+  multiples per lane-varying discrepancy; shared factors still use `VPSHUFB`.
+- With `N<=256` and full-code `R<=128`, benchmark a hybrid FDMA-leaf crossover;
+  FMA/half-GCD asymptotics may not repay their transform overhead at this scale.
 - Native Cantor coordinates make XDRS derivative `B` scales identity, but its
   low-rate clear-and-XOR derivative still differs from Leopard's derivative.
 - Field shuffle, affine, log, and exponent tables are compile-time-generated
   once in `src/field.cc`; no production field initialization is required.
+- Single-codeword LCH block kernels vectorize across code positions, not shard
+  bytes; the GFNI path converts the full buffer once to an AES-isomorphic basis
+  so `VGF2P8MULB` can consume lane-varying skew factors at every radix-2 stage.
+- AVX2-only single-codeword block transforms use SSSE3 for 16-byte halves,
+  AVX2 for wider halves, and scalar butterflies below 16 bytes.
+- Native Cantor `Tables().affine[c]` avoids basis conversion for fixed factors,
+  but GFNI affine selects only one 8x8 matrix per 64-bit/eight-byte region.
+- The Cantor-affine codeword scan is opt-in via
+  `GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT`; it did not beat the
+  AES-isomorphic multiplier consistently, so production tuned dispatch excludes it.
+- A single unknown error's magnitude is the highest syndrome coefficient because
+  native normalized LCH blocks have unit leading Lagrange coefficients.
 - Leopard forms `FFTSkew - 1` sentinel pointers and triggers UBSan; sanitize the
   safe XDRS adapter rows and verify Leopard adapters with output-checked smoke.
 - Leopard's speed depends on radix-4 fusion at every layer pair, truncated
@@ -113,6 +142,9 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
 
 ## Matrix/GF(256) Guidance
 
+- Document header functions with parseable Doxygen block comments
+  (`/** ... */`) and tags such as `@brief`, `@param`, and `@return`; do not use
+  `//` comments as API documentation.
 - Keep exact GF(256) semantics: field addition is XOR, not integer addition.
 - For lookup-table SIMD paths, use the low/high-nibble `pshufb` decomposition:
   `product = table_lo[a][b & 0x0f] ^ table_hi[a][b >> 4]`.
