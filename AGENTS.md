@@ -68,6 +68,10 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
 - Batched independent codewords can use bytes as SIMD lanes despite differing
   locators: mask each lane's MA branch and FFT locator derivatives instead of
   iterating divergent root lists.
+- Private `CorrectBatch` uses SIMD on complete 32-byte chunks and `CorrectOne`
+  tails; its scratch frame is about 31 KiB, and masks are position-major.
+- Without GFNI, AVX2 FDMA stays in Cantor coordinates and prepares eight basis
+  multiples per lane-varying discrepancy; shared factors still use `VPSHUFB`.
 - With `N<=256` and full-code `R<=128`, benchmark a hybrid FDMA-leaf crossover;
   FMA/half-GCD asymptotics may not repay their transform overhead at this scale.
 - Native Cantor coordinates make XDRS derivative `B` scales identity, but its
@@ -77,6 +81,8 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
 - Single-codeword LCH block kernels vectorize across code positions, not shard
   bytes; the GFNI path converts the full buffer once to an AES-isomorphic basis
   so `VGF2P8MULB` can consume lane-varying skew factors at every radix-2 stage.
+- AVX2-only single-codeword block transforms use SSSE3 for 16-byte halves,
+  AVX2 for wider halves, and scalar butterflies below 16 bytes.
 - Native Cantor `Tables().affine[c]` avoids basis conversion for fixed factors,
   but GFNI affine selects only one 8x8 matrix per 64-bit/eight-byte region.
 - The Cantor-affine codeword scan is opt-in via
@@ -136,6 +142,9 @@ This repository is a small C++ GF arithmetic and matrix benchmark project.
 
 ## Matrix/GF(256) Guidance
 
+- Document header functions with parseable Doxygen block comments
+  (`/** ... */`) and tags such as `@brief`, `@param`, and `@return`; do not use
+  `//` comments as API documentation.
 - Keep exact GF(256) semantics: field addition is XOR, not integer addition.
 - For lookup-table SIMD paths, use the low/high-nibble `pshufb` decomposition:
   `product = table_lo[a][b & 0x0f] ^ table_hi[a][b >> 4]`.

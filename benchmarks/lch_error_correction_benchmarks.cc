@@ -325,8 +325,8 @@ class BatchCorrectionInput {
         errors_(MakeBatchErrors(code, profile, kByteCount)),
         errors_per_codeword_(errors_.size() / kByteCount) {
     if (!encoder_.Valid() || !decoder_.Valid() ||
-        !gf2p8::lch::BackendAvailable(Backend::gfni256_affine)) {
-      error_ = "GFNI batch backend is unavailable";
+        !gf2p8::lch::BackendAvailable(Backend::avx2)) {
+      error_ = "AVX2 batch backend is unavailable";
       return;
     }
     for (size_t shard = 0; shard < code.data_count; ++shard) {
@@ -503,8 +503,9 @@ void BenchmarkCodewordTransform(benchmark::State& state,
                                 bool inverse,
                                 Backend backend,
                                 bool cantor_affine) {
-  if ((backend != Backend::scalar || cantor_affine) &&
-      !gf2p8::lch::BackendAvailable(Backend::gfni256_affine)) {
+  if ((backend != Backend::scalar && !gf2p8::lch::BackendAvailable(backend)) ||
+      (cantor_affine &&
+       !gf2p8::lch::BackendAvailable(Backend::gfni256_affine))) {
     state.SkipWithError("backend was not compiled");
     return;
   }
@@ -569,7 +570,7 @@ void RegisterScalarCorrectionBenchmarks() {
 void RegisterBatchCorrectionBenchmarks() {
   for (const ErrorProfile profile : kErrorProfiles) {
     auto* registered = benchmark::RegisterBenchmark(
-        std::string("LCH/Owned/ErrorCorrection/FDMA/BatchGFNI32/") +
+        std::string("LCH/Owned/ErrorCorrection/FDMA/BatchSIMD32/") +
             ProfileName(profile),
         [profile](benchmark::State& state) {
           BenchmarkBatchCorrection(state,
@@ -595,6 +596,7 @@ void RegisterCodewordTransformBenchmarks() {
   };
   std::vector<Variant> variants = {
       {Backend::scalar, "Scalar", false},
+      {Backend::avx2, "AVX2Hybrid", false},
       {Backend::gfni256_affine, "GFNI256Mul", false},
   };
 #if defined(GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT)

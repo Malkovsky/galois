@@ -14,6 +14,7 @@
 #include "lin_chung_han/codeword_transform_internal.h"
 #include "lin_chung_han/transform.h"
 #include "reed_solomon/code_parameters.h"
+#include "reed_solomon/error_correction/avx2_internal.h"
 #include "reed_solomon/error_correction/internal.h"
 
 namespace gf2p8::rs::detail::error_correction {
@@ -161,6 +162,57 @@ void UpdateSamplesGFNI(Element* first,
         Product(source_cantor, static_cast<Element>(i ^ constraint), tables);
     first[i] = cantor_to_aes[new_first_cantor];
     second[i] = cantor_to_aes[new_second_cantor];
+  }
+}
+#endif
+
+#if defined(__AVX2__)
+template <bool UseFirst>
+void UpdateSamplesAVX2(Element* first,
+                       Element* second,
+                       size_t begin,
+                       size_t end,
+                       size_t constraint,
+                       Element first_discrepancy,
+                       Element second_discrepancy,
+                       const MultiplicationTables& tables) {
+  static constexpr std::array<Element, kFieldSize> kEvaluationPoints = [] {
+    std::array<Element, kFieldSize> points{};
+    for (size_t i = 0; i < points.size(); ++i) {
+      points[i] = static_cast<Element>(i);
+    }
+    return points;
+  }();
+  const __m256i constraint_vector =
+      _mm256_set1_epi8(static_cast<char>(constraint));
+
+  size_t i = begin;
+  for (; i + 32 <= end; i += 32) {
+    const __m256i old_first =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(first + i));
+    const __m256i old_second =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(second + i));
+    const __m256i new_first = _mm256_xor_si256(
+        avx2::MultiplyFixed(old_first, second_discrepancy, tables),
+        avx2::MultiplyFixed(old_second, first_discrepancy, tables));
+    const __m256i source = UseFirst ? old_first : old_second;
+    const __m256i point_differences = _mm256_xor_si256(
+        _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(kEvaluationPoints.data() + i)),
+        constraint_vector);
+    const __m256i new_second =
+        avx2::MultiplyVariable(source, point_differences, tables);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(first + i), new_first);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(second + i), new_second);
+  }
+
+  for (; i < end; ++i) {
+    const Element old_first = first[i];
+    const Element old_second = second[i];
+    first[i] = Product(old_first, second_discrepancy, tables) ^
+               Product(old_second, first_discrepancy, tables);
+    second[i] = Product(UseFirst ? old_first : old_second,
+                        static_cast<Element>(i ^ constraint), tables);
   }
 }
 #endif
@@ -427,6 +479,13 @@ CorrectionResult CorrectOne(const LCHDecoder& decoder,
         std::span(locator_second).first(correction_radius + 1));
   }
 #endif
+#if defined(__AVX2__)
+#if defined(__GFNI__)
+  const bool use_avx2_fdma = !use_gfni_fdma && recovery_count >= 32;
+#else
+  const bool use_avx2_fdma = recovery_count >= 32;
+#endif
+#endif
   for (size_t constraint = 0; constraint < recovery_count; ++constraint) {
     const Element first_discrepancy = d[constraint];
     const Element second_discrepancy = g[constraint];
@@ -448,6 +507,25 @@ CorrectionResult CorrectOne(const LCHDecoder& decoder,
                                  recovery_count, constraint, first_discrepancy,
                                  second_discrepancy, tables);
         UpdateSamplesGFNI<false>(locator_first.data(), locator_second.data(), 0,
+                                 correction_radius + 1, constraint,
+                                 first_discrepancy, second_discrepancy, tables);
+      }
+    } else
+#endif
+#if defined(__AVX2__)
+        if (use_avx2_fdma) {
+      if (first_update) {
+        UpdateSamplesAVX2<true>(d.data(), g.data(), constraint + 1,
+                                recovery_count, constraint, first_discrepancy,
+                                second_discrepancy, tables);
+        UpdateSamplesAVX2<true>(locator_first.data(), locator_second.data(), 0,
+                                correction_radius + 1, constraint,
+                                first_discrepancy, second_discrepancy, tables);
+      } else {
+        UpdateSamplesAVX2<false>(d.data(), g.data(), constraint + 1,
+                                 recovery_count, constraint, first_discrepancy,
+                                 second_discrepancy, tables);
+        UpdateSamplesAVX2<false>(locator_first.data(), locator_second.data(), 0,
                                  correction_radius + 1, constraint,
                                  first_discrepancy, second_discrepancy, tables);
       }

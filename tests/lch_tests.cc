@@ -417,9 +417,10 @@ TEST(LCHCodewordTransform, EveryBackendMatchesPointerTransforms) {
           }
 
           for (const Backend backend :
-               {Backend::scalar, Backend::tuned, Backend::gfni256_affine}) {
-            if (backend == Backend::gfni256_affine &&
-                !gf2p8::lch::BackendAvailable(backend)) {
+               {Backend::scalar, Backend::tuned, Backend::avx2,
+                Backend::gfni256_affine}) {
+            if (!gf2p8::lch::BackendAvailable(backend) &&
+                backend != Backend::scalar && backend != Backend::tuned) {
               continue;
             }
             std::vector<Element> actual = input;
@@ -452,10 +453,10 @@ TEST(LCHCodewordTransform, EveryBackendMatchesPointerTransforms) {
 #endif
         }
 
-        for (const Backend backend :
-             {Backend::scalar, Backend::tuned, Backend::gfni256_affine}) {
-          if (backend == Backend::gfni256_affine &&
-              !gf2p8::lch::BackendAvailable(backend)) {
+        for (const Backend backend : {Backend::scalar, Backend::tuned,
+                                      Backend::avx2, Backend::gfni256_affine}) {
+          if (!gf2p8::lch::BackendAvailable(backend) &&
+              backend != Backend::scalar && backend != Backend::tuned) {
             continue;
           }
           std::vector<Element> round_trip = input;

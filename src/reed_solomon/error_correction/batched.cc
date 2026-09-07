@@ -12,10 +12,12 @@
 #include <limits>
 #include <span>
 
+#include "field.h"
 #include "lin_chung_han/codeword_transform_internal.h"
 #include "lin_chung_han/kernels_internal.h"
 #include "lin_chung_han/transform.h"
 #include "reed_solomon/code_parameters.h"
+#include "reed_solomon/error_correction/avx2_internal.h"
 #include "reed_solomon/error_correction/internal.h"
 
 namespace gf2p8::rs::detail::error_correction {
@@ -76,7 +78,7 @@ bool SupportedDimensions(const LCHDecoder& decoder,
          parameters.mother_size == codeword_size;
 }
 
-#if defined(__GFNI__) && defined(__AVX2__)
+#if defined(__AVX2__)
 size_t PublicPosition(CodeFamily family,
                       size_t data_count,
                       size_t recovery_count,
@@ -141,7 +143,7 @@ CorrectionStatus CorrectColumnsScalar(const LCHDecoder& decoder,
   return CorrectionStatus::ok;
 }
 
-#if defined(__GFNI__) && defined(__AVX2__)
+#if defined(__AVX2__)
 
 constexpr size_t kBatchLanes = 32;
 constexpr size_t kMaximumLocatorSamples = kFieldSize / 4 + 1;
@@ -248,12 +250,28 @@ void IFFT32Blocks(Rows& rows,
   }
 }
 
-__m256i LaneMask(uint32_t bits) {
-  alignas(32) std::array<Element, kBatchLanes> bytes;
-  for (size_t lane = 0; lane < kBatchLanes; ++lane) {
-    bytes[lane] = static_cast<Element>(0U - ((bits >> lane) & 1U));
+consteval std::array<uint64_t, 256> MakeLaneByteTable() {
+  std::array<uint64_t, 256> table{};
+  for (size_t value = 0; value < table.size(); ++value) {
+    for (size_t bit = 0; bit < 8; ++bit) {
+      table[value] |= static_cast<uint64_t>((value >> bit) & 1U) << (8 * bit);
+    }
   }
-  return _mm256_load_si256(reinterpret_cast<const __m256i*>(bytes.data()));
+  return table;
+}
+
+inline constexpr auto kLaneByteTable = MakeLaneByteTable();
+
+__m256i LaneBytes(uint32_t bits) {
+  return _mm256_set_epi64x(
+      static_cast<long long>(kLaneByteTable[(bits >> 24) & 0xffU]),
+      static_cast<long long>(kLaneByteTable[(bits >> 16) & 0xffU]),
+      static_cast<long long>(kLaneByteTable[(bits >> 8) & 0xffU]),
+      static_cast<long long>(kLaneByteTable[bits & 0xffU]));
+}
+
+__m256i LaneMask(uint32_t bits) {
+  return _mm256_sub_epi8(_mm256_setzero_si256(), LaneBytes(bits));
 }
 
 uint32_t ZeroMask(__m256i values) {
@@ -261,6 +279,55 @@ uint32_t ZeroMask(__m256i values) {
       _mm256_movemask_epi8(_mm256_cmpeq_epi8(values, _mm256_setzero_si256())));
 }
 
+__m128i PackWordMask(__m256i mask) {
+  return _mm_packs_epi16(_mm256_castsi256_si128(mask),
+                         _mm256_extracti128_si256(mask, 1));
+}
+
+__m256i UpdateRanks(__m256i first_discrepancy,
+                    __m256i second_discrepancy,
+                    uint16_t* first_ranks,
+                    uint16_t* second_ranks) {
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i all = _mm256_set1_epi16(-1);
+  const __m256i two = _mm256_set1_epi16(2);
+  __m128i byte_masks[2];
+  for (size_t half = 0; half < 2; ++half) {
+    const __m128i first_bytes =
+        half == 0 ? _mm256_castsi256_si128(first_discrepancy)
+                  : _mm256_extracti128_si256(first_discrepancy, 1);
+    const __m128i second_bytes =
+        half == 0 ? _mm256_castsi256_si128(second_discrepancy)
+                  : _mm256_extracti128_si256(second_discrepancy, 1);
+    const __m256i first_values = _mm256_cvtepu8_epi16(first_bytes);
+    const __m256i second_values = _mm256_cvtepu8_epi16(second_bytes);
+    const __m256i old_first = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(first_ranks + 16 * half));
+    const __m256i old_second = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(second_ranks + 16 * half));
+    const __m256i second_is_zero = _mm256_cmpeq_epi16(second_values, zero);
+    const __m256i first_is_nonzero =
+        _mm256_xor_si256(_mm256_cmpeq_epi16(first_values, zero), all);
+    const __m256i first_rank_is_lower =
+        _mm256_cmpgt_epi16(old_second, old_first);
+    const __m256i update = _mm256_or_si256(
+        second_is_zero,
+        _mm256_and_si256(first_is_nonzero, first_rank_is_lower));
+    const __m256i new_first = _mm256_blendv_epi8(old_first, old_second, update);
+    const __m256i new_second =
+        _mm256_blendv_epi8(_mm256_add_epi16(old_second, two),
+                           _mm256_add_epi16(old_first, two), update);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(first_ranks + 16 * half),
+                        new_first);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(second_ranks + 16 * half),
+                        new_second);
+    byte_masks[half] = PackWordMask(update);
+  }
+  return _mm256_inserti128_si256(_mm256_castsi128_si256(byte_masks[0]),
+                                 byte_masks[1], 1);
+}
+
+template <bool UseGFNI>
 void UpdateBatchRows(Element* first,
                      Element* second,
                      size_t begin,
@@ -268,21 +335,46 @@ void UpdateBatchRows(Element* first,
                      size_t constraint,
                      __m256i first_discrepancy,
                      __m256i second_discrepancy,
-                     __m256i first_update_mask) {
+                     __m256i first_update_mask,
+                     const avx2::PreparedMultiplier* first_multiplier,
+                     const avx2::PreparedMultiplier* second_multiplier,
+                     const MultiplicationTables& tables) {
+#if defined(__GFNI__)
   const auto& cantor_to_aes = lch::detail::CantorToAESMap();
+#else
+  static_assert(!UseGFNI);
+  (void)first_discrepancy;
+  (void)second_discrepancy;
+#endif
   for (size_t i = begin; i < end; ++i) {
     __m256i old_first = _mm256_load_si256(
         reinterpret_cast<const __m256i*>(first + i * kBatchLanes));
     __m256i old_second = _mm256_load_si256(
         reinterpret_cast<const __m256i*>(second + i * kBatchLanes));
+#if defined(__GFNI__)
+    if constexpr (UseGFNI) {
+      const __m256i new_first =
+          _mm256_xor_si256(_mm256_gf2p8mul_epi8(old_first, second_discrepancy),
+                           _mm256_gf2p8mul_epi8(old_second, first_discrepancy));
+      const __m256i source =
+          _mm256_blendv_epi8(old_second, old_first, first_update_mask);
+      const __m256i point_difference = _mm256_set1_epi8(static_cast<char>(
+          cantor_to_aes[static_cast<Element>(i ^ constraint)]));
+      const __m256i new_second = _mm256_gf2p8mul_epi8(source, point_difference);
+      _mm256_store_si256(reinterpret_cast<__m256i*>(first + i * kBatchLanes),
+                         new_first);
+      _mm256_store_si256(reinterpret_cast<__m256i*>(second + i * kBatchLanes),
+                         new_second);
+      continue;
+    }
+#endif
     const __m256i new_first =
-        _mm256_xor_si256(_mm256_gf2p8mul_epi8(old_first, second_discrepancy),
-                         _mm256_gf2p8mul_epi8(old_second, first_discrepancy));
+        _mm256_xor_si256(avx2::MultiplyPrepared(old_first, *second_multiplier),
+                         avx2::MultiplyPrepared(old_second, *first_multiplier));
     const __m256i source =
         _mm256_blendv_epi8(old_second, old_first, first_update_mask);
-    const __m256i point_difference = _mm256_set1_epi8(
-        static_cast<char>(cantor_to_aes[static_cast<Element>(i ^ constraint)]));
-    const __m256i new_second = _mm256_gf2p8mul_epi8(source, point_difference);
+    const __m256i new_second = avx2::MultiplyFixed(
+        source, static_cast<Element>(i ^ constraint), tables);
     _mm256_store_si256(reinterpret_cast<__m256i*>(first + i * kBatchLanes),
                        new_first);
     _mm256_store_si256(reinterpret_cast<__m256i*>(second + i * kBatchLanes),
@@ -310,6 +402,7 @@ void DifferentiateRows(const Element* coefficients,
   }
 }
 
+#if defined(__GFNI__)
 __m256i InvertAES(__m256i value) {
   const __m256i power2 = _mm256_gf2p8mul_epi8(value, value);
   const __m256i power3 = _mm256_gf2p8mul_epi8(power2, value);
@@ -323,36 +416,74 @@ __m256i InvertAES(__m256i value) {
   const __m256i power252 = _mm256_gf2p8mul_epi8(power240, power12);
   return _mm256_gf2p8mul_epi8(power252, power2);
 }
+#endif
 
+template <bool UseGFNI>
 uint32_t DivideRows(const Element* numerator,
                     const Element* denominator,
                     Element denominator_scale,
                     Element* quotient,
-                    uint32_t active_lanes) {
-  alignas(32) std::array<Element, kBatchLanes> numerator_aes;
-  alignas(32) std::array<Element, kBatchLanes> denominator_aes;
-  std::memcpy(numerator_aes.data(), numerator, kBatchLanes);
-  std::memcpy(denominator_aes.data(), denominator, kBatchLanes);
-  lch::detail::ConvertCantorToAES(numerator_aes);
-  lch::detail::ConvertCantorToAES(denominator_aes);
+                    uint32_t active_lanes,
+                    const MultiplicationTables& tables) {
+#if defined(__GFNI__)
+  if constexpr (UseGFNI) {
+    alignas(32) std::array<Element, kBatchLanes> numerator_aes;
+    alignas(32) std::array<Element, kBatchLanes> denominator_aes;
+    std::memcpy(numerator_aes.data(), numerator, kBatchLanes);
+    std::memcpy(denominator_aes.data(), denominator, kBatchLanes);
+    lch::detail::ConvertCantorToAES(numerator_aes);
+    lch::detail::ConvertCantorToAES(denominator_aes);
 
-  const __m256i numerator_vector =
-      _mm256_load_si256(reinterpret_cast<const __m256i*>(numerator_aes.data()));
-  __m256i denominator_vector = _mm256_load_si256(
-      reinterpret_cast<const __m256i*>(denominator_aes.data()));
-  if (denominator_scale != 1) {
-    const Element scale_aes = lch::detail::CantorToAESMap()[denominator_scale];
-    denominator_vector = _mm256_gf2p8mul_epi8(
-        denominator_vector, _mm256_set1_epi8(static_cast<char>(scale_aes)));
+    const __m256i numerator_vector = _mm256_load_si256(
+        reinterpret_cast<const __m256i*>(numerator_aes.data()));
+    __m256i denominator_vector = _mm256_load_si256(
+        reinterpret_cast<const __m256i*>(denominator_aes.data()));
+    if (denominator_scale != 1) {
+      const Element scale_aes =
+          lch::detail::CantorToAESMap()[denominator_scale];
+      denominator_vector = _mm256_gf2p8mul_epi8(
+          denominator_vector, _mm256_set1_epi8(static_cast<char>(scale_aes)));
+    }
+    const uint32_t zero_denominators = ZeroMask(denominator_vector);
+    const __m256i quotient_aes =
+        _mm256_gf2p8mul_epi8(numerator_vector, InvertAES(denominator_vector));
+    _mm256_store_si256(reinterpret_cast<__m256i*>(numerator_aes.data()),
+                       quotient_aes);
+    lch::detail::ConvertAESToCantor(numerator_aes);
+    std::memcpy(quotient, numerator_aes.data(), kBatchLanes);
+    return active_lanes & zero_denominators;
   }
-  const uint32_t zero_denominators = ZeroMask(denominator_vector);
-  const __m256i quotient_aes =
-      _mm256_gf2p8mul_epi8(numerator_vector, InvertAES(denominator_vector));
-  _mm256_store_si256(reinterpret_cast<__m256i*>(numerator_aes.data()),
-                     quotient_aes);
-  lch::detail::ConvertAESToCantor(numerator_aes);
-  std::memcpy(quotient, numerator_aes.data(), kBatchLanes);
-  return active_lanes & zero_denominators;
+#else
+  static_assert(!UseGFNI);
+#endif
+
+  alignas(32) std::array<Element, kBatchLanes> scaled_denominators;
+  const __m256i denominator_values =
+      _mm256_load_si256(reinterpret_cast<const __m256i*>(denominator));
+  _mm256_store_si256(
+      reinterpret_cast<__m256i*>(scaled_denominators.data()),
+      avx2::MultiplyFixed(denominator_values, denominator_scale, tables));
+  const LogarithmTables& logarithms = tables.cantor;
+  uint32_t failed_lanes = 0;
+  uint32_t lanes = active_lanes;
+  while (lanes != 0) {
+    const size_t lane = std::countr_zero(lanes);
+    const Element scaled_denominator = scaled_denominators[lane];
+    if (scaled_denominator == 0) {
+      failed_lanes |= uint32_t{1} << lane;
+    } else if (numerator[lane] == 0) {
+      quotient[lane] = 0;
+    } else {
+      int difference = logarithms.logarithm[numerator[lane]] -
+                       logarithms.logarithm[scaled_denominator];
+      if (difference < 0) {
+        difference += 255;
+      }
+      quotient[lane] = logarithms.exponent[static_cast<size_t>(difference)];
+    }
+    lanes &= lanes - 1;
+  }
+  return failed_lanes;
 }
 
 void CopyNativeCodeword(std::span<Element* const> data,
@@ -392,7 +523,15 @@ void FoldSyndrome(Rows& transformed,
                   const lch::detail::ResolvedKernels& kernels) {
   for (size_t block = recovery_count; block < codeword_size;
        block += recovery_count) {
-    for (size_t i = 0; i < recovery_count; ++i) {
+    size_t i = 0;
+    for (; i + 4 <= recovery_count; i += 4) {
+      kernels.xor_four(Row(transformed, i), Row(transformed, block + i),
+                       Row(transformed, i + 1), Row(transformed, block + i + 1),
+                       Row(transformed, i + 2), Row(transformed, block + i + 2),
+                       Row(transformed, i + 3), Row(transformed, block + i + 3),
+                       kBatchLanes);
+    }
+    for (; i < recovery_count; ++i) {
       kernels.xor_one(Row(transformed, i), Row(transformed, block + i),
                       kBatchLanes);
     }
@@ -409,7 +548,7 @@ void PublishChunkResults(std::span<CorrectionResult> results,
                          uint32_t clean_lanes,
                          uint32_t corrected_lanes,
                          const std::array<uint32_t, kFieldSize>& root_masks,
-                         const std::array<uint16_t, kBatchLanes>& root_counts) {
+                         const std::array<uint8_t, kBatchLanes>& root_counts) {
   const size_t codeword_size = data_count + recovery_count;
   for (size_t lane = 0; lane < kBatchLanes; ++lane) {
     const uint32_t bit = uint32_t{1} << lane;
@@ -430,13 +569,14 @@ void PublishChunkResults(std::span<CorrectionResult> results,
     const size_t public_position =
         PublicPosition(family, data_count, recovery_count, native_position);
     const uint32_t roots = root_masks[native_position] & corrected_lanes;
-    for (size_t lane = 0; lane < kBatchLanes; ++lane) {
-      error_masks[public_position * byte_count + column + lane] =
-          static_cast<uint8_t>((roots >> lane) & 1U);
-    }
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(error_masks.data() +
+                                   public_position * byte_count + column),
+        LaneBytes(roots));
   }
 }
 
+template <bool UseGFNI>
 void CorrectChunk32(std::span<Element* const> data,
                     std::span<const Element* const> recovery,
                     size_t byte_count,
@@ -445,11 +585,15 @@ void CorrectChunk32(std::span<Element* const> data,
                     const lch::detail::ResolvedKernels& kernels,
                     std::span<CorrectionResult> results,
                     std::span<uint8_t> error_masks) {
+#if !defined(__GFNI__)
+  static_assert(!UseGFNI);
+#endif
   const size_t data_count = data.size();
   const size_t recovery_count = recovery.size();
   const size_t codeword_size = data_count + recovery_count;
   const size_t correction_radius = recovery_count / 2;
   const lch::Context& context = lch::Context::Shared();
+  const MultiplicationTables& tables = context.Tables();
 
   alignas(32) Rows work{};
   alignas(32) SyndromeRows syndrome_or_scratch{};
@@ -457,10 +601,10 @@ void CorrectChunk32(std::span<Element* const> data,
   alignas(32) SampleRows locator_first{};
   alignas(32) SampleRows locator_second{};
   std::array<uint32_t, kFieldSize> root_masks{};
-  std::array<uint16_t, kBatchLanes> first_ranks{};
-  std::array<uint16_t, kBatchLanes> second_ranks{};
+  alignas(32) std::array<uint16_t, kBatchLanes> first_ranks{};
+  alignas(32) std::array<uint16_t, kBatchLanes> second_ranks{};
   std::array<uint16_t, kBatchLanes> locator_degrees{};
-  std::array<uint16_t, kBatchLanes> root_counts{};
+  alignas(32) std::array<uint8_t, kBatchLanes> root_counts{};
   second_ranks.fill(1);
 
   CopyNativeCodeword(data, recovery, parameters.family, column, work);
@@ -496,48 +640,53 @@ void CorrectChunk32(std::span<Element* const> data,
   std::fill_n(locator_second.data(), (correction_radius + 1) * kBatchLanes,
               Element{0});
 
-  lch::detail::ConvertCantorToAES(
-      std::span(syndrome_or_scratch).first(recovery_count * kBatchLanes));
-  lch::detail::ConvertCantorToAES(
-      std::span(derivative).first(recovery_count * kBatchLanes));
-  lch::detail::ConvertCantorToAES(
-      std::span(locator_first).first((correction_radius + 1) * kBatchLanes));
-  lch::detail::ConvertCantorToAES(
-      std::span(locator_second).first((correction_radius + 1) * kBatchLanes));
+#if defined(__GFNI__)
+  if constexpr (UseGFNI) {
+    lch::detail::ConvertCantorToAES(
+        std::span(syndrome_or_scratch).first(recovery_count * kBatchLanes));
+    lch::detail::ConvertCantorToAES(
+        std::span(derivative).first(recovery_count * kBatchLanes));
+    lch::detail::ConvertCantorToAES(
+        std::span(locator_first).first((correction_radius + 1) * kBatchLanes));
+    lch::detail::ConvertCantorToAES(
+        std::span(locator_second).first((correction_radius + 1) * kBatchLanes));
+  }
+#endif
 
   for (size_t constraint = 0; constraint < recovery_count; ++constraint) {
     const __m256i first_discrepancy = _mm256_load_si256(
         reinterpret_cast<const __m256i*>(Row(syndrome_or_scratch, constraint)));
     const __m256i second_discrepancy = _mm256_load_si256(
         reinterpret_cast<const __m256i*>(Row(derivative, constraint)));
-    alignas(32) std::array<Element, kBatchLanes> first_values;
-    alignas(32) std::array<Element, kBatchLanes> second_values;
-    alignas(32) std::array<Element, kBatchLanes> update_bytes;
-    _mm256_store_si256(reinterpret_cast<__m256i*>(first_values.data()),
-                       first_discrepancy);
-    _mm256_store_si256(reinterpret_cast<__m256i*>(second_values.data()),
-                       second_discrepancy);
-    for (size_t lane = 0; lane < kBatchLanes; ++lane) {
-      const bool first_update =
-          second_values[lane] == 0 ||
-          (first_values[lane] != 0 && first_ranks[lane] < second_ranks[lane]);
-      update_bytes[lane] = first_update ? 0xff : 0;
-      if (first_update) {
-        const uint16_t old_first_rank = first_ranks[lane];
-        first_ranks[lane] = second_ranks[lane];
-        second_ranks[lane] = static_cast<uint16_t>(old_first_rank + 2);
-      } else {
-        second_ranks[lane] = static_cast<uint16_t>(second_ranks[lane] + 2);
-      }
+    const __m256i update_mask =
+        UpdateRanks(first_discrepancy, second_discrepancy, first_ranks.data(),
+                    second_ranks.data());
+#if defined(__GFNI__)
+    if constexpr (UseGFNI) {
+      UpdateBatchRows<true>(syndrome_or_scratch.data(), derivative.data(),
+                            constraint + 1, recovery_count, constraint,
+                            first_discrepancy, second_discrepancy, update_mask,
+                            nullptr, nullptr, tables);
+      UpdateBatchRows<true>(locator_first.data(), locator_second.data(), 0,
+                            correction_radius + 1, constraint,
+                            first_discrepancy, second_discrepancy, update_mask,
+                            nullptr, nullptr, tables);
+    } else
+#endif
+    {
+      avx2::PreparedMultiplier first_multiplier;
+      avx2::PreparedMultiplier second_multiplier;
+      first_multiplier = avx2::PrepareMultiplier(first_discrepancy, tables);
+      second_multiplier = avx2::PrepareMultiplier(second_discrepancy, tables);
+      UpdateBatchRows<false>(syndrome_or_scratch.data(), derivative.data(),
+                             constraint + 1, recovery_count, constraint,
+                             first_discrepancy, second_discrepancy, update_mask,
+                             &first_multiplier, &second_multiplier, tables);
+      UpdateBatchRows<false>(locator_first.data(), locator_second.data(), 0,
+                             correction_radius + 1, constraint,
+                             first_discrepancy, second_discrepancy, update_mask,
+                             &first_multiplier, &second_multiplier, tables);
     }
-    const __m256i update_mask = _mm256_load_si256(
-        reinterpret_cast<const __m256i*>(update_bytes.data()));
-    UpdateBatchRows(syndrome_or_scratch.data(), derivative.data(),
-                    constraint + 1, recovery_count, constraint,
-                    first_discrepancy, second_discrepancy, update_mask);
-    UpdateBatchRows(locator_first.data(), locator_second.data(), 0,
-                    correction_radius + 1, constraint, first_discrepancy,
-                    second_discrepancy, update_mask);
   }
 
   // FDMA mutated its discrepancy rows, but work still holds the original
@@ -569,8 +718,12 @@ void CorrectChunk32(std::span<Element* const> data,
     _mm256_store_si256(reinterpret_cast<__m256i*>(Row(locator_first, i)),
                        _mm256_blendv_epi8(second, first, selection_mask));
   }
-  lch::detail::ConvertAESToCantor(
-      std::span(locator_first).first((correction_radius + 1) * kBatchLanes));
+#if defined(__GFNI__)
+  if constexpr (UseGFNI) {
+    lch::detail::ConvertAESToCantor(
+        std::span(locator_first).first((correction_radius + 1) * kBatchLanes));
+  }
+#endif
   std::memcpy(locator_second.data(), locator_first.data(),
               (correction_radius + 1) * kBatchLanes);
 
@@ -607,17 +760,18 @@ void CorrectChunk32(std::span<Element* const> data,
                 (correction_radius + 1) * kBatchLanes);
   }
   FFT32Blocks(work, codeword_size, recovery_count, kernels);
+  __m256i root_count_vector = _mm256_setzero_si256();
+  const __m256i candidate_mask = LaneMask(candidate_lanes);
   for (size_t position = 0; position < codeword_size; ++position) {
     const __m256i values = _mm256_load_si256(
         reinterpret_cast<const __m256i*>(Row(work, position)));
-    root_masks[position] = ZeroMask(values) & candidate_lanes;
-    uint32_t roots = root_masks[position];
-    while (roots != 0) {
-      const size_t lane = std::countr_zero(roots);
-      ++root_counts[lane];
-      roots &= roots - 1;
-    }
+    const __m256i roots = _mm256_and_si256(
+        _mm256_cmpeq_epi8(values, _mm256_setzero_si256()), candidate_mask);
+    root_masks[position] = static_cast<uint32_t>(_mm256_movemask_epi8(roots));
+    root_count_vector = _mm256_sub_epi8(root_count_vector, roots);
   }
+  _mm256_store_si256(reinterpret_cast<__m256i*>(root_counts.data()),
+                     root_count_vector);
   for (size_t lane = 0; lane < kBatchLanes; ++lane) {
     if (root_counts[lane] != locator_degrees[lane]) {
       candidate_lanes &= ~(uint32_t{1} << lane);
@@ -646,20 +800,37 @@ void CorrectChunk32(std::span<Element* const> data,
   // z(a)=u(a)lambda(a) in the AES-isomorphic basis.
   std::memcpy(derivative.data(), syndrome_or_scratch.data(),
               (correction_radius + 1) * kBatchLanes);
-  lch::detail::ConvertCantorToAES(
-      std::span(locator_second).first((correction_radius + 1) * kBatchLanes));
-  lch::detail::ConvertCantorToAES(
-      std::span(derivative).first((correction_radius + 1) * kBatchLanes));
+#if defined(__GFNI__)
+  if constexpr (UseGFNI) {
+    lch::detail::ConvertCantorToAES(
+        std::span(locator_second).first((correction_radius + 1) * kBatchLanes));
+    lch::detail::ConvertCantorToAES(
+        std::span(derivative).first((correction_radius + 1) * kBatchLanes));
+  }
+#endif
   for (size_t i = 0; i <= correction_radius; ++i) {
     const __m256i locator = _mm256_load_si256(
         reinterpret_cast<const __m256i*>(Row(locator_second, i)));
     const __m256i syndrome =
         _mm256_load_si256(reinterpret_cast<const __m256i*>(Row(derivative, i)));
+    __m256i product;
+#if defined(__GFNI__)
+    if constexpr (UseGFNI) {
+      product = _mm256_gf2p8mul_epi8(locator, syndrome);
+    } else
+#endif
+    {
+      product = avx2::MultiplyVariable(locator, syndrome, tables);
+    }
     _mm256_store_si256(reinterpret_cast<__m256i*>(Row(locator_second, i)),
-                       _mm256_gf2p8mul_epi8(locator, syndrome));
+                       product);
   }
-  lch::detail::ConvertAESToCantor(
-      std::span(locator_second).first((correction_radius + 1) * kBatchLanes));
+#if defined(__GFNI__)
+  if constexpr (UseGFNI) {
+    lch::detail::ConvertAESToCantor(
+        std::span(locator_second).first((correction_radius + 1) * kBatchLanes));
+  }
+#endif
 
   IFFT32Rows(locator_second.data(), correction_radius, 0, kernels);
   std::memcpy(derivative.data(), locator_second.data(),
@@ -709,9 +880,10 @@ void CorrectChunk32(std::span<Element* const> data,
     if (active == 0) {
       continue;
     }
-    candidate_lanes &= ~DivideRows(
-        Row(work, position), Row(derivative, position),
-        context.Skew(syndrome_level, position), Row(work, position), active);
+    candidate_lanes &=
+        ~DivideRows<UseGFNI>(Row(work, position), Row(derivative, position),
+                             context.Skew(syndrome_level, position),
+                             Row(work, position), active, tables);
     const __m256i correction = _mm256_load_si256(
         reinterpret_cast<const __m256i*>(Row(work, position)));
     candidate_lanes &= ~(active & ZeroMask(correction));
@@ -727,8 +899,8 @@ void CorrectChunk32(std::span<Element* const> data,
       continue;
     }
     candidate_lanes &=
-        ~DivideRows(Row(work, position), Row(derivative, position), 1,
-                    Row(work, position), active);
+        ~DivideRows<UseGFNI>(Row(work, position), Row(derivative, position), 1,
+                             Row(work, position), active, tables);
     const __m256i ratio = _mm256_load_si256(
         reinterpret_cast<const __m256i*>(Row(work, position)));
     const __m256i syndrome = _mm256_load_si256(
@@ -768,12 +940,15 @@ void CorrectChunk32(std::span<Element* const> data,
       continue;
     }
     const uint32_t active = root_masks[native_position] & candidate_lanes;
-    uint32_t lanes = active;
-    while (lanes != 0) {
-      const size_t lane = std::countr_zero(lanes);
-      data[public_position][column + lane] ^= Row(work, native_position)[lane];
-      lanes &= lanes - 1;
-    }
+    const __m256i old_data = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(data[public_position] + column));
+    const __m256i correction = _mm256_and_si256(
+        _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(Row(work, native_position))),
+        LaneMask(active));
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(data[public_position] + column),
+        _mm256_xor_si256(old_data, correction));
   }
   PublishChunkResults(results, error_masks, byte_count, column,
                       parameters.family, data_count, recovery_count,
@@ -842,16 +1017,23 @@ CorrectionStatus CorrectBatch(const LCHDecoder& decoder,
   std::fill(results.begin(), results.end(), CorrectionResult{});
 
   size_t column = 0;
-#if defined(__GFNI__) && defined(__AVX2__)
-  if (lch::BackendAvailable(lch::Backend::gfni256_affine)) {
-    const lch::Backend transform_backend = lch::SelectBackend(kBatchLanes);
+#if defined(__AVX2__)
+  if (lch::BackendAvailable(lch::Backend::avx2)) {
+    const lch::Backend transform_backend = lch::Backend::avx2;
     const lch::detail::ResolvedKernels* kernels =
         lch::detail::ResolveKernels(transform_backend, kBatchLanes);
     if (kernels != nullptr) {
+#if defined(__GFNI__)
       for (; column + kBatchLanes <= byte_count; column += kBatchLanes) {
-        CorrectChunk32(data, recovery, byte_count, column, parameters, *kernels,
-                       results, error_masks);
+        CorrectChunk32<true>(data, recovery, byte_count, column, parameters,
+                             *kernels, results, error_masks);
       }
+#else
+      for (; column + kBatchLanes <= byte_count; column += kBatchLanes) {
+        CorrectChunk32<false>(data, recovery, byte_count, column, parameters,
+                              *kernels, results, error_masks);
+      }
+#endif
     }
   }
 #endif

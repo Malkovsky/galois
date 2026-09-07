@@ -10,6 +10,7 @@
 
 #include "field.h"
 #include "lin_chung_han/codeword_transform_internal.h"
+#include "lin_chung_han/kernels_internal.h"
 
 namespace gf2p8::lch::detail {
 namespace {
@@ -132,10 +133,11 @@ Status Validate(std::span<Element> values,
     return Status::invalid_argument;
   }
   if (backend != Backend::scalar && backend != Backend::tuned &&
-      backend != Backend::gfni256_affine) {
+      backend != Backend::avx2 && backend != Backend::gfni256_affine) {
     return Status::unsupported_backend;
   }
-  if (backend == Backend::gfni256_affine && !BackendAvailable(backend)) {
+  if ((backend == Backend::avx2 || backend == Backend::gfni256_affine) &&
+      !BackendAvailable(backend)) {
     return Status::unsupported_backend;
   }
   return Status::ok;
@@ -202,6 +204,54 @@ void IFFTScalar(const Context& context,
     }
   }
 }
+
+#if defined(__AVX2__)
+template <bool Inverse>
+void TransformAVX2(const Context& context,
+                   std::span<Element> values,
+                   size_t block_size,
+                   size_t evaluation_offset) {
+  const ResolvedKernels& kernels = *ResolveKernels(Backend::avx2, size_t{32});
+  const ResolvedKernels* short_kernels =
+      ResolveKernels(Backend::ssse3, size_t{16});
+  const MultiplicationTables& tables = context.Tables();
+  for (size_t half = Inverse ? 1 : block_size / 2;
+       Inverse ? half < block_size : half != 0;
+       half = Inverse ? half * 2 : half / 2) {
+    const size_t group_size = 2 * half;
+    const size_t level = Log2(half);
+    for (size_t outer = 0; outer < values.size(); outer += block_size) {
+      const size_t transform_offset = evaluation_offset + outer;
+      for (size_t group = 0; group < block_size; group += group_size) {
+        const Element coefficient =
+            context.Skew(level, transform_offset ^ group);
+        Element* x = values.data() + outer + group;
+        Element* y = x + half;
+        const ResolvedKernels* stage_kernels = half >= 32   ? &kernels
+                                               : half == 16 ? short_kernels
+                                                            : nullptr;
+        if (stage_kernels != nullptr) {
+          if constexpr (Inverse) {
+            stage_kernels->ifft_radix2(x, y, half, coefficient, tables);
+          } else {
+            stage_kernels->fft_radix2(x, y, half, coefficient, tables);
+          }
+          continue;
+        }
+        for (size_t i = 0; i < half; ++i) {
+          if constexpr (Inverse) {
+            y[i] ^= x[i];
+            x[i] ^= Product(y[i], coefficient, tables);
+          } else {
+            x[i] ^= Product(y[i], coefficient, tables);
+            y[i] ^= x[i];
+          }
+        }
+      }
+    }
+  }
+}
+#endif
 
 #if defined(__GFNI__) && defined(__AVX2__)
 
@@ -621,8 +671,10 @@ Backend ResolveBackend(Backend backend) {
   if (backend != Backend::tuned) {
     return backend;
   }
-  return BackendAvailable(Backend::gfni256_affine) ? Backend::gfni256_affine
-                                                   : Backend::scalar;
+  if (BackendAvailable(Backend::gfni256_affine)) {
+    return Backend::gfni256_affine;
+  }
+  return BackendAvailable(Backend::avx2) ? Backend::avx2 : Backend::scalar;
 }
 
 Status Run(const Context& context,
@@ -640,6 +692,16 @@ Status Run(const Context& context,
     }
     return Status::ok;
   }
+#if defined(__AVX2__)
+  if (backend == Backend::avx2) {
+    if (inverse) {
+      TransformAVX2<true>(context, values, block_size, evaluation_offset);
+    } else {
+      TransformAVX2<false>(context, values, block_size, evaluation_offset);
+    }
+    return Status::ok;
+  }
+#endif
 #if defined(__GFNI__) && defined(__AVX2__)
   if (backend == Backend::gfni256_affine) {
     TransformGFNI(values, block_size, evaluation_offset, inverse);

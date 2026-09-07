@@ -14,6 +14,9 @@
 #include "reed_solomon/experiment/gfni512_radix8.h"
 #endif
 #include "reed_solomon/code_parameters.h"
+#if defined(__AVX2__)
+#include "reed_solomon/error_correction/avx2_internal.h"
+#endif
 #include "reed_solomon/error_correction/internal.h"
 #include "reed_solomon/lch_decoder.h"
 #include "reed_solomon/lch_encoder.h"
@@ -893,6 +896,38 @@ TEST(LCHErrorCorrection, CorrectsRandomMultiErrorLocationsAndMagnitudes) {
     }
   }
 }
+
+#if defined(__AVX2__)
+TEST(LCHErrorCorrection, AVX2VariableProductsMatchCantorField) {
+  namespace avx2 = gf2p8::rs::detail::error_correction::avx2;
+  alignas(32) std::array<Element, 32> first{};
+  alignas(32) std::array<Element, 32> second{};
+  alignas(32) std::array<Element, 32> products{};
+  const auto& tables = gf2p8::Tables();
+
+  for (size_t first_value = 0; first_value < 256; ++first_value) {
+    first.fill(static_cast<Element>(first_value));
+    const __m256i first_vector =
+        _mm256_load_si256(reinterpret_cast<const __m256i*>(first.data()));
+    for (size_t second_base = 0; second_base < 256; second_base += 32) {
+      for (size_t lane = 0; lane < second.size(); ++lane) {
+        second[lane] = static_cast<Element>(second_base + lane);
+      }
+      const __m256i product = avx2::MultiplyVariable(
+          first_vector,
+          _mm256_load_si256(reinterpret_cast<const __m256i*>(second.data())),
+          tables);
+      _mm256_store_si256(reinterpret_cast<__m256i*>(products.data()), product);
+      for (size_t lane = 0; lane < products.size(); ++lane) {
+        ASSERT_EQ(products[lane],
+                  gf2p8::MultiplyCantor(first[lane], second[lane]))
+            << "first=" << first_value
+            << " second=" << static_cast<unsigned>(second[lane]);
+      }
+    }
+  }
+}
+#endif
 
 TEST(LCHErrorCorrection, BatchCorrectsDivergentIndependentCodewords) {
   constexpr size_t kBytes = 65;
