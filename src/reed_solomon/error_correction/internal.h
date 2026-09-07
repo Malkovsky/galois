@@ -4,22 +4,12 @@
 #include <cstdint>
 #include <span>
 
-#include "reed_solomon/lch_decoder.h"
+#include "reed_solomon/error_correction.h"
 
 namespace gf2p8::rs::detail::error_correction {
 
-enum class CorrectionStatus {
-  ok,
-  invalid_argument,
-  unsupported_dimensions,
-  uncorrectable,
-  reconstruction_failed,
-};
-
-struct CorrectionResult {
-  CorrectionStatus status = CorrectionStatus::invalid_argument;
-  size_t error_count = 0;
-};
+using ::gf2p8::rs::CorrectionStatus;
+using ::gf2p8::rs::CorrectionResult;
 
 /**
  * @brief Corrects one scalar LCH Reed-Solomon codeword.
@@ -61,5 +51,20 @@ CorrectionStatus CorrectBatch(const LCHDecoder& decoder,
                               size_t byte_count,
                               std::span<CorrectionResult> results,
                               std::span<uint8_t> error_masks);
+
+/**
+ * @brief Repairs whole independent codewords, including recovery positions.
+ * @param decoder Component code dimensions.
+ * @param shards N disjoint mutable shard ranges in public data/recovery order.
+ * @param byte_count Independent codewords per shard.
+ * @param results Per-codeword outcomes; failed codewords remain unchanged.
+ * @param error_masks Position-major masks, as in CorrectBatch.
+ * @return Call-level status; all shard and output ranges must be disjoint.
+ */
+CorrectionStatus CorrectCodewordBatch(const LCHDecoder& decoder,
+                                      std::span<Element* const> shards,
+                                      size_t byte_count,
+                                      std::span<CorrectionResult> results,
+                                      std::span<uint8_t> error_masks);
 
 }  // namespace gf2p8::rs::detail::error_correction

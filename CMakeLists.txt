@@ -62,6 +62,7 @@ add_library(gf256_core STATIC
     src/reed_solomon/decoder/high_rate.cc
     src/reed_solomon/lch_encoder.cc
     src/reed_solomon/lch_decoder.cc
+    src/reed_solomon/strong_weak_rs_product_code.cc
 )
 target_compile_features(gf256_core PUBLIC cxx_std_20)
 target_include_directories(gf256_core
@@ -142,7 +143,8 @@ if(GF256_BUILD_TESTS)
   target_link_libraries(gf_unittests PRIVATE gf256_core gtest gtest_main)
   add_test(NAME Unittests COMMAND gf_unittests)
 
-  add_executable(lch_rs_unittests tests/lch_tests.cc tests/rs_tests.cc)
+  add_executable(lch_rs_unittests tests/lch_tests.cc tests/rs_tests.cc
+    tests/product_code_tests.cc)
   target_include_directories(lch_rs_unittests PRIVATE ${PROJECT_SOURCE_DIR}/src)
   target_link_libraries(lch_rs_unittests PRIVATE gf256_core gtest gtest_main)
   if(GF256_ENABLE_NATIVE_ISA AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -170,8 +172,10 @@ endif()
 if(GF256_BUILD_BENCHMARKS)
   FetchContent_MakeAvailable(googlebenchmark)
 
-  add_executable(benchmarks benchmarks/matrix_multiplication.cc)
+  add_executable(benchmarks benchmarks/matrix_multiplication.cc
+    benchmarks/strong_weak_rs_product_code_benchmarks.cc)
   target_link_libraries(benchmarks PRIVATE gf256_core benchmark benchmark_main)
+  target_include_directories(benchmarks PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
   add_executable(rs_verbose_benchmarks
     benchmarks/lch_rs_benchmarks.cc
