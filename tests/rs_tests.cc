@@ -14,6 +14,7 @@
 #include "reed_solomon/experiment/gfni512_radix8.h"
 #endif
 #include "reed_solomon/code_parameters.h"
+#include "reed_solomon/error_correction/internal.h"
 #include "reed_solomon/lch_decoder.h"
 #include "reed_solomon/lch_encoder.h"
 
@@ -25,6 +26,9 @@ using gf2p8::lch::Radix;
 using gf2p8::lch::Status;
 using gf2p8::rs::LCHDecoder;
 using gf2p8::rs::LCHEncoder;
+using gf2p8::rs::detail::error_correction::CorrectBatch;
+using gf2p8::rs::detail::error_correction::CorrectionStatus;
+using gf2p8::rs::detail::error_correction::CorrectOne;
 
 std::vector<Element*> MutablePointers(
     std::vector<std::vector<Element>>& shards) {
@@ -95,6 +99,65 @@ std::vector<std::vector<Element>> Encode(
                            backend, radix),
             Status::ok);
   return recovery;
+}
+
+std::vector<Element> EncodeOne(const LCHEncoder& encoder,
+                               std::span<const Element> data) {
+  std::vector<std::vector<Element>> data_shards(data.size(),
+                                                std::vector<Element>(1));
+  for (size_t i = 0; i < data.size(); ++i) {
+    data_shards[i][0] = data[i];
+  }
+  const auto recovery_shards = Encode(encoder, data_shards, 1);
+  std::vector<Element> recovery(recovery_shards.size());
+  for (size_t i = 0; i < recovery.size(); ++i) {
+    recovery[i] = recovery_shards[i][0];
+  }
+  return recovery;
+}
+
+void ExpectCorrects(size_t data_count,
+                    size_t recovery_count,
+                    std::span<const Element> expected_data,
+                    std::span<const std::pair<size_t, Element>> errors) {
+  const LCHEncoder encoder(data_count, recovery_count);
+  const LCHDecoder decoder(data_count, recovery_count);
+  ASSERT_TRUE(encoder.Valid());
+  ASSERT_TRUE(decoder.Valid());
+
+  const std::vector<Element> expected_recovery =
+      EncodeOne(encoder, expected_data);
+  std::vector<Element> data(expected_data.begin(), expected_data.end());
+  std::vector<Element> recovery = expected_recovery;
+  std::vector<uint8_t> expected_mask(data_count + recovery_count, 0);
+  for (const auto [position, magnitude] : errors) {
+    ASSERT_LT(position, expected_mask.size());
+    ASSERT_NE(magnitude, 0);
+    ASSERT_EQ(expected_mask[position], 0);
+    expected_mask[position] = 1;
+    if (position < data_count) {
+      data[position] ^= magnitude;
+    } else {
+      recovery[position - data_count] ^= magnitude;
+    }
+  }
+  const std::vector<Element> corrupted_recovery = recovery;
+
+  std::vector<uint8_t> actual_mask(expected_mask.size(), 0xa5);
+  const auto result = CorrectOne(decoder, data, recovery, actual_mask);
+  ASSERT_EQ(result.status, CorrectionStatus::ok);
+  EXPECT_EQ(result.error_count, errors.size());
+  EXPECT_EQ(actual_mask, expected_mask);
+  EXPECT_TRUE(std::equal(data.begin(), data.end(), expected_data.begin(),
+                         expected_data.end()));
+  EXPECT_EQ(recovery, corrupted_recovery);
+
+  const std::vector<Element> rebuilt_recovery = EncodeOne(encoder, data);
+  for (size_t i = 0; i < recovery_count; ++i) {
+    if (expected_mask[data_count + i] == 0) {
+      EXPECT_EQ(rebuilt_recovery[i], recovery[i]);
+    }
+  }
 }
 
 std::vector<std::vector<Element>> InterpolationOracle(
@@ -552,6 +615,487 @@ TEST(LCHCode, ZeroByteOperationsAllowNullShardPointers) {
   EXPECT_EQ(decoder.Decode(data_output, data_present, recovery_input,
                            recovery_present, 0, decode_workspace),
             Status::ok);
+}
+
+TEST(LCHErrorCorrection, ValidatesArgumentsAndSupportedDimensions) {
+  std::array<Element, 6> data = {1, 2, 3, 4, 5, 6};
+  std::array<Element, 3> recovery = {7, 8, 9};
+  std::array<uint8_t, 9> mask{};
+  mask.fill(0xa5);
+
+  const LCHDecoder invalid_decoder(0, 1);
+  auto result =
+      CorrectOne(invalid_decoder, std::span(data).first(0),
+                 std::span(recovery).first(1), std::span(mask).first(1));
+  EXPECT_EQ(result.status, CorrectionStatus::invalid_argument);
+  EXPECT_EQ(mask[0], 0);
+
+  const LCHDecoder supported_decoder(6, 2);
+  const auto original_data = data;
+  mask.fill(0xa5);
+  result = CorrectOne(supported_decoder, std::span(data).first(5),
+                      std::span(recovery).first(2), std::span(mask).first(8));
+  EXPECT_EQ(result.status, CorrectionStatus::invalid_argument);
+  EXPECT_EQ(data, original_data);
+  EXPECT_TRUE(std::all_of(mask.begin(), mask.begin() + 8,
+                          [](uint8_t value) { return value == 0; }));
+
+  mask.fill(0xa5);
+  result = CorrectOne(supported_decoder, data, std::span(recovery).first(1),
+                      std::span(mask).first(8));
+  EXPECT_EQ(result.status, CorrectionStatus::invalid_argument);
+  EXPECT_TRUE(std::all_of(mask.begin(), mask.begin() + 8,
+                          [](uint8_t value) { return value == 0; }));
+
+  mask.fill(0xa5);
+  result = CorrectOne(supported_decoder, data, std::span(recovery).first(2),
+                      std::span(mask).first(7));
+  EXPECT_EQ(result.status, CorrectionStatus::invalid_argument);
+  EXPECT_TRUE(std::all_of(mask.begin(), mask.begin() + 7,
+                          [](uint8_t value) { return value == 0; }));
+
+  const LCHDecoder unsupported_decoder(5, 3);
+  mask.fill(0xa5);
+  result = CorrectOne(unsupported_decoder, std::span(data).first(5), recovery,
+                      std::span(mask).first(8));
+  EXPECT_EQ(result.status, CorrectionStatus::unsupported_dimensions);
+  EXPECT_EQ(data, original_data);
+  EXPECT_TRUE(std::all_of(mask.begin(), mask.begin() + 8,
+                          [](uint8_t value) { return value == 0; }));
+
+  const LCHDecoder shortened_decoder(4, 2);
+  mask.fill(0xa5);
+  result = CorrectOne(shortened_decoder, std::span(data).first(4),
+                      std::span(recovery).first(2), std::span(mask).first(6));
+  EXPECT_EQ(result.status, CorrectionStatus::unsupported_dimensions);
+  EXPECT_EQ(data, original_data);
+  EXPECT_TRUE(std::all_of(mask.begin(), mask.begin() + 6,
+                          [](uint8_t value) { return value == 0; }));
+
+  const LCHDecoder overlap_decoder(2, 2);
+  std::array<Element, 4> overlapping_storage = {1, 2, 3, 4};
+  const auto original_storage = overlapping_storage;
+  std::array<Element, 2> separate_recovery = {5, 6};
+  result = CorrectOne(overlap_decoder, std::span(overlapping_storage).first(2),
+                      separate_recovery, overlapping_storage);
+  EXPECT_EQ(result.status, CorrectionStatus::invalid_argument);
+  EXPECT_EQ(overlapping_storage, original_storage);
+
+  std::array<Element, 2> separate_data = {7, 8};
+  std::array<Element, 4> overlapping_recovery = {9, 10, 11, 12};
+  const auto original_overlapping_recovery = overlapping_recovery;
+  result = CorrectOne(overlap_decoder, separate_data,
+                      std::span<const Element>(overlapping_recovery).first(2),
+                      overlapping_recovery);
+  EXPECT_EQ(result.status, CorrectionStatus::invalid_argument);
+  EXPECT_EQ(overlapping_recovery, original_overlapping_recovery);
+
+  std::array<uint8_t, 4> separate_mask{};
+  separate_mask.fill(0xa5);
+  result = CorrectOne(overlap_decoder, std::span(overlapping_storage).first(2),
+                      std::span<const Element>(overlapping_storage).first(2),
+                      separate_mask);
+  EXPECT_EQ(result.status, CorrectionStatus::invalid_argument);
+  EXPECT_EQ(overlapping_storage, original_storage);
+  EXPECT_TRUE(std::all_of(separate_mask.begin(), separate_mask.end(),
+                          [](uint8_t value) { return value == 0; }));
+}
+
+TEST(LCHErrorCorrection, AcceptsUncorruptedFullCodes) {
+  for (const auto [data_count, recovery_count] :
+       {std::pair<size_t, size_t>{1, 1}, {2, 2}, {6, 2}, {12, 4}, {8, 8}}) {
+    const LCHEncoder encoder(data_count, recovery_count);
+    const LCHDecoder decoder(data_count, recovery_count);
+    std::vector<Element> data(data_count);
+    for (size_t i = 0; i < data_count; ++i) {
+      data[i] = static_cast<Element>(17 * i + data_count);
+    }
+    const std::vector<Element> recovery = EncodeOne(encoder, data);
+    const std::vector<Element> expected_data = data;
+    std::vector<uint8_t> mask(data_count + recovery_count, 0xa5);
+    const auto result = CorrectOne(decoder, data, recovery, mask);
+    EXPECT_EQ(result.status, CorrectionStatus::ok)
+        << data_count << '/' << recovery_count;
+    EXPECT_EQ(result.error_count, 0) << data_count << '/' << recovery_count;
+    EXPECT_EQ(data, expected_data) << data_count << '/' << recovery_count;
+    EXPECT_TRUE(std::all_of(mask.begin(), mask.end(),
+                            [](uint8_t value) { return value == 0; }))
+        << data_count << '/' << recovery_count;
+  }
+}
+
+TEST(LCHErrorCorrection, RadiusZeroRejectsNonCodewords) {
+  const LCHEncoder encoder(3, 1);
+  const LCHDecoder decoder(3, 1);
+  const std::array<Element, 3> expected_data = {0x12, 0x34, 0x56};
+  std::vector<Element> data(expected_data.begin(), expected_data.end());
+  std::vector<Element> recovery = EncodeOne(encoder, data);
+  recovery[0] ^= 0x7b;
+  const auto corrupted_recovery = recovery;
+  std::array<uint8_t, 4> mask{};
+  mask.fill(0xa5);
+
+  const auto result = CorrectOne(decoder, data, recovery, mask);
+  EXPECT_EQ(result.status, CorrectionStatus::uncorrectable);
+  EXPECT_EQ(result.error_count, 0);
+  EXPECT_TRUE(std::equal(data.begin(), data.end(), expected_data.begin(),
+                         expected_data.end()));
+  EXPECT_EQ(recovery, corrupted_recovery);
+  EXPECT_TRUE(std::all_of(mask.begin(), mask.end(),
+                          [](uint8_t value) { return value == 0; }));
+}
+
+TEST(LCHErrorCorrection, ExhaustivelyCorrectsOneErrorForTwoPlusTwo) {
+  constexpr std::array<Element, 2> data = {0x31, 0xa7};
+  for (size_t position = 0; position < 4; ++position) {
+    for (unsigned magnitude = 1; magnitude < 256; ++magnitude) {
+      const std::array<std::pair<size_t, Element>, 1> errors = {
+          std::pair<size_t, Element>{position,
+                                     static_cast<Element>(magnitude)}};
+      ExpectCorrects(2, 2, data, errors);
+    }
+  }
+}
+
+TEST(LCHErrorCorrection, ExhaustsLocationSubsetsThroughRadiusForFourPlusFour) {
+  constexpr std::array<Element, 4> data = {0x09, 0x53, 0xa1, 0xfe};
+  for (size_t first = 0; first < 8; ++first) {
+    const std::array<std::pair<size_t, Element>, 1> one_error = {
+        std::pair<size_t, Element>{
+            first, static_cast<Element>((37 * first + 11) % 255 + 1)}};
+    ExpectCorrects(4, 4, data, one_error);
+
+    for (size_t second = first + 1; second < 8; ++second) {
+      const std::array<std::pair<size_t, Element>, 2> two_errors = {
+          std::pair<size_t, Element>{
+              first, static_cast<Element>((37 * first + 11) % 255 + 1)},
+          std::pair<size_t, Element>{
+              second, static_cast<Element>((53 * second + 19) % 255 + 1)},
+      };
+      ExpectCorrects(4, 4, data, two_errors);
+    }
+  }
+}
+
+TEST(LCHErrorCorrection, CorrectsDeterministicLargerFullCodes) {
+  constexpr std::array<std::pair<size_t, size_t>, 7> dimensions = {
+      std::pair<size_t, size_t>{6, 2},
+      {12, 4},
+      {24, 8},
+      {48, 16},
+      {96, 32},
+      {192, 64},
+      {128, 128},
+  };
+  std::mt19937 random(0x5eed1234);
+
+  for (const auto [data_count, recovery_count] : dimensions) {
+    std::vector<Element> data(data_count);
+    std::generate(data.begin(), data.end(),
+                  [&random] { return static_cast<Element>(random()); });
+    const size_t radius = recovery_count / 2;
+
+    for (size_t trial = 0; trial < 6; ++trial) {
+      const size_t error_count =
+          trial < 3 ? radius : 1 + static_cast<size_t>(random()) % radius;
+      std::vector<size_t> positions;
+      if (trial % 3 == 0) {
+        positions.resize(data_count);
+        std::iota(positions.begin(), positions.end(), size_t{0});
+      } else if (trial % 3 == 1) {
+        positions.resize(recovery_count);
+        std::iota(positions.begin(), positions.end(), data_count);
+      } else {
+        std::vector<size_t> data_positions(data_count);
+        std::vector<size_t> recovery_positions(recovery_count);
+        std::iota(data_positions.begin(), data_positions.end(), size_t{0});
+        std::iota(recovery_positions.begin(), recovery_positions.end(),
+                  data_count);
+        std::shuffle(data_positions.begin(), data_positions.end(), random);
+        std::shuffle(recovery_positions.begin(), recovery_positions.end(),
+                     random);
+        positions.push_back(data_positions.front());
+        if (error_count > 1) {
+          positions.push_back(recovery_positions.front());
+        }
+        data_positions.erase(data_positions.begin());
+        if (error_count > 1) {
+          recovery_positions.erase(recovery_positions.begin());
+        }
+        positions.insert(positions.end(), data_positions.begin(),
+                         data_positions.end());
+        positions.insert(positions.end(), recovery_positions.begin(),
+                         recovery_positions.end());
+        std::shuffle(positions.begin() + std::min(error_count, size_t{2}),
+                     positions.end(), random);
+      }
+      if (trial % 3 != 2) {
+        std::shuffle(positions.begin(), positions.end(), random);
+      }
+
+      std::vector<std::pair<size_t, Element>> errors;
+      errors.reserve(error_count);
+      for (size_t i = 0; i < error_count; ++i) {
+        Element magnitude = 0;
+        while (magnitude == 0) {
+          magnitude = static_cast<Element>(random());
+        }
+        errors.emplace_back(positions[i], magnitude);
+      }
+      ExpectCorrects(data_count, recovery_count, data, errors);
+    }
+  }
+}
+
+TEST(LCHErrorCorrection, CorrectsRandomMultiErrorLocationsAndMagnitudes) {
+  constexpr std::array<std::pair<size_t, size_t>, 5> dimensions = {
+      std::pair<size_t, size_t>{4, 4},
+      {12, 4},
+      {224, 32},
+      {192, 64},
+      {128, 128},
+  };
+  std::mt19937 random(0x7a6b5c4dU);
+
+  for (const auto [data_count, recovery_count] : dimensions) {
+    for (size_t trial = 0; trial < 24; ++trial) {
+      SCOPED_TRACE(::testing::Message()
+                   << "K=" << data_count << " R=" << recovery_count
+                   << " trial=" << trial);
+      std::vector<Element> data(data_count);
+      for (Element& value : data) {
+        value = static_cast<Element>(random());
+      }
+
+      const size_t radius = recovery_count / 2;
+      const size_t error_count = 2 + random() % (radius - 1);
+      const size_t first_position = random() % data_count;
+      std::vector<size_t> remaining_positions;
+      remaining_positions.reserve(data_count + recovery_count - 1);
+      for (size_t position = 0; position < data_count + recovery_count;
+           ++position) {
+        if (position != first_position) {
+          remaining_positions.push_back(position);
+        }
+      }
+      std::shuffle(remaining_positions.begin(), remaining_positions.end(),
+                   random);
+
+      std::vector<std::pair<size_t, Element>> errors;
+      errors.reserve(error_count);
+      errors.emplace_back(first_position,
+                          static_cast<Element>(1 + random() % 255));
+      for (size_t i = 1; i < error_count; ++i) {
+        errors.emplace_back(remaining_positions[i - 1],
+                            static_cast<Element>(1 + random() % 255));
+      }
+      ExpectCorrects(data_count, recovery_count, data, errors);
+    }
+  }
+}
+
+TEST(LCHErrorCorrection, BatchCorrectsDivergentIndependentCodewords) {
+  constexpr size_t kBytes = 65;
+  constexpr std::array<std::pair<size_t, size_t>, 5> dimensions = {
+      std::pair<size_t, size_t>{6, 2},
+      {12, 4},
+      {224, 32},
+      {192, 64},
+      {128, 128},
+  };
+
+  for (const auto [data_count, recovery_count] : dimensions) {
+    SCOPED_TRACE(::testing::Message()
+                 << "K=" << data_count << " R=" << recovery_count);
+    const LCHEncoder encoder(data_count, recovery_count);
+    const LCHDecoder decoder(data_count, recovery_count);
+    const auto expected_data = RandomShards(
+        data_count, kBytes,
+        static_cast<uint32_t>(0xb47c0000U + data_count + recovery_count));
+    const auto expected_recovery =
+        Encode(encoder, expected_data, kBytes, Backend::scalar, Radix::radix2);
+    auto data = expected_data;
+    auto recovery = expected_recovery;
+    std::vector<uint8_t> expected_mask((data_count + recovery_count) * kBytes,
+                                       0);
+    std::vector<size_t> expected_counts(kBytes, 0);
+
+    const size_t radius = recovery_count / 2;
+    const size_t codeword_size = data_count + recovery_count;
+    for (size_t byte = 0; byte < kBytes; ++byte) {
+      size_t error_count = 0;
+      if (byte % 4 == 1) {
+        error_count = 1;
+      } else if (byte % 4 == 2) {
+        error_count = 1;
+      } else if (byte % 4 == 3) {
+        error_count = radius;
+      }
+      expected_counts[byte] = error_count;
+
+      std::vector<size_t> positions(codeword_size);
+      std::iota(positions.begin(), positions.end(), size_t{0});
+      std::mt19937 random(static_cast<uint32_t>(
+          0x51d30000U ^ (data_count << 12U) ^ (recovery_count << 4U) ^ byte));
+      std::shuffle(positions.begin(), positions.end(), random);
+      if (byte % 4 == 1) {
+        positions[0] = byte % data_count;
+      } else if (byte % 4 == 2) {
+        positions[0] = data_count + byte % recovery_count;
+      }
+
+      for (size_t i = 0; i < error_count; ++i) {
+        const size_t position = positions[i];
+        ASSERT_EQ(expected_mask[position * kBytes + byte], 0);
+        expected_mask[position * kBytes + byte] = 1;
+        const Element magnitude =
+            static_cast<Element>(1 + ((73 * byte + 41 * i + 19) % 255));
+        if (position < data_count) {
+          data[position][byte] ^= magnitude;
+        } else {
+          recovery[position - data_count][byte] ^= magnitude;
+        }
+      }
+    }
+    const auto corrupted_recovery = recovery;
+
+    auto data_pointers = MutablePointers(data);
+    const auto recovery_pointers = ConstPointers(recovery);
+    std::vector<gf2p8::rs::detail::error_correction::CorrectionResult> results(
+        kBytes);
+    std::vector<uint8_t> actual_mask(expected_mask.size(), 0xa5);
+    ASSERT_EQ(CorrectBatch(decoder, data_pointers, recovery_pointers, kBytes,
+                           results, actual_mask),
+              CorrectionStatus::ok);
+    for (size_t byte = 0; byte < kBytes; ++byte) {
+      EXPECT_EQ(results[byte].status, CorrectionStatus::ok) << byte;
+      EXPECT_EQ(results[byte].error_count, expected_counts[byte]) << byte;
+    }
+    EXPECT_EQ(data, expected_data);
+    EXPECT_EQ(recovery, corrupted_recovery);
+    EXPECT_EQ(actual_mask, expected_mask);
+
+    const auto rebuilt_recovery =
+        Encode(encoder, data, kBytes, Backend::scalar, Radix::radix2);
+    for (size_t shard = 0; shard < recovery_count; ++shard) {
+      for (size_t byte = 0; byte < kBytes; ++byte) {
+        if (expected_mask[(data_count + shard) * kBytes + byte] == 0) {
+          EXPECT_EQ(rebuilt_recovery[shard][byte], recovery[shard][byte]);
+        }
+      }
+    }
+  }
+}
+
+TEST(LCHErrorCorrection, BatchValidatesContractWithoutMutation) {
+  constexpr size_t kBytes = 4;
+  const LCHEncoder encoder(6, 2);
+  const LCHDecoder decoder(6, 2);
+  const auto expected_data = RandomShards(6, kBytes, 0x93810000U);
+  const auto recovery = Encode(encoder, expected_data, kBytes);
+  auto data = expected_data;
+  auto data_pointers = MutablePointers(data);
+  auto recovery_pointers = ConstPointers(recovery);
+  std::array<gf2p8::rs::detail::error_correction::CorrectionResult, kBytes>
+      results{};
+  std::array<uint8_t, 8 * kBytes> masks{};
+  masks.fill(0xa5);
+
+  EXPECT_EQ(CorrectBatch(decoder, std::span(data_pointers).first(5),
+                         recovery_pointers, kBytes, results, masks),
+            CorrectionStatus::invalid_argument);
+  EXPECT_EQ(data, expected_data);
+  EXPECT_TRUE(std::all_of(masks.begin(), masks.end(),
+                          [](uint8_t value) { return value == 0xa5; }));
+
+  Element* saved = data_pointers[1];
+  data_pointers[1] = data_pointers[0];
+  EXPECT_EQ(CorrectBatch(decoder, data_pointers, recovery_pointers, kBytes,
+                         results, masks),
+            CorrectionStatus::invalid_argument);
+  data_pointers[1] = saved;
+  EXPECT_EQ(data, expected_data);
+  EXPECT_TRUE(std::all_of(masks.begin(), masks.end(),
+                          [](uint8_t value) { return value == 0xa5; }));
+
+  const LCHDecoder unsupported(4, 2);
+  EXPECT_EQ(CorrectBatch(unsupported, std::span(data_pointers).first(4),
+                         recovery_pointers, kBytes, results,
+                         std::span(masks).first(6 * kBytes)),
+            CorrectionStatus::unsupported_dimensions);
+  EXPECT_EQ(data, expected_data);
+}
+
+TEST(LCHErrorCorrection, BatchIsTransactionalPerCodeword) {
+  constexpr size_t kBytes = 32;
+  const LCHEncoder encoder(4, 4);
+  const LCHDecoder decoder(4, 4);
+  const auto expected_data = RandomShards(4, kBytes, 0x71a50000U);
+  auto data = expected_data;
+  auto recovery = Encode(encoder, expected_data, kBytes);
+  const auto expected_recovery = recovery;
+
+  data[0][0] ^= 0x5b;
+  data[0][1] ^= 0x01;
+  data[1][1] ^= 0x02;
+  data[2][1] ^= 0x03;
+  const auto corrupted_data = data;
+  const auto corrupted_recovery = recovery;
+
+  auto data_pointers = MutablePointers(data);
+  const auto recovery_pointers = ConstPointers(recovery);
+  std::array<gf2p8::rs::detail::error_correction::CorrectionResult, kBytes>
+      results{};
+  std::array<uint8_t, 8 * kBytes> masks{};
+  masks.fill(0xa5);
+  ASSERT_EQ(CorrectBatch(decoder, data_pointers, recovery_pointers, kBytes,
+                         results, masks),
+            CorrectionStatus::ok);
+
+  EXPECT_EQ(results[0].status, CorrectionStatus::ok);
+  EXPECT_EQ(results[0].error_count, 1);
+  EXPECT_EQ(results[1].status, CorrectionStatus::uncorrectable);
+  EXPECT_EQ(results[1].error_count, 0);
+  for (size_t byte = 2; byte < kBytes; ++byte) {
+    EXPECT_EQ(results[byte].status, CorrectionStatus::ok);
+    EXPECT_EQ(results[byte].error_count, 0);
+  }
+  for (size_t shard = 0; shard < data.size(); ++shard) {
+    EXPECT_EQ(data[shard][0], expected_data[shard][0]);
+    EXPECT_EQ(data[shard][1], corrupted_data[shard][1]);
+    for (size_t byte = 2; byte < kBytes; ++byte) {
+      EXPECT_EQ(data[shard][byte], expected_data[shard][byte]);
+    }
+  }
+  EXPECT_EQ(recovery, corrupted_recovery);
+  EXPECT_EQ(masks[0 * kBytes + 0], 1);
+  for (size_t position = 0; position < 8; ++position) {
+    EXPECT_EQ(masks[position * kBytes + 1], 0);
+  }
+  EXPECT_EQ(expected_recovery, corrupted_recovery);
+}
+
+TEST(LCHErrorCorrection, RejectsSelectedOverRadiusPatternWithoutMutation) {
+  const LCHEncoder encoder(4, 4);
+  const LCHDecoder decoder(4, 4);
+  constexpr std::array<Element, 4> expected_data = {0x22, 0x47, 0x91, 0xd3};
+  std::vector<Element> data(expected_data.begin(), expected_data.end());
+  std::vector<Element> recovery = EncodeOne(encoder, data);
+  data[0] ^= 0x01;
+  data[1] ^= 0x02;
+  data[2] ^= 0x03;
+  const std::vector<Element> corrupted_data = data;
+  const std::vector<Element> corrupted_recovery = recovery;
+  std::array<uint8_t, 8> mask{};
+  mask.fill(0xa5);
+
+  const auto result = CorrectOne(decoder, data, recovery, mask);
+  EXPECT_EQ(result.status, CorrectionStatus::uncorrectable);
+  EXPECT_EQ(result.error_count, 0);
+  EXPECT_EQ(data, corrupted_data);
+  EXPECT_EQ(recovery, corrupted_recovery);
+  EXPECT_TRUE(std::all_of(mask.begin(), mask.end(),
+                          [](uint8_t value) { return value == 0; }));
 }
 
 #if defined(GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT)

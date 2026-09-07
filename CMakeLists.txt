@@ -27,6 +27,8 @@ option(GF256_BUILD_REFERENCE_BENCHMARKS "Build external RS baselines" OFF)
 option(GF256_ENABLE_NATIVE_ISA "Compile owned sources for the build host" OFF)
 option(GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT
   "Build retained GFNI512 radix-8 tests and verbose benchmarks" OFF)
+option(GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT
+  "Build the native-Cantor affine codeword-transform experiment" OFF)
 
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
@@ -48,10 +50,13 @@ FetchContent_Declare(
 add_library(gf256_core STATIC
     src/field.cc
     src/matrix.cc
+    src/lin_chung_han/codeword_transform.cc
     src/lin_chung_han/transform.cc
     src/lin_chung_han/kernels.cc
     src/lin_chung_han/gfni.cc
     src/reed_solomon/code_parameters.cc
+    src/reed_solomon/error_correction/batched.cc
+    src/reed_solomon/error_correction/scalar.cc
     src/reed_solomon/decoder/shared.cc
     src/reed_solomon/decoder/low_rate.cc
     src/reed_solomon/decoder/high_rate.cc
@@ -69,6 +74,15 @@ if(GF256_ENABLE_NATIVE_ISA)
   else()
     message(WARNING "GF256_ENABLE_NATIVE_ISA has no flags for this compiler")
   endif()
+endif()
+
+if(GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT)
+  if(NOT GF256_ENABLE_NATIVE_ISA)
+    message(FATAL_ERROR
+      "GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT requires GF256_ENABLE_NATIVE_ISA")
+  endif()
+  target_compile_definitions(gf256_core PRIVATE
+    GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT=1)
 endif()
 
 if(GF256_BUILD_TOOLS)
@@ -137,6 +151,10 @@ if(GF256_BUILD_TESTS)
     target_compile_definitions(lch_rs_unittests PRIVATE
       GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT=1)
   endif()
+  if(GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT)
+    target_compile_definitions(lch_rs_unittests PRIVATE
+      GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT=1)
+  endif()
   add_test(NAME LCHRSUnittests COMMAND lch_rs_unittests)
 
   if(GF256_BUILD_TOOLS)
@@ -152,7 +170,9 @@ if(GF256_BUILD_BENCHMARKS)
   add_executable(benchmarks benchmarks/matrix_multiplication.cc)
   target_link_libraries(benchmarks PRIVATE gf256_core benchmark benchmark_main)
 
-  add_executable(rs_verbose_benchmarks benchmarks/lch_rs_benchmarks.cc)
+  add_executable(rs_verbose_benchmarks
+    benchmarks/lch_rs_benchmarks.cc
+    benchmarks/lch_error_correction_benchmarks.cc)
   add_executable(rs_benchmarks benchmarks/lch_rs_benchmarks.cc)
   target_compile_definitions(rs_benchmarks PRIVATE
     GF256_HIGH_LEVEL_BENCHMARKS_ONLY=1)
@@ -161,6 +181,10 @@ if(GF256_BUILD_BENCHMARKS)
       GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT=1)
     target_link_libraries(rs_verbose_benchmarks PRIVATE
       gf256_gfni512_radix8_experiment)
+  endif()
+  if(GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT)
+    target_compile_definitions(rs_verbose_benchmarks PRIVATE
+      GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT=1)
   endif()
 
   foreach(benchmark_target IN ITEMS rs_verbose_benchmarks rs_benchmarks)

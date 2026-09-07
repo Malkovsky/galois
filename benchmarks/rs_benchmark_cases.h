@@ -13,6 +13,27 @@ struct RsBenchmarkCase {
   int64_t bytes;
 };
 
+struct RsErrorCorrectionCase {
+  int64_t data_count;
+  int64_t recovery_count;
+};
+
+// Direct full-code dimensions supported by the private scalar FDMA decoder:
+// N=K+R and R are powers of two, with no shortening or puncturing.
+inline constexpr std::array<RsErrorCorrectionCase, 10>
+    kFullCodeErrorCorrectionCases{{
+        {2, 2},
+        {6, 2},
+        {12, 4},
+        {24, 8},
+        {48, 16},
+        {96, 32},
+        {192, 64},
+        {128, 128},
+        {224, 32},
+        {254, 2},
+    }};
+
 // Full-length low-/high-rate comparison grid used by the owned LCH codec and
 // the native XDRS and ISA-L references.
 inline constexpr std::array<RsBenchmarkCase, 9> kLCHComparisonCases{{
