@@ -228,18 +228,17 @@ size_t PublicPosition(CodeFamily family,
                                           : native_position - recovery_count;
 }
 
-CorrectionStatus RecoverWithEvaluator(
-    CodeFamily family,
-    std::span<Element> data,
-    std::span<const Element> recovery,
-    std::span<Element> mutable_recovery,
-    size_t recovery_count,
-    std::span<const uint8_t> root_positions,
-    const Values& locator_samples,
-    const Values& locator_coefficients,
-    size_t locator_degree,
-    const Values& syndrome_samples,
-    const MultiplicationTables& tables) {
+CorrectionStatus RecoverWithEvaluator(CodeFamily family,
+                                      std::span<Element> data,
+                                      std::span<const Element> recovery,
+                                      std::span<Element> mutable_recovery,
+                                      size_t recovery_count,
+                                      std::span<const uint8_t> root_positions,
+                                      const Values& locator_samples,
+                                      const Values& locator_coefficients,
+                                      size_t locator_degree,
+                                      const Values& syndrome_samples,
+                                      const MultiplicationTables& tables) {
   const size_t data_count = data.size();
   const size_t codeword_size = data_count + recovery_count;
   const size_t correction_radius = recovery_count / 2;
@@ -641,7 +640,8 @@ static CorrectionResult CorrectOneImpl(const LCHDecoder& decoder,
 
   CorrectionStatus recovery_status = CorrectionStatus::ok;
   // Whole-codeword mode verifies every candidate, including parity-only roots.
-  // Retain the existing data-only fast path for CorrectOne/CorrectBatch callers.
+  // Retain the existing data-only fast path for CorrectOne/CorrectBatch
+  // callers.
   if (has_data_error && root_count == 1 && mutable_recovery.empty()) {
     // Every aligned R-point native Cantor IFFT has unit leading Lagrange
     // coefficient. Therefore the highest syndrome coefficient is the error
@@ -679,7 +679,7 @@ CorrectionResult CorrectOne(const LCHDecoder& decoder,
 namespace gf2p8::rs {
 
 CorrectionResult CorrectCodeword(const LCHDecoder& decoder,
-                                std::span<Element> codeword) {
+                                 std::span<Element> codeword) {
   if (!decoder.Valid() ||
       codeword.size() != decoder.DataCount() + decoder.RecoveryCount()) {
     return {.status = CorrectionStatus::invalid_argument};

@@ -5,12 +5,13 @@
 #include <vector>
 
 #include "benchmark/benchmark.h"
-#include "reed_solomon/strong_weak_rs_product_code.h"
 #include "reed_solomon/product_code_internal.h"
+#include "reed_solomon/strong_weak_rs_product_code.h"
 
 namespace {
 
-void BenchmarkProductCorrectionBSC(benchmark::State& state, int batch_passes = -1) {
+void BenchmarkProductCorrectionBSC(benchmark::State& state,
+                                   int batch_passes = -1) {
   using gf2p8::Element;
   using gf2p8::rs::ProductCorrectionResult;
   using gf2p8::rs::ProductTermination;
@@ -30,8 +31,8 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state, int batch_passes = -
 
   std::mt19937 messages(kSeed);
   std::mt19937 channel(kSeed ^ 0x9e3779b9U);
-  std::vector<std::vector<Element>> original(
-      kCorpusCount, std::vector<Element>(kBlockBytes));
+  std::vector<std::vector<Element>> original(kCorpusCount,
+                                             std::vector<Element>(kBlockBytes));
   auto corrupted = original;
   auto work = original;
   std::vector<ProductCorrectionResult> results(kCorpusCount);
@@ -77,6 +78,8 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state, int batch_passes = -
   uint64_t message_failures = 0, block_failures = 0, validity_failures = 0;
   uint64_t valid_wrong_blocks = 0, pass_limits = 0, passes = 0;
   uint64_t strong_lines = 0, weak_lines = 0;
+  uint64_t accepted_bits = 0, accepted_symbols = 0;
+  uint64_t strong_bits = 0, strong_symbols = 0, weak_bits = 0, weak_symbols = 0;
   size_t max_passes = 0;
   // Validate this exact channel corpus against the retained single path outside
   // timing, including scheduling outcomes, not just final message recovery.
@@ -85,15 +88,22 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state, int batch_passes = -
     const auto expected = gf2p8::rs::detail::ProductCorrectionAccess::Correct(
         code, reference, kPassLimit, 0, false);
     work[sample] = corrupted[sample];
-    const auto actual = batch_passes < 0 ? code.Correct(work[sample], kPassLimit)
-        : gf2p8::rs::detail::ProductCorrectionAccess::Correct(
-              code, work[sample], kPassLimit, batch_passes);
-    if (work[sample] != reference || actual.termination != expected.termination ||
+    const auto actual =
+        batch_passes < 0 ? code.Correct(work[sample], kPassLimit)
+                         : gf2p8::rs::detail::ProductCorrectionAccess::Correct(
+                               code, work[sample], kPassLimit, batch_passes);
+    if (work[sample] != reference ||
+        actual.termination != expected.termination ||
         actual.all_zero_syndromes != expected.all_zero_syndromes ||
         actual.directional_passes != expected.directional_passes ||
         actual.strong_lines_visited != expected.strong_lines_visited ||
         actual.weak_lines_visited != expected.weak_lines_visited ||
-        actual.changed_symbols != expected.changed_symbols) {
+        actual.changed_symbols != expected.changed_symbols ||
+        actual.changed_bits != expected.changed_bits ||
+        actual.strong_changed_bits != expected.strong_changed_bits ||
+        actual.weak_changed_bits != expected.weak_changed_bits ||
+        actual.strong_changed_symbols != expected.strong_changed_symbols ||
+        actual.weak_changed_symbols != expected.weak_changed_symbols) {
       state.SkipWithError("batch/single corpus differential mismatch");
       return;
     }
@@ -106,9 +116,11 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state, int batch_passes = -
     }
     state.ResumeTiming();
     for (size_t sample = 0; sample < kCorpusCount; ++sample) {
-      results[sample] = batch_passes < 0 ? code.Correct(work[sample], kPassLimit)
-          : gf2p8::rs::detail::ProductCorrectionAccess::Correct(
-                code, work[sample], kPassLimit, batch_passes);
+      results[sample] =
+          batch_passes < 0
+              ? code.Correct(work[sample], kPassLimit)
+              : gf2p8::rs::detail::ProductCorrectionAccess::Correct(
+                    code, work[sample], kPassLimit, batch_passes);
       benchmark::DoNotOptimize(results[sample]);
       benchmark::ClobberMemory();
     }
@@ -121,8 +133,8 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state, int batch_passes = -
       }
       uint64_t data_bits = 0, block_bits = 0;
       for (size_t pos = 0; pos < kBlockBytes; ++pos) {
-        const auto bits = std::popcount(static_cast<unsigned>(
-            work[sample][pos] ^ original[sample][pos]));
+        const auto bits = std::popcount(
+            static_cast<unsigned>(work[sample][pos] ^ original[sample][pos]));
         block_bits += bits;
         if (pos / kN < kStrongK && pos % kN < kWeakK) {
           data_bits += bits;
@@ -139,13 +151,23 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state, int batch_passes = -
       max_passes = std::max(max_passes, result.directional_passes);
       strong_lines += result.strong_lines_visited;
       weak_lines += result.weak_lines_visited;
+      accepted_bits += result.changed_bits;
+      accepted_symbols += result.changed_symbols;
+      strong_bits += result.strong_changed_bits;
+      strong_symbols += result.strong_changed_symbols;
+      weak_bits += result.weak_changed_bits;
+      weak_symbols += result.weak_changed_symbols;
     }
     state.ResumeTiming();
-    if (state.skipped()) break;
+    if (state.skipped()) {
+      break;
+    }
   }
 
   const double sweeps = static_cast<double>(state.iterations());
-  if (sweeps == 0 || state.skipped()) return;
+  if (sweeps == 0 || state.skipped()) {
+    return;
+  }
   const double blocks = sweeps * kCorpusCount;
   state.counters["corpus_blocks"] = kCorpusCount;
   state.counters["timed_blocks"] = blocks;
@@ -155,9 +177,11 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state, int batch_passes = -
   state.counters["channel_codeword_BER"] =
       static_cast<double>(channel_bits) / (kCorpusCount * kBlockBytes * 8);
   state.counters["channel_flipped_bits"] = static_cast<double>(channel_bits);
-  state.counters["channel_corrupted_bytes"] = static_cast<double>(channel_symbols);
+  state.counters["channel_corrupted_bytes"] =
+      static_cast<double>(channel_symbols);
   state.counters["corpus_data_residual_bits"] = data_residual_bits / sweeps;
-  state.counters["corpus_codeword_residual_bits"] = codeword_residual_bits / sweeps;
+  state.counters["corpus_codeword_residual_bits"] =
+      codeword_residual_bits / sweeps;
   state.counters["data_residual_BER"] =
       data_residual_bits / (blocks * kInformationBytes * 8);
   state.counters["codeword_residual_BER"] =
@@ -174,11 +198,19 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state, int batch_passes = -
   state.counters["max_directional_passes"] = static_cast<double>(max_passes);
   state.counters["mean_strong_lines"] = strong_lines / blocks;
   state.counters["mean_weak_lines"] = weak_lines / blocks;
+  state.counters["mean_accepted_bit_changes"] = accepted_bits / blocks;
+  state.counters["mean_accepted_byte_changes"] = accepted_symbols / blocks;
+  state.counters["mean_strong_accepted_bit_changes"] = strong_bits / blocks;
+  state.counters["mean_strong_accepted_byte_changes"] = strong_symbols / blocks;
+  state.counters["mean_weak_accepted_bit_changes"] = weak_bits / blocks;
+  state.counters["mean_weak_accepted_byte_changes"] = weak_symbols / blocks;
   state.counters["pass_limit"] = kPassLimit;
   state.SetItemsProcessed(state.iterations() * kCorpusCount);
-  state.SetBytesProcessed(state.iterations() * kCorpusCount * kInformationBytes);
-  state.SetLabel("64 blocks/iteration; information bytes=224*254; "
-                  "Correct includes exact final validity; tuned backend");
+  state.SetBytesProcessed(state.iterations() * kCorpusCount *
+                          kInformationBytes);
+  state.SetLabel(
+      "64 blocks/iteration; information bytes=224*254; "
+      "Correct includes exact final validity; tuned backend");
 }
 
 const auto* kProductCorrectionBSC = benchmark::RegisterBenchmark(

@@ -7,6 +7,22 @@
   },
   "configurePresets": [
     {
+      "name": "experimental",
+      "displayName": "Experimental Tools",
+      "description": "Native Release build of the RS product Monte Carlo tool",
+      "binaryDir": "${sourceDir}/build/experimental-preset",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "GF256_BUILD_MONTE_CARLO": "ON",
+        "GF256_BUILD_TOOLS": "OFF",
+        "GF256_BUILD_TESTS": "OFF",
+        "GF256_BUILD_BENCHMARKS": "OFF",
+        "GF256_BUILD_REFERENCE_BENCHMARKS": "OFF",
+        "GF256_ENABLE_NATIVE_ISA": "ON"
+      }
+    },
+    {
       "name": "release",
       "displayName": "Release",
       "description": "Configure an optimized release build",
@@ -61,6 +77,14 @@
     }
   ],
   "buildPresets": [
+    {
+      "name": "experimental",
+      "displayName": "Build Experimental Tools",
+      "configurePreset": "experimental",
+      "targets": [
+        "rs-product-monte-carlo"
+      ]
+    },
     {
       "name": "release",
       "displayName": "Build Release",

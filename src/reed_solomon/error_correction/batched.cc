@@ -105,14 +105,15 @@ const Element* NativeSource(std::span<Element* const> data,
 }
 #endif
 
-CorrectionStatus CorrectColumnsScalar(const LCHDecoder& decoder,
-                                      std::span<Element* const> data,
-                                      std::span<const Element* const> recovery,
-                                      size_t byte_count,
-                                      size_t first_column,
-                                      std::span<CorrectionResult> results,
-                                      std::span<uint8_t> error_masks,
-                                      std::span<Element* const> mutable_recovery) {
+CorrectionStatus CorrectColumnsScalar(
+    const LCHDecoder& decoder,
+    std::span<Element* const> data,
+    std::span<const Element* const> recovery,
+    size_t byte_count,
+    size_t first_column,
+    std::span<CorrectionResult> results,
+    std::span<uint8_t> error_masks,
+    std::span<Element* const> mutable_recovery) {
   const size_t data_count = data.size();
   const size_t recovery_count = recovery.size();
   const size_t codeword_size = data_count + recovery_count;
@@ -137,7 +138,8 @@ CorrectionStatus CorrectColumnsScalar(const LCHDecoder& decoder,
       std::copy_n(recovery_values.begin(), recovery_count,
                   data_values.begin() + data_count);
       const auto before = data_values;
-      result = CorrectCodeword(decoder, std::span(data_values).first(codeword_size));
+      result =
+          CorrectCodeword(decoder, std::span(data_values).first(codeword_size));
       for (size_t i = 0; i < codeword_size; ++i) {
         mask[i] = before[i] != data_values[i];
       }
@@ -803,9 +805,11 @@ void CorrectChunk32(std::span<Element* const> data,
     }
   }
   // Whole-codeword mode must evaluate and verify parity-only candidates too.
-  const uint32_t location_only_lanes = mutable_recovery.empty()
-      ? candidate_lanes & ~data_error_lanes : 0;
-  if (mutable_recovery.empty()) candidate_lanes &= data_error_lanes;
+  const uint32_t location_only_lanes =
+      mutable_recovery.empty() ? candidate_lanes & ~data_error_lanes : 0;
+  if (mutable_recovery.empty()) {
+    candidate_lanes &= data_error_lanes;
+  }
   if (candidate_lanes == 0) {
     PublishChunkResults(results, error_masks, byte_count, column,
                         parameters.family, data_count, recovery_count,
@@ -958,7 +962,8 @@ void CorrectChunk32(std::span<Element* const> data,
       continue;
     }
     Element* destination = public_position < data_count
-        ? data[public_position] : mutable_recovery[public_position - data_count];
+                               ? data[public_position]
+                               : mutable_recovery[public_position - data_count];
     const uint32_t active = root_masks[native_position] & candidate_lanes;
     const __m256i old_data = _mm256_loadu_si256(
         reinterpret_cast<const __m256i*>(destination + column));
@@ -966,9 +971,8 @@ void CorrectChunk32(std::span<Element* const> data,
         _mm256_load_si256(
             reinterpret_cast<const __m256i*>(Row(work, native_position))),
         LaneMask(active));
-    _mm256_storeu_si256(
-        reinterpret_cast<__m256i*>(destination + column),
-        _mm256_xor_si256(old_data, correction));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination + column),
+                        _mm256_xor_si256(old_data, correction));
   }
   PublishChunkResults(results, error_masks, byte_count, column,
                       parameters.family, data_count, recovery_count,
@@ -980,13 +984,14 @@ void CorrectChunk32(std::span<Element* const> data,
 
 }  // namespace
 
-static CorrectionStatus CorrectBatchImpl(const LCHDecoder& decoder,
-                              std::span<Element* const> data,
-                              std::span<const Element* const> recovery,
-                              size_t byte_count,
-                              std::span<CorrectionResult> results,
-                              std::span<uint8_t> error_masks,
-                              std::span<Element* const> mutable_recovery) {
+static CorrectionStatus CorrectBatchImpl(
+    const LCHDecoder& decoder,
+    std::span<Element* const> data,
+    std::span<const Element* const> recovery,
+    size_t byte_count,
+    std::span<CorrectionResult> results,
+    std::span<uint8_t> error_masks,
+    std::span<Element* const> mutable_recovery) {
   if (!decoder.Valid()) {
     return CorrectionStatus::invalid_argument;
   }

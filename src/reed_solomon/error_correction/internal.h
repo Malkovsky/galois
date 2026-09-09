@@ -8,8 +8,8 @@
 
 namespace gf2p8::rs::detail::error_correction {
 
-using ::gf2p8::rs::CorrectionStatus;
 using ::gf2p8::rs::CorrectionResult;
+using ::gf2p8::rs::CorrectionStatus;
 
 /**
  * @brief Corrects one scalar LCH Reed-Solomon codeword.
