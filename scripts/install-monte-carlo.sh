@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
-  printf 'Usage: %s [PREFIX]\nBuild native Release rs-product-monte-carlo and install it (default: ~/.local).\nRequires CMake, a C++20 compiler, OpenSSL 3 development files, and Git/network for pinned jsoncons headers. No Python runtime or sudo.\n' "$0"
+  printf 'Usage: %s [PREFIX]\nBuild native Release rs-product-monte-carlo and install it (default: ~/.local).\nRequires CMake, a C++20 compiler, OpenSSL 3 development files, and Git/network for pinned nlohmann/json v3.12.0 headers. No Python runtime or sudo.\n' "$0"
   exit 0
 fi
 if (( $# > 1 )) || [[ ${1:-} == -* ]]; then

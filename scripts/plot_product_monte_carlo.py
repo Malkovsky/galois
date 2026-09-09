@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot sampled-stratum BER contributions, not extrapolated decoder BER."""
+"""Pool reports and plot fixed-weight conditional BER and/or BSC contributions."""
 
 import argparse
 import csv
@@ -196,9 +196,44 @@ def load_report(path):
         raise ValueError(f"{path}: {error}") from error
 
 
+def discover_reports(paths):
+    """Expand containers in sorted order, stopping at runs and rejecting overlap."""
+    reports, sources = [], {}
+
+    def visit(path, source):
+        if path.is_dir():
+            metadata, summary = path / "metadata.json", path / "summary.json"
+            if metadata.exists() or summary.exists():
+                require(metadata.is_file() and summary.is_file(),
+                        f"{path}: incomplete run; expected both metadata.json and summary.json "
+                        "as files; finish the report or move the partial run outside the input tree")
+                visit(summary, source)
+            else:
+                for child in sorted(path.iterdir()):
+                    if not child.is_symlink() and child.is_dir():
+                        visit(child, source)
+            return
+        require(path.is_file(), f"input does not exist or is not a report file: {path}")
+        resolved = path.resolve()
+        require(resolved not in sources,
+                f"duplicate report source (duplicate run identity): {path}; "
+                f"overlapping inputs {sources.get(resolved)} and {source}; supply each run only once")
+        sources[resolved] = source
+        reports.append(path)
+
+    for source in paths:
+        before = len(reports)
+        visit(Path(source), source)
+        require(len(reports) > before,
+                f"{source}: no runs found; expected metadata.json + summary.json pairs "
+                "in this directory or its descendants (subdirectory symlinks are not followed)")
+    require(reports, "no runs found: supply run directories, containers, or summary files")
+    return reports
+
+
 def pool_reports(paths, allow_mixed_codewords=False):
     groups, identities, seeds, conventions = {}, set(), set(), {}
-    for path in paths:
+    for path in discover_reports(paths):
         digest, seed, config, rows, codeword = load_report(path)
         require(digest not in identities, f"duplicate run identity: {path}")
         require((config, seed) not in seeds,
@@ -297,82 +332,193 @@ def plot_value(value):
     return result if result > 0 else math.nan
 
 
+def conditional_values(rows, metric):
+    """Yield provenance and normalized conditional BER in ascending k."""
+    for k, row in sorted(rows.items()):
+        total, trials = row[metric], row["trials"]
+        mean = total / trials
+        log_mean = math.log(total) - math.log(trials) if total else NEG_INF
+        log_ber = log_mean - math.log(DENOMINATORS[metric])
+        yield {"k": k, "residual_bits_sum": total, "completed_blocks": trials,
+               "mean": mean, "log10_mean": log_mean / math.log(10), "raw_ber": k / N,
+               "conditional_ber": math.exp(log_ber),
+               "log10_conditional_ber": log_ber / math.log(10)}
+
+
+def export_conditional(groups, metrics, path):
+    """Export pooled conditional BER points, independent of plotted mode/limits."""
+    records = []
+    for config, rows in groups.items():
+        for metric in metrics:
+            points = []
+            for value in conditional_values(rows, metric):
+                log_ber = value["log10_conditional_ber"]
+                points.append({"raw_ber": value["raw_ber"],
+                               "residual_ber": value["conditional_ber"],
+                               "log10_residual_ber": log_ber if math.isfinite(log_ber) else None})
+            records.append({"configuration": config_label(config), "metric": metric,
+                            "points": points})
+    with path.open("w", encoding="utf-8") as stream:
+        json.dump(records, stream, indent=2, allow_nan=False)
+        stream.write("\n")
+
+
+def plot_results(groups, metrics, mode, ps, output, csv_path, plt, thin=0.5):
+    require(math.isfinite(thin) and thin > 0, "--thin must be finite and greater than zero")
+    figure, axis = plt.subplots(figsize=(11, 7))
+    positive = False
+    total_underflows = 0
+    sampled = set()
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    with csv_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=[
+            "configuration", "metric", "p", "log10_contribution", "log10_covered_mass",
+            "log10_missing_mass", "sampled_strata", "zero_observed_strata", "record_type",
+            "k", "residual_bits_sum", "completed_blocks", "mean", "log10_mean",
+            "raw_ber", "conditional_ber", "log10_conditional_ber"])
+        writer.writeheader()
+        for index, (config, rows) in enumerate(groups.items()):
+            label = config_label(config)
+            color = colors[index % len(colors)]
+            sampled.update(rows)
+            weighted = [evaluate(rows, p) for p in ps] if mode != "conditional" else []
+            for metric in metrics:
+                zeros = sum(row[metric] == 0 for row in rows.values())
+                base = {"configuration": label, "metric": metric,
+                        "sampled_strata": len(rows), "zero_observed_strata": zeros}
+                if mode != "ber":
+                    values = list(conditional_values(rows, metric))
+                    for value in values:
+                        writer.writerow({**base, "record_type": "conditional", **value})
+                    ys = [plot_value(v["log10_conditional_ber"] * math.log(10)) for v in values]
+                    visible = [(v["raw_ber"], y) for v, y in zip(values, ys) if math.isfinite(y)]
+                    underflows = sum(v["residual_bits_sum"] > 0 and not math.isfinite(y)
+                                     for v, y in zip(values, ys))
+                    total_underflows += underflows
+                    positive |= bool(visible)
+                    clipped = sum(not (0.0045 <= x <= 0.008 and 1e-30 <= y <= 1e-1)
+                                  for x, y in visible)
+                    note = f"{zeros}/{len(values)} zero-observed strata omitted"
+                    print(f"{label}; {metric}: {note}; {underflows} positive BERs underflowed "
+                          f"(see CSV logs); {clipped} points outside axis limits", file=sys.stderr)
+                    axis.scatter([x for x, _ in visible], [y for _, y in visible], s=18 * thin**2,
+                                 linewidths=thin,
+                                 color=color, marker="o" if metric == "information" else "x",
+                                 label=f"Fixed-weight conditional BER; {metric}: {label}\n{note}")
+                if mode != "conditional":
+                    print(f"{label}; {metric}: {len(rows)}/{N + 1} sampled strata, "
+                          f"{zeros} zero-observed strata; log10 missing mass range "
+                          f"[{min(v[2] for v in weighted) / math.log(10):.6g}, "
+                          f"{max(v[2] for v in weighted) / math.log(10):.6g}]", file=sys.stderr)
+                    for p, (contributions, covered, missing) in zip(ps, weighted):
+                        writer.writerow({**base, "record_type": "ber", "p": p,
+                                         "log10_contribution": contributions[metric] / math.log(10),
+                                         "log10_covered_mass": covered / math.log(10),
+                                         "log10_missing_mass": missing / math.log(10)})
+                    axis.plot(ps, [plot_value(v[0][metric]) for v in weighted], linewidth=2 * thin,
+                              color=color, linestyle="-" if metric == "information" else "--",
+                              label=f"Sampled-stratum BSC contribution; {metric}: {label}")
+    axis.set(xscale="linear", yscale="log", xlim=(0.008, 0.0045), ylim=(1e-30, 1e-1),
+             xlabel="Raw BER (k / 524288 for conditional; p for BSC)",
+             ylabel="Residual BER", title="Product-code BER")
+    if mode == "conditional" and not positive:
+        message = ("All observed residual sums are zero; no positive BERs to plot."
+                    if sampled else "No completed blocks in these report snapshots.")
+        if total_underflows:
+            message = "No representable positive BERs to plot; see CSV logs."
+        axis.text(0.5, 0.5, message + "\nNo artificial floor is used.",
+                  transform=axis.transAxes, ha="center", va="center")
+    axis.grid(True, which="major", color="#d1d5db", alpha=0.75)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.legend(fontsize=8)
+    figure.text(0.5, 0.02,
+                "Fixed-weight conditional BER is not a full BSC expectation. Missing strata unknown.\n"
+                "Zeros omitted, not floored; zero observed errors are not certainty. "
+                "No weight renormalization or extrapolation.", ha="center", fontsize=9)
+    figure.tight_layout(rect=(0, 0.06, 1, 1))
+    figure.savefig(output, facecolor="white", metadata={"Creator": __file__, "Date": None})
+    plt.close(figure)
+
+
 def main(argv=None):
     if hasattr(sys, "set_int_max_str_digits"):
         sys.set_int_max_str_digits(0)
     parser = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog="Weights are Binomial(N,p), without renormalization. Missing k are unknown; "
+        epilog="BER mode uses Binomial(N,p) weights, without renormalization. Conditional mode uses "
+        "raw BER k/524288 and residual BER sum(residual bits)/(sum(completed blocks)*D), "
+        "D=455168 for information or 524288 for full. Both mode overlays conditional scatter and "
+        "sampled-stratum BSC contribution lines; conditional BER is not a full BSC expectation. "
+        "All modes use descending linear x 0.008 to 0.0045 and log y 1e-30 to 1e-1; "
+        "out-of-range points are clipped, not discarded from CSV. "
+        "Zeros are omitted and counted, never floored. The unified CSV uses record_type conditional/ber, "
+        "retains BER columns and conditional exact sums/counts and mean/log10_mean, and adds "
+        "raw_ber, conditional_ber/log10_conditional_ber. Inapplicable fields are blank. "
+        "Missing k are unknown; "
         "zero observed errors are not certainty. Arbitrarily low plotted values are not reliability "
         "evidence. No extrapolation or MSE fit: a fitting model has not been specified. "
         "Matching decoder configurations pool per-k sums/counts; different flags/caps stay separate. "
-        "Repeated seeds within a configuration are rejected. Metadata has no source revision.")
-    parser.add_argument("inputs", nargs="+", type=Path, help="run directories or summary.json with sibling metadata.json")
+        "Repeated seeds within a configuration and overlapping inputs are rejected. "
+        f"Only the fixed code {CODE} is supported; other dimensions/coordinates are rejected. "
+        "Zero/random conventions must match unless --allow-mixed-codewords is explicit. "
+        "Metadata has no source revision. "
+        "Discovery stops at run directories, ignores unrelated files, and does not follow subdirectory "
+        "symlinks. Partial or malformed runs are errors, not silently skipped. "
+        "Example: python3 -B scripts/plot_product_monte_carlo.py experiments --mode conditional "
+        "--metric both --output merged.svg (also writes merged.csv). "
+        "Direct inputs remain supported: run-a run-b/summary.json --output merged.svg.")
+    parser.add_argument("inputs", nargs="+", type=Path,
+                        help="run directories, summary files with sibling metadata.json, or containers "
+                        "recursively searched in sorted order for metadata.json + summary.json pairs")
     parser.add_argument("--output", type=Path, default=Path("product_monte_carlo.svg"), help="SVG output")
-    parser.add_argument("--csv", type=Path, help="CSV output (default: output path with .csv suffix)")
-    parser.add_argument("--points", type=int, default=200)
+    parser.add_argument("--csv", type=Path, help="unified CSV output, both row types in both mode "
+                        "(default: output path with .csv suffix; no sidecar)")
+    parser.add_argument("--export", type=Path, metavar="JSON",
+                        help="also export only pooled conditional raw/residual BER values to indented JSON, "
+                        "with null log10 for zero estimates, "
+                        "including zeros and out-of-axis points, regardless of --mode")
+    parser.add_argument("--mode", choices=("conditional", "ber", "both"), default="ber",
+                        help="conditional: fixed-weight BER scatter; ber: BSC contribution lines; both: overlay")
+    parser.add_argument("--points", type=int, default=200, help="BER p-grid size; ignored in conditional mode")
     parser.add_argument("--metric", choices=("information", "full", "both"), default="information")
+    parser.add_argument("--thin", type=float, default=0.5,
+                        help="positive size multiplier for curve widths, marker diameters and marker strokes; "
+                        "smaller is thinner, 1 uses the previous curve width and marker area")
     parser.add_argument("--allow-mixed-codewords", action="store_true",
                         help="pool zero/random inputs using linear-code BDD translation equivariance; "
                         "absent legacy convention means random; repeated seeds remain forbidden")
     args = parser.parse_args(argv)
-    require(args.points >= 2, "--points must be at least 2")
+    require(math.isfinite(args.thin) and args.thin > 0,
+            "--thin must be finite and greater than zero")
+    require(args.mode == "conditional" or args.points >= 2, "--points must be at least 2")
     require(args.output.suffix.lower() == ".svg", "--output must be an .svg path")
     csv_path = args.csv or args.output.with_suffix(".csv")
-    protected = {p.resolve() for path in args.inputs for p in (
-        (path / "summary.json" if path.is_dir() else path),
-        (path if path.is_dir() else path.parent) / "metadata.json")}
-    require(args.output.resolve() != csv_path.resolve() and not protected.intersection(
-        {args.output.resolve(), csv_path.resolve()}), "output paths must be distinct from each other and inputs")
-    groups = pool_reports(args.inputs, args.allow_mixed_codewords)
+    reports = discover_reports(args.inputs)
+    protected = {p.resolve() for path in reports for p in (path, path.parent / "metadata.json")}
+    outputs = [args.output.resolve(), csv_path.resolve()]
+    if args.export is not None:
+        outputs.append(args.export.resolve())
+    require(len(set(outputs)) == len(outputs) and not protected.intersection(outputs),
+            "output paths must be distinct from each other and inputs")
+    groups = pool_reports(reports, args.allow_mixed_codewords)
     print("Warning: metadata lacks source revision; decoder implementation compatibility cannot be verified. "
           "Missing strata are unknown; zero observed errors do not establish zero BER. "
-          "No extrapolation or MSE fit is performed.", file=sys.stderr)
+          "No extrapolation or MSE fit is performed. "
+          f"Validated {len(reports)} report(s); only the fixed code {CODE} is supported.", file=sys.stderr)
     metrics = list(METRICS) if args.metric == "both" else [args.metric]
-    ps = [0.008 + (0.0045 - 0.008) * i / (args.points - 1) for i in range(args.points)]
-    results = []
-    for config, rows in groups.items():
-        values = [evaluate(rows, p) for p in ps]
-        label = config_label(config)
-        for metric in metrics:
-            zeros = sum(row[metric] == 0 for row in rows.values())
-            print(f"{label}; {metric}: {len(rows)}/{N + 1} sampled strata, "
-                  f"{zeros} zero-observed strata; log10 missing mass range "
-                  f"[{min(v[2] for v in values) / math.log(10):.6g}, "
-                  f"{max(v[2] for v in values) / math.log(10):.6g}]", file=sys.stderr)
-            results.append((label, metric, zeros, len(rows), values))
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError as error:
         raise ValueError("plotting requires matplotlib; numerical core uses only the standard library") from error
-    with csv_path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.writer(stream)
-        writer.writerow(["configuration", "metric", "p", "log10_contribution", "log10_covered_mass",
-                         "log10_missing_mass", "sampled_strata", "zero_observed_strata"])
-        for label, metric, zeros, sampled, values in results:
-            for p, (contributions, covered, missing) in zip(ps, values):
-                writer.writerow([label, metric, p, contributions[metric] / math.log(10),
-                                 covered / math.log(10), missing / math.log(10), sampled, zeros])
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11,
                          "svg.hashsalt": "gf256-product-monte-carlo"})
-    figure, axis = plt.subplots(figsize=(11, 7))
-    for label, metric, _, _, values in results:
-        axis.plot(ps, [plot_value(v[0][metric]) for v in values], linewidth=2,
-                  label=f"{metric}: {label}")
-    axis.set(xlim=(0.008, 0.0045), ylim=(1e-30, 1e-1), yscale="log",
-             xlabel="Channel bit-flip probability p",
-             ylabel="Sampled-stratum BER contribution",
-             title="Product-code sampled-stratum BER contribution")
-    axis.grid(True, which="major", color="#d1d5db", alpha=0.75)
-    axis.spines[["top", "right"]].set_visible(False)
-    axis.legend(fontsize=8)
-    figure.text(0.5, 0.02, "Missing strata unknown; zero observed errors are not certainty. No extrapolation.",
-                ha="center", fontsize=9)
-    figure.tight_layout(rect=(0, 0.04, 1, 1))
-    figure.savefig(args.output, facecolor="white", metadata={"Creator": __file__, "Date": None})
-    plt.close(figure)
+    ps = ([0.008 + (0.0045 - 0.008) * i / (args.points - 1) for i in range(args.points)]
+          if args.mode != "conditional" else [])
+    plot_results(groups, metrics, args.mode, ps, args.output, csv_path, plt, thin=args.thin)
+    if args.export is not None:
+        export_conditional(groups, metrics, args.export)
 
 
 if __name__ == "__main__":

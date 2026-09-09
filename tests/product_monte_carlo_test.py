@@ -147,6 +147,60 @@ class NativeTest(unittest.TestCase):
         (path / "flips.bin").write_bytes(data+b"uncommitted tail")
         self.invoke("--replay", path)
 
+    def test_uint64_seed_and_canonical_unicode_identity(self):
+        for reference in (False, True):
+            path = self.run_case(str(reference), "--seed", 2**64-1,
+                "--batches", 1, "--batch-size", 1, "--sampler", "fisher-yates",
+                "--minimum-flipped-bits", 0, "--maximum-flipped-bits", 0,
+                reference=reference)
+            metadata = self.read(path, "metadata.json")
+            self.assertEqual(metadata["settings"]["root seed"], 2**64-1)
+            digest = hashlib.sha256(canonical(metadata).encode("ascii")).hexdigest()
+            self.assertEqual(self.read(path)["run identity"], digest)
+            self.assertEqual((path / "flips.bin").read_bytes()[8:40], bytes.fromhex(digest))
+            metadata["created at"] = "unicode \u00e9 \U0001f600 / \x0f\n"
+            digest = hashlib.sha256(canonical(metadata).encode("ascii")).hexdigest()
+            # Exercise raw UTF-8 parsing as well as canonical ASCII serialization.
+            (path / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+            records = self.records(path)
+            for record in records:
+                record["run identity"] = digest
+            (path / "journal.jsonl").write_text("".join(canonical(r)+"\n" for r in records))
+            data = (path / "flips.bin").read_bytes()
+            (path / "flips.bin").write_bytes(data[:8]+bytes.fromhex(digest)+data[40:])
+            self.invoke("--replay", path)
+            self.assertEqual(self.read(path)["run identity"], digest)
+
+    def test_oversized_counters_and_legacy_moments_rejected(self):
+        for reference in (False, True):
+            path = self.run_case(str(reference), "--batches", 1, "--batch-size", 1,
+                                 reference=reference)
+            before = (path / "summary.json").read_bytes()
+            original = self.records(path)[0]
+            for value in (2**64, 10**100, 10**400, 1.0, -1):
+                record = copy.deepcopy(original)
+                if reference:
+                    record["statistics"]["accepted bit changes"]["squared sum"] = value
+                else:
+                    record["statistics"]["total iterations"] = value
+                (path / "journal.jsonl").write_text(canonical(record)+"\n")
+                p = self.invoke("--report", path, success=False)
+                self.assertRegex(p.stderr, "uint64|unsigned integer")
+                self.assertEqual(before, (path / "summary.json").read_bytes())
+
+    def test_counter_overflow_preserves_committed_prefix(self):
+        for sampler in ("floyd", "fisher-yates"):
+            path = self.root / sampler
+            p = self.invoke("--output", path, "--seed", 42, "--batches", 1,
+                "--batch-size", 3, "--checkpoint-trials", 1, "--sampler", sampler,
+                "--minimum-flipped-bits", 0, "--maximum-flipped-bits", 0,
+                fault=True, env=dict(os.environ, MC_TEST_COUNTER_OVERFLOW="1"), success=False)
+            self.assertIn("uint64 counter addition overflow", p.stderr)
+            self.assertEqual(len(self.records(path)), 1)
+            self.assertEqual(self.count(path), 0)  # Last durable summary is unchanged.
+            self.invoke("--replay" if sampler == "fisher-yates" else "--report", path)
+            self.assertEqual(self.count(path), 1)
+
     def test_recovery_strictness_and_partial_tail(self):
         path = self.run_case("source", "--checkpoint-trials", 1)
         before = (path / "summary.json").read_bytes()

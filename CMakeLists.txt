@@ -91,12 +91,13 @@ endif()
 if(GF256_BUILD_MONTE_CARLO)
   find_package(Threads REQUIRED)
   find_package(OpenSSL 3 REQUIRED COMPONENTS Crypto)
-  FetchContent_Declare(jsoncons
-    GIT_REPOSITORY https://github.com/danielaparker/jsoncons.git
-    GIT_TAG v0.177.0
+  FetchContent_Declare(nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.12.0
     GIT_SHALLOW TRUE)
-  set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(jsoncons)
+  set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+  set(JSON_Install OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(nlohmann_json)
   add_library(product_monte_carlo_trials OBJECT tools/product_monte_carlo_native.cc)
   target_link_libraries(product_monte_carlo_trials PRIVATE gf256_core)
   set_target_properties(product_monte_carlo_trials PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -105,7 +106,7 @@ if(GF256_BUILD_MONTE_CARLO)
   endif()
   add_executable(rs-product-monte-carlo tools/product_monte_carlo.cc)
   target_link_libraries(rs-product-monte-carlo PRIVATE product_monte_carlo_trials
-    gf256_core Threads::Threads OpenSSL::Crypto jsoncons)
+    gf256_core Threads::Threads OpenSSL::Crypto nlohmann_json::nlohmann_json)
   include(GNUInstallDirs)
   install(TARGETS rs-product-monte-carlo
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT product-monte-carlo)
@@ -194,13 +195,13 @@ if(GF256_BUILD_TESTS)
     configure_file(tests/reference/product_monte_carlo.py product_monte_carlo_reference.py COPYONLY)
     add_executable(product_monte_carlo_data_tests tests/product_monte_carlo_data_tests.cc)
     target_include_directories(product_monte_carlo_data_tests PRIVATE tools)
-    target_link_libraries(product_monte_carlo_data_tests PRIVATE jsoncons gtest_main)
+    target_link_libraries(product_monte_carlo_data_tests PRIVATE nlohmann_json::nlohmann_json gtest_main)
     target_compile_features(product_monte_carlo_data_tests PRIVATE cxx_std_20)
     add_test(NAME ProductMonteCarloData COMMAND product_monte_carlo_data_tests)
     add_executable(product_monte_carlo_fault_cli tools/product_monte_carlo.cc)
     target_compile_definitions(product_monte_carlo_fault_cli PRIVATE GF256_MC_TEST_HOOKS=1)
     target_link_libraries(product_monte_carlo_fault_cli PRIVATE product_monte_carlo_trials
-      gf256_core Threads::Threads OpenSSL::Crypto jsoncons)
+      gf256_core Threads::Threads OpenSSL::Crypto nlohmann_json::nlohmann_json)
     add_test(NAME ProductMonteCarloCli
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/product_monte_carlo_test.py
               ${PROJECT_BINARY_DIR}/rs-product-monte-carlo)

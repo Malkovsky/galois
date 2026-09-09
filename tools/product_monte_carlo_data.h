@@ -1,20 +1,19 @@
 #pragma once
 
 #include <array>
+#include <charconv>
 #include <cstdint>
-#include <jsoncons/bigint.hpp>
-#include <jsoncons/json.hpp>
-#include <jsoncons/json_cursor.hpp>
 #include <map>
+#include <nlohmann/json.hpp>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace mc {
-using Json = jsoncons::json;
-using Big = jsoncons::bigint;
+using Json = nlohmann::json;
 inline constexpr std::string_view kCode =
     "RS256,224 x RS256,254 Cantor systematic row major";
 inline constexpr std::string_view kFloyd =
@@ -54,75 +53,78 @@ inline void Require(bool condition, const std::string& message) {
 }
 
 inline Json Parse(const std::string& text) {
-  const auto options = jsoncons::json_options()
-                           .lossless_number(true)
-                           .max_nesting_depth(32)
-                           .err_handler(jsoncons::strict_json_parsing());
-  // Validate the library's event stream before DOM construction can discard
-  // duplicate keys. Number tokens larger than uint64 retain their exact digits.
   std::vector<std::set<std::string>> objects;
-  jsoncons::json_string_cursor cursor(text, options);
-  for (; !cursor.done(); cursor.next()) {
-    const auto& event = cursor.current();
-    using E = jsoncons::staj_event_type;
-    if (event.event_type() == E::begin_object) {
-      objects.emplace_back();
-    }
-    if (event.event_type() == E::end_object) {
-      objects.pop_back();
-    }
-    if (event.event_type() == E::key) {
-      Require(objects.back().insert(event.get<std::string>()).second,
-              "duplicate JSON key");
-    }
-    Require(event.event_type() != E::double_value &&
-                event.tag() != jsoncons::semantic_tag::bigdec,
-            "noninteger JSON number");
+  try {
+    return Json::parse(
+        text, [&](int depth, Json::parse_event_t event, Json& value) {
+          using E = Json::parse_event_t;
+          if (event == E::object_start || event == E::array_start) {
+            Require(depth < 32, "JSON nesting exceeds 32");
+          }
+          if (event == E::object_start) {
+            objects.emplace_back();
+          }
+          if (event == E::object_end) {
+            objects.pop_back();
+          }
+          if (event == E::key) {
+            Require(objects.back().insert(value.get<std::string>()).second,
+                    "duplicate JSON key");
+          }
+          // Overflowing integer tokens also become floats in the DOM. Never
+          // accept their rounded values, including unused legacy squared sums.
+          Require(!value.is_number_float(),
+                  "noninteger JSON number or integer exceeds uint64 (including "
+                  "legacy moments)");
+          return true;
+        });
+  } catch (const Json::out_of_range&) {
+    throw std::runtime_error(
+        "JSON number exceeds uint64 (including legacy moments)");
   }
-  return Json::parse(text, options);
 }
 
 inline std::string Dump(const Json& value, bool pretty = false) {
-  std::string text;
-  auto options = jsoncons::json_options()
-                     .bigint_format(jsoncons::bigint_chars_format::number)
-                     .escape_all_non_ascii(true)
-                     .indent_size(2);
-  if (!pretty) {
-    options.spaces_around_colon(jsoncons::spaces_option::no_spaces)
-        .spaces_around_comma(jsoncons::spaces_option::no_spaces);
-  }
-  value.dump(
-      text, options,
-      pretty ? jsoncons::indenting::indent : jsoncons::indenting::no_indent);
-  return text;
+  // The default ordered object map and ASCII escaping match Python's
+  // sort_keys=True, ensure_ascii=True, separators=(",", ":") identities.
+  return value.dump(pretty ? 2 : -1, ' ', true);
 }
 
-inline Big Natural(const Json& value) {
-  if (value.is_uint64()) {
-    return Big(value.as<uint64_t>());
-  }
-  Require(value.tag() == jsoncons::semantic_tag::bigint,
+inline uint64_t Natural(const Json& value) {
+  Require(value.is_number_unsigned() ||
+              (value.is_number_integer() && value.get<int64_t>() >= 0),
           "expected unsigned integer");
-  auto n = Big::from_string(value.as<std::string>());
-  Require(n >= 0, "expected unsigned integer");
-  return n;
+  return value.get<uint64_t>();
 }
 inline uint64_t U64(const Json& value) {
-  auto n = Natural(value);
-  Require(n <= Big(UINT64_MAX), "integer exceeds uint64");
-  return static_cast<uint64_t>(n);
+  return Natural(value);
 }
-inline Json Number(const Big& value) {
-  if (value <= Big(UINT64_MAX)) {
-    return Json(static_cast<uint64_t>(value));
-  }
-  return Json(value.to_string(), jsoncons::semantic_tag::bigint);
+inline uint64_t Decimal(std::string_view text) {
+  Require(!text.empty(), "expected unsigned decimal integer");
+  uint64_t value = 0;
+  const auto [end, error] =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  Require(error != std::errc::result_out_of_range, "integer exceeds uint64");
+  Require(error == std::errc{} && end == text.data() + text.size(),
+          "expected unsigned decimal integer");
+  return value;
+}
+inline uint64_t CheckedAdd(uint64_t a, uint64_t b) {
+  Require(b <= UINT64_MAX - a, "uint64 counter addition overflow");
+  return a + b;
+}
+inline uint64_t CheckedMultiply(uint64_t a, uint64_t b) {
+  Require(b == 0 || a <= UINT64_MAX / b,
+          "uint64 counter multiplication overflow");
+  return a * b;
+}
+inline Json Number(uint64_t value) {
+  return Json(value);
 }
 inline void Fields(const Json& value, std::set<std::string> expected) {
   Require(value.is_object() && value.size() == expected.size(),
           "incompatible object fields");
-  for (const auto& item : value.object_range()) {
+  for (const auto& item : value.items()) {
     Require(expected.erase(std::string(item.key())) == 1,
             "incompatible object field");
   }
@@ -177,35 +179,28 @@ struct Settings {
     s.checkpoint = U64(j.at("checkpoint trials"));
     s.report = U64(j.at("report seconds"));
     s.sync = U64(j.at("fsync seconds"));
-    Require(j.at("anchors").is_bool() && j.at("binary image").is_bool(),
+    Require(j.at("anchors").is_boolean() && j.at("binary image").is_boolean(),
             "gates must be boolean");
-    s.anchors = j.at("anchors").as<bool>();
-    s.binary = j.at("binary image").as<bool>();
+    s.anchors = j.at("anchors").get<bool>();
+    s.binary = j.at("binary image").get<bool>();
     s.Validate();
     return s;
   }
 };
 
 struct Stats {
-  // All public accumulators are arbitrary precision. Trial metrics remain
-  // bounded uint64 values in the private ABI and legacy flip records.
-  Big blocks = 0, iterations = 0, info_raw = 0, info_post = 0, full_raw = 0,
-      full_post = 0;
+  uint64_t blocks = 0, iterations = 0, info_raw = 0, info_post = 0,
+           full_raw = 0, full_post = 0;
   void Add(const std::array<uint64_t, 22>& m) {
-    ++blocks;
-    iterations += m[12];
-    info_raw += m[2];
-    info_post += m[6];
-    full_raw += m[0];
-    full_post += m[4];
+    Add(Stats{1, m[12], m[2], m[6], m[0], m[4]});
   }
   void Add(const Stats& s) {
-    blocks += s.blocks;
-    iterations += s.iterations;
-    info_raw += s.info_raw;
-    info_post += s.info_post;
-    full_raw += s.full_raw;
-    full_post += s.full_post;
+    Stats next{
+        CheckedAdd(blocks, s.blocks),     CheckedAdd(iterations, s.iterations),
+        CheckedAdd(info_raw, s.info_raw), CheckedAdd(info_post, s.info_post),
+        CheckedAdd(full_raw, s.full_raw), CheckedAdd(full_post, s.full_post)};
+    CheckedMultiply(next.blocks, 524288);
+    *this = next;
   }
   Json ToJson() const {
     Json j;
@@ -213,7 +208,8 @@ struct Stats {
     j["total iterations"] = Number(iterations);
     for (bool info : {true, false}) {
       Json bits;
-      bits["total bits"] = Number(blocks * (info ? 455168 : 524288));
+      bits["total bits"] =
+          Number(CheckedMultiply(blocks, info ? 455168 : 524288));
       bits["raw corrupted bits"] = Number(info ? info_raw : full_raw);
       bits["post decoding corrupted bits"] =
           Number(info ? info_post : full_post);
@@ -222,7 +218,7 @@ struct Stats {
     return j;
   }
   static Stats FromJson(const Json& j,
-                        const Big& count,
+                        uint64_t count,
                         uint64_t k,
                         uint64_t passes) {
     Fields(j, {"completed blocks", "total iterations", "information bits",
@@ -230,14 +226,17 @@ struct Stats {
     Stats s;
     s.blocks = Natural(j.at("completed blocks"));
     s.iterations = Natural(j.at("total iterations"));
-    Require(s.blocks == count && s.iterations >= count * 2 &&
-                s.iterations <= count * Big(passes),
+    // Compare the upper bound by division: count*passes need not fit u64
+    // when the actual iteration count does.
+    Require(s.blocks == count && s.iterations >= CheckedMultiply(count, 2) &&
+                (passes != 0 && s.iterations / passes <= count &&
+                 (s.iterations / passes < count || s.iterations % passes == 0)),
             "inconsistent block/iteration counts");
     for (bool info : {true, false}) {
       const auto& bits = j.at(info ? "information bits" : "full-codeword bits");
       Fields(bits, {"total bits", "raw corrupted bits",
                     "post decoding corrupted bits"});
-      const auto total = count * (info ? 455168 : 524288);
+      const auto total = CheckedMultiply(count, info ? 455168 : 524288);
       auto raw = Natural(bits.at("raw corrupted bits"));
       auto post = Natural(bits.at("post decoding corrupted bits"));
       Require(Natural(bits.at("total bits")) == total && raw <= total &&
@@ -246,10 +245,11 @@ struct Stats {
       (info ? s.info_raw : s.full_raw) = raw;
       (info ? s.info_post : s.full_post) = post;
     }
-    Require(s.full_raw == count * Big(k), "initial channel is not exact k");
+    Require(s.full_raw == CheckedMultiply(count, k),
+            "initial channel is not exact k");
     Require(s.info_raw <= s.full_raw && s.info_post <= s.full_post &&
-                s.full_raw - s.info_raw <= count * 69120 &&
-                s.full_post - s.info_post <= count * 69120,
+                s.full_raw - s.info_raw <= CheckedMultiply(count, 69120) &&
+                s.full_post - s.info_post <= CheckedMultiply(count, 69120),
             "inconsistent information/full bit counters");
     return s;
   }
@@ -258,32 +258,37 @@ struct Stats {
 inline Json LegacyStats() {
   Json j;
   for (auto name : kMetrics) {
-    j[name]["sum"] = 0;
-    j[name]["squared sum"] = 0;
+    j[name]["sum"] = uint64_t{0};
+    j[name]["squared sum"] = uint64_t{0};
   }
   return j;
 }
 inline void AddLegacy(Json& to, const Json& from) {
+  Json next = to;
   for (auto name : kMetrics) {
     for (auto field : {"sum", "squared sum"}) {
-      to[name][field] = Number(Natural(to.at(name).at(field)) +
-                               Natural(from.at(name).at(field)));
+      next[name][field] = Number(CheckedAdd(Natural(to.at(name).at(field)),
+                                            Natural(from.at(name).at(field))));
     }
   }
+  to.swap(next);
 }
 inline void AddLegacyTrial(Json& to, const std::array<uint64_t, 22>& m) {
+  Json next = to;
   for (size_t i = 0; i < m.size(); ++i) {
-    auto& item = to.at(kMetrics[i]);
-    item["sum"] = Number(Natural(item.at("sum")) + Big(m[i]));
-    item["squared sum"] =
-        Number(Natural(item.at("squared sum")) + Big(m[i]) * Big(m[i]));
+    auto& item = next.at(kMetrics[i]);
+    item["sum"] = Number(CheckedAdd(Natural(item.at("sum")), m[i]));
+    item["squared sum"] = Number(CheckedAdd(Natural(item.at("squared sum")),
+                                            CheckedMultiply(m[i], m[i])));
   }
+  to.swap(next);
 }
 inline void ValidateLegacy(const Json& j,
                            uint64_t count,
                            uint64_t k,
                            uint64_t passes) {
   Fields(j, std::set<std::string>(kMetrics.begin(), kMetrics.end()));
+  Require(passes >= 2 && passes <= 1000000, "invalid legacy pass cap");
   std::array<uint64_t, 22> bounds{524288,
                                   65536,
                                   455168,
@@ -311,21 +316,130 @@ inline void ValidateLegacy(const Json& j,
     Fields(item, {"sum", "squared sum"});
     auto sum = Natural(item.at("sum")),
          square = Natural(item.at("squared sum"));
-    Require(sum <= Big(count) * Big(bounds[i]) &&
-                square <= Big(count) * Big(bounds[i]) * Big(bounds[i]) &&
-                sum * sum <= Big(count) * square && sum <= square &&
-                square <= Big(bounds[i]) * sum,
+    // Only comparison products are widened, never stored counters. Two u64
+    // factors fit exactly; the redundant count*bound*bound bound is implied
+    // by sum <= count*bound and square <= bound*sum.
+    using Wide = __uint128_t;
+    Require(sum <= Wide(count) * bounds[i] &&
+                Wide(sum) * sum <= Wide(count) * square && sum <= square &&
+                square <= Wide(bounds[i]) * sum,
             "inconsistent legacy moments");
   }
-  Require(Natural(j.at(kMetrics[0]).at("sum")) == Big(count) * Big(k) &&
+  Require(Natural(j.at(kMetrics[0]).at("sum")) == CheckedMultiply(count, k) &&
               Natural(j.at(kMetrics[0]).at("squared sum")) ==
-                  Big(count) * Big(k) * Big(k),
+                  CheckedMultiply(CheckedMultiply(count, k), k),
           "initial channel is not exact k");
   for (size_t i : {13, 14}) {
     Require(Natural(j.at(kMetrics[i]).at("sum")) ==
-                Natural(j.at(kMetrics[i + 2]).at("sum")) +
-                    Natural(j.at(kMetrics[i + 4]).at("sum")),
+                CheckedAdd(Natural(j.at(kMetrics[i + 2]).at("sum")),
+                           Natural(j.at(kMetrics[i + 4]).at("sum"))),
             "directional accepted totals disagree");
   }
 }
+
+struct Aggregate {
+  std::string identity;
+  unsigned schema;
+  Stats overall;
+  std::map<uint64_t, Stats> by_k;
+  Json legacy = LegacyStats();
+  std::map<uint64_t, Json> legacy_k;
+  /** @brief Initialize an empty aggregate for a run and schema revision. */
+  Aggregate(std::string id, unsigned revision)
+      : identity(std::move(id)), schema(revision) {}
+
+  struct PreparedAdd {
+    Stats overall;
+    decltype(by_k)::node_type row;
+    Json legacy;
+    decltype(legacy_k)::node_type legacy_row;
+  };
+
+  /**
+   * @brief Check totals and allocate staged nodes without changing this
+   * aggregate.
+   * @param k Flipped-bit count of the updated stratum.
+   * @param stats Counter increment.
+   * @param old Legacy moment increment, required for schema 1.
+   * @return Prepared update that can be discarded without side effects.
+   */
+  PreparedAdd PrepareAdd(uint64_t k,
+                         const Stats& stats,
+                         const Json& old = Json()) const {
+    PreparedAdd next;
+    next.overall = overall;
+    next.overall.Add(stats);
+    const auto it = by_k.find(k);
+    Stats row = it == by_k.end() ? Stats{} : it->second;
+    row.Add(stats);
+    // Stage just one node, with the same allocator as the destination map.
+    decltype(by_k) rows;
+    rows.emplace(k, row);
+    next.row = rows.extract(rows.begin());
+    if (schema == 1) {
+      next.legacy = legacy;
+      AddLegacy(next.legacy, old);
+      const auto old_it = legacy_k.find(k);
+      Json old_row = old_it == legacy_k.end() ? LegacyStats() : old_it->second;
+      AddLegacy(old_row, old);
+      decltype(legacy_k) old_rows;
+      old_rows.emplace(k, std::move(old_row));
+      next.legacy_row = old_rows.extract(old_rows.begin());
+    }
+    return next;
+  }
+
+  /**
+   * @brief Publish prepared totals without allocation or exceptions.
+   * @param next Update prepared by this aggregate; commit once, with no
+   * intervening updates. Node insertion allocates nothing, and the integer
+   * comparator cannot throw.
+   */
+  void Commit(PreparedAdd&& next) noexcept {
+    auto row = by_k.insert(std::move(next.row));
+    if (!row.inserted) {
+      row.position->second = row.node.mapped();
+    }
+    if (schema == 1) {
+      auto old_row = legacy_k.insert(std::move(next.legacy_row));
+      if (!old_row.inserted) {
+        old_row.position->second.swap(old_row.node.mapped());
+      }
+      legacy.swap(next.legacy);
+    }
+    overall = next.overall;
+  }
+
+  /** @brief Prepare and commit one increment with strong exception safety. */
+  void Add(uint64_t k, const Stats& stats, const Json& old = Json()) {
+    Commit(PrepareAdd(k, stats, old));
+  }
+
+  /** @brief Serialize the overall totals and all strata in the run's schema. */
+  Json Summary() const {
+    Json out;
+    out["schema revision"] = schema;
+    out["run identity"] = identity;
+    Json rows = Json::array();
+    for (const auto& [k, s] : by_k) {
+      Json row;
+      row["flipped bit count"] = k;
+      if (schema == 1) {
+        row["trial count"] = Number(s.blocks);
+        row["statistics"] = legacy_k.at(k);
+      } else {
+        row["statistics"] = s.ToJson();
+      }
+      rows.push_back(std::move(row));
+    }
+    out["by flipped bit count"] = std::move(rows);
+    if (schema == 1) {
+      out["overall"]["trial count"] = Number(overall.blocks);
+      out["overall"]["statistics"] = legacy;
+    } else {
+      out["overall"]["statistics"] = overall.ToJson();
+    }
+    return out;
+  }
+};
 }  // namespace mc

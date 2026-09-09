@@ -127,6 +127,8 @@ int Trial(uint64_t seed,
           uint8_t* residual) {
   try {
     // Local counters cannot alias the byte buffers and are published only once.
+    // The validated cap bounds every metric by 1000000 * 524288 (< 2^39);
+    // scans count at most 524288 bits, so these per-trial additions fit u64.
     uint64_t out[22]{};
     if (!output || k > 524288 || passes < 2 || passes > 1000000 ||
         sampler < 0 || sampler > 2 || (sampler == 2 && !positions)) {

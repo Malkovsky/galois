@@ -325,51 +325,6 @@ class Workers {
   bool active_ = false, halted_ = false, shutdown_ = false;
 };
 
-struct Aggregate {
-  std::string identity;
-  unsigned schema;
-  Stats overall;
-  std::map<uint64_t, Stats> by_k;
-  Json legacy = LegacyStats();
-  std::map<uint64_t, Json> legacy_k;
-  Aggregate(std::string id, unsigned revision)
-      : identity(std::move(id)), schema(revision) {}
-  void Add(uint64_t k, const Stats& stats, const Json& old = Json()) {
-    overall.Add(stats);
-    by_k[k].Add(stats);
-    if (schema == 1) {
-      AddLegacy(legacy, old);
-      auto [it, inserted] = legacy_k.try_emplace(k, LegacyStats());
-      AddLegacy(it->second, old);
-    }
-  }
-  Json Summary() const {
-    Json out;
-    out["schema revision"] = schema;
-    out["run identity"] = identity;
-    Json rows(jsoncons::json_array_arg);
-    for (const auto& [k, s] : by_k) {
-      Json row;
-      row["flipped bit count"] = k;
-      if (schema == 1) {
-        row["trial count"] = Number(s.blocks);
-        row["statistics"] = legacy_k.at(k);
-      } else {
-        row["statistics"] = s.ToJson();
-      }
-      rows.push_back(std::move(row));
-    }
-    out["by flipped bit count"] = std::move(rows);
-    if (schema == 1) {
-      out["overall"]["trial count"] = Number(overall.blocks);
-      out["overall"]["statistics"] = legacy;
-    } else {
-      out["overall"]["statistics"] = overall.ToJson();
-    }
-    return out;
-  }
-};
-
 void WriteFlips(File& file, uint64_t batch, uint64_t k, const Result& result) {
   const auto count = std::min(k, 524288 - k);
   std::string bytes(208 + 4 * count, '\0');
@@ -433,7 +388,7 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
   const auto start = Clock::now();
   auto last_sync = start, last_report = start, last_bar = start,
        last_checkpoint = start;
-  Big completed_total = 0, increment = 0;
+  uint64_t completed_total = 0, increment = 0;
   uint64_t batch_completed = 0, batch = 0, k = 0;
   Stats staged;
   uint64_t first = 0, end = 0, flip_start = 0;
@@ -452,10 +407,20 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
     return "batch=" + std::to_string(batch) + " k=" + std::to_string(k) +
            " trials=" + std::to_string(batch_completed) + "/" +
            std::to_string(s.size) +
-           " overall trials=" + completed_total.to_string();
+           " overall trials=" + std::to_string(completed_total);
   };
   auto checkpoint = [&] {
     if (staged.blocks != 0) {
+      // Preflight every aggregate and derived total before publishing a record.
+#ifdef GF256_MC_TEST_HOOKS
+      if (increment == 1 && std::getenv("MC_TEST_COUNTER_OVERFLOW")) {
+        auto exhausted = aggregate.overall;
+        exhausted.iterations = UINT64_MAX;
+        exhausted.Add(staged);
+      }
+#endif
+      auto next = aggregate.PrepareAdd(k, staged);
+      const auto next_increment = CheckedAdd(increment, 1);
       Json r;
       r["schema revision"] = 2;
       r["run identity"] = aggregate.identity;
@@ -472,8 +437,8 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
         r["flip end"] = flips->Offset();
       }
       journal.Write(Dump(r) + "\n");
-      aggregate.Add(k, staged);
-      ++increment;
+      aggregate.Commit(std::move(next));
+      increment = next_increment;
       staged = Stats{};
     }
     last_checkpoint = Clock::now();
@@ -512,7 +477,8 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
         Result result;
         uint64_t observed;
         bool ready = workers.Pop(result, observed, done);
-        completed_total += Big(observed - batch_completed);
+        completed_total =
+            CheckedAdd(completed_total, observed - batch_completed);
         batch_completed = observed;
         if (ready) {
           if (result.error) {
@@ -540,12 +506,15 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
                 flip_start = flips->Offset();
               }
             }
+            auto next_staged = staged;
+            next_staged.Add(result.metrics);
+            const auto next_end = CheckedAdd(result.index, 1);
             if (flips) {
               WriteFlips(*flips, batch, k, result);
             }
-            end = result.index + 1;
-            staged.Add(result.metrics);
-            if (staged.blocks == Big(s.checkpoint)) {
+            end = next_end;
+            staged = next_staged;
+            if (staged.blocks == s.checkpoint) {
               checkpoint();
             }
           }
@@ -559,7 +528,7 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
         }
         if (now - last_report >= std::chrono::seconds(s.report)) {
           progress(counts() + " persisted overall trials=" +
-                       aggregate.overall.blocks.to_string() + " " +
+                       std::to_string(aggregate.overall.blocks) + " " +
                        throughput(now),
                    !tty);
           last_report = now;
@@ -570,8 +539,9 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
       bar(Clock::now(), true);
       progress("batch=" + std::to_string(batch) + " k=" + std::to_string(k) +
                " completed trials=" + std::to_string(batch_completed) + "/" +
-               std::to_string(s.size) + " overall trials=" +
-               completed_total.to_string() + " " + throughput(Clock::now()));
+               std::to_string(s.size) +
+               " overall trials=" + std::to_string(completed_total) + " " +
+               throughput(Clock::now()));
       Require(batch != UINT64_MAX, "batch identity exhausted; start a new run");
       ++batch;
     }
@@ -588,7 +558,7 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
     throw;
   }
   durable();
-  progress("finalizing trials=" + completed_total.to_string() +
+  progress("finalizing trials=" + std::to_string(completed_total) +
            " interrupted=" + (product_interrupted() ? "True" : "False") +
            " error=" + (error.empty() ? "None" : error) + " " +
            throughput(Clock::now()));
@@ -682,7 +652,7 @@ void Recover(const fs::path& directory, bool replay) {
           "incompatible metadata schema/code/random algorithm");
   Require(metadata.at("created at").is_string(), "invalid created at");
   const auto codeword = metadata.contains("codeword")
-                            ? metadata.at("codeword").as<std::string>()
+                            ? metadata.at("codeword").get<std::string>()
                             : "random";
   Require(codeword == "zero" || codeword == "random",
           "incompatible codeword convention");
@@ -699,10 +669,11 @@ void Recover(const fs::path& directory, bool replay) {
     Require(flips.good() && ReadExact(flips, 40) == "RSFLIP01" + digest,
             "invalid flip file identity/version");
   }
-  Big index = 0;
+  uint64_t index = 0;
   std::optional<std::pair<uint64_t, uint64_t>> previous;
   bool incomplete = false;
   while (auto line = ReadLine(journal, incomplete)) {
+    const auto next_index = CheckedAdd(index, 1);
     try {
       Json r = Parse(*line);
       fields = {"schema revision", "run identity",      "increment id",
@@ -746,19 +717,18 @@ void Recover(const fs::path& directory, bool replay) {
         stats.full_raw = Natural(old.at(kMetrics[0]).at("sum"));
         stats.full_post = Natural(old.at(kMetrics[4]).at("sum"));
       } else {
-        stats =
-            Stats::FromJson(r.at("statistics"), Big(count), k, settings.passes);
+        stats = Stats::FromJson(r.at("statistics"), count, k, settings.passes);
       }
       if (recorded) {
         ReadFlips(flips, r, settings, replay, codeword == "random", schema);
       }
       aggregate.Add(k, stats, r.at("statistics"));
       previous = {batch, end};
+      index = next_index;
     } catch (const std::exception& e) {
-      throw std::runtime_error("journal line " + (index + 1).to_string() +
+      throw std::runtime_error("journal line " + std::to_string(next_index) +
                                ": " + e.what());
     }
-    ++index;
   }
   if (recorded && flips.peek() != std::char_traits<char>::eof()) {
     std::cerr << "unreferenced flip tail ignored (not committed trials)\n";
@@ -805,8 +775,13 @@ int Main(int argc, char** argv) {
              "--report-seconds 2 --fsync-seconds 5 (1..86400)\n"
              "One uniform k per batch; exactly k flips per all-zero block. No "
              "resume.\n"
-             "Counters are exact arbitrary-precision JSON integers; iterations "
-             "are directional passes.\n"
+             "Counters are exact uint64 JSON integers "
+             "(0..18446744073709551615); "
+             "overflow is an error.\n"
+             "Total bits must also fit uint64; iterations are directional "
+             "passes.\n"
+             "Legacy schema 1 sums and squared sums exceeding uint64 are "
+             "rejected.\n"
              "SIGINT/SIGTERM stop starts, drain whole in-flight blocks, "
              "checkpoint and fsync.\n"
              "Crash loss: bounded worker window/staged increment plus journal "
@@ -849,9 +824,7 @@ int Main(int argc, char** argv) {
                 std::all_of(value.begin(), value.end(),
                             [](char c) { return c >= '0' && c <= '9'; }),
             "expected unsigned decimal integer for " + flag);
-    auto n = Big::from_string(value);
-    Require(n <= Big(UINT64_MAX), "integer exceeds uint64");
-    auto v = static_cast<uint64_t>(n);
+    auto v = Decimal(value);
     if (flag == "--seed") {
       s.seed = v;
       seeded = true;
