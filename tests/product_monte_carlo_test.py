@@ -10,6 +10,7 @@ import re
 import select
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,9 @@ class NativeTest(unittest.TestCase):
         path = self.root / name
         self.invoke("--output", path, "--seed", 42, "--batches", 2,
                     "--batch-size", 17, *args, **kwargs)
+        if not kwargs.get("reference"):
+            self.assertFalse((path / "journal.jsonl").exists())
+            self.assertEqual(self.read(path, "metadata.json")["storage"], "atomic summary v1")
         return path
 
     def read(self, path, name="summary.json"):
@@ -66,6 +70,17 @@ class NativeTest(unittest.TestCase):
 
     def records(self, path):
         return [json.loads(s) for s in (path / "journal.jsonl").read_text().splitlines()]
+
+    def saved_indices(self, path):
+        data = (path / "flips.bin").read_bytes()
+        end = self.read(path)["checkpoint"]["flip end"]
+        result, offset = [], 40
+        while offset < end:
+            batch, trial, k, count = struct.unpack_from("<QQII", data, offset)
+            result.append(trial)
+            offset += 240 + count*4
+        self.assertEqual(offset, end)
+        return result
 
     def count(self, path):
         return self.read(path)["overall"]["statistics"]["completed blocks"]
@@ -105,6 +120,56 @@ class NativeTest(unittest.TestCase):
                 a = self.run_case(anchors+binary, *args)
                 b = self.run_case("old"+anchors+binary, *args, reference=True)
                 self.assertEqual(self.read(a)["overall"]["statistics"], projected(self.read(b)["overall"]))
+
+    def test_shortened_dimensions_threads_report_replay_and_totals(self):
+        common = ("--n1", 256, "--k1", 224, "--n2", 175, "--k2", 173,
+                  "--minimum-flipped-bits", 1800, "--maximum-flipped-bits", 1810,
+                  "--batches", 1, "--batch-size", 6)
+        results = []
+        for threads in (1, 3):
+            path = self.run_case(f"short-{threads}", *common, "--threads", threads)
+            result = self.read(path)
+            self.assertEqual(result["code parameters"], {"n1": 256, "k1": 224, "n2": 175, "k2": 173})
+            results.append(result["overall"])
+            stats = result["overall"]["statistics"]
+            self.assertEqual(stats["full-codeword bits"]["total bits"], 6*8*256*175)
+            self.assertEqual(stats["information bits"]["total bits"], 6*8*224*173)
+            metadata = self.read(path, "metadata.json")
+            self.assertEqual([metadata["settings"][key] for key in ("n1", "k1", "n2", "k2")],
+                             [256, 224, 175, 173])
+            before = (path / "metadata.json").read_bytes()
+            self.invoke("--report", path)
+            self.assertEqual(result, self.read(path))
+            self.assertEqual(before, (path / "metadata.json").read_bytes())
+        self.assertEqual(results[0], results[1])
+        for dims in ((256, 224, 175, 173), (4, 2, 5, 3)):
+            n = 8*dims[0]*dims[2]
+            for k in (0, 1, n//2, n-1, n):
+                path = self.run_case(f"fy-{n}-{k}", "--sampler", "fisher-yates", "--threads", 3,
+                    "--batches", 1, "--batch-size", 3,
+                    *[arg for key, value in zip(("--n1", "--k1", "--n2", "--k2"), dims) for arg in (key, value)],
+                    "--minimum-flipped-bits", k, "--maximum-flipped-bits", k)
+                before = self.read(path)
+                self.invoke("--replay", path)
+                self.assertEqual(before, self.read(path))
+                self.assertEqual((path / "flips.bin").stat().st_size, 40+3*(240+4*min(k,n-k)))
+                self.assertEqual(before["overall"]["statistics"]["full-codeword bits"]["raw corrupted bits"], 3*k)
+
+    def test_dimension_and_dynamic_range_validation(self):
+        for args in (("--n1", 255), ("--k1", 223), ("--n2", 175),
+                     ("--n2", 257, "--k2", 255), ("--n2", 3, "--k2", 1),
+                     ("--n2", 175, "--k2", 173, "--maximum-flipped-bits", 358401),
+                     ("--n1", 4, "--k1", 2, "--n2", 5, "--k2", 3)):
+            self.invoke("--output", self.root / "invalid", *args, success=False)
+            self.assertFalse((self.root / "invalid").exists())
+        path = self.run_case("bad-range", "--n2", 175, "--k2", 173,
+                             "--batches", 1, "--batch-size", 1)
+        metadata = self.read(path, "metadata.json")
+        metadata["settings"]["maximum flipped bits"] = 358401
+        (path / "metadata.json").write_text(canonical(metadata))
+        before = (path / "summary.json").read_bytes()
+        self.invoke("--report", path, success=False)
+        self.assertEqual(before, (path / "summary.json").read_bytes())
 
     def test_legacy_report_and_saved_replay_hash_defaults(self):
         for sampler in ("floyd", "fisher-yates"):
@@ -147,6 +212,30 @@ class NativeTest(unittest.TestCase):
         (path / "flips.bin").write_bytes(data+b"uncommitted tail")
         self.invoke("--replay", path)
 
+    def test_legacy_schema2_journal_regeneration_and_replay(self):
+        for sampler in ("floyd", "fisher-yates"):
+            path = self.run_case(f"legacy2-{sampler}", "--sampler", sampler,
+                                 "--batches", 1, "--batch-size", 2, reference=True)
+            metadata = self.read(path, "metadata.json")
+            metadata["schema revision"] = 2
+            digest = hashlib.sha256(canonical(metadata).encode("ascii")).hexdigest()
+            (path / "metadata.json").write_text(canonical(metadata))
+            records = self.records(path)
+            for record in records:
+                record["statistics"] = projected(record)
+                record["schema revision"] = 2
+                record["run identity"] = digest
+            (path / "journal.jsonl").write_text("".join(canonical(r)+"\n" for r in records))
+            if sampler == "fisher-yates":
+                data = (path / "flips.bin").read_bytes()
+                (path / "flips.bin").write_bytes(data[:8]+bytes.fromhex(digest)+data[40:])
+            expected = projected(self.read(path)["overall"])
+            (path / "summary.json").unlink()
+            before = (path / "metadata.json").read_bytes()
+            self.invoke("--replay" if sampler == "fisher-yates" else "--report", path)
+            self.assertEqual(self.read(path)["overall"]["statistics"], expected)
+            self.assertEqual((path / "metadata.json").read_bytes(), before)
+
     def test_uint64_seed_and_canonical_unicode_identity(self):
         for reference in (False, True):
             path = self.run_case(str(reference), "--seed", 2**64-1,
@@ -162,10 +251,15 @@ class NativeTest(unittest.TestCase):
             digest = hashlib.sha256(canonical(metadata).encode("ascii")).hexdigest()
             # Exercise raw UTF-8 parsing as well as canonical ASCII serialization.
             (path / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
-            records = self.records(path)
-            for record in records:
-                record["run identity"] = digest
-            (path / "journal.jsonl").write_text("".join(canonical(r)+"\n" for r in records))
+            if reference:
+                records = self.records(path)
+                for record in records:
+                    record["run identity"] = digest
+                (path / "journal.jsonl").write_text("".join(canonical(r)+"\n" for r in records))
+            else:
+                summary = self.read(path)
+                summary["run identity"] = digest
+                (path / "summary.json").write_text(canonical(summary))
             data = (path / "flips.bin").read_bytes()
             (path / "flips.bin").write_bytes(data[:8]+bytes.fromhex(digest)+data[40:])
             self.invoke("--replay", path)
@@ -176,17 +270,19 @@ class NativeTest(unittest.TestCase):
             path = self.run_case(str(reference), "--batches", 1, "--batch-size", 1,
                                  reference=reference)
             before = (path / "summary.json").read_bytes()
-            original = self.records(path)[0]
+            original = self.records(path)[0] if reference else self.read(path)
             for value in (2**64, 10**100, 10**400, 1.0, -1):
                 record = copy.deepcopy(original)
                 if reference:
                     record["statistics"]["accepted bit changes"]["squared sum"] = value
                 else:
-                    record["statistics"]["total iterations"] = value
-                (path / "journal.jsonl").write_text(canonical(record)+"\n")
+                    record["overall"]["statistics"]["total iterations"] = value
+                target = path / ("journal.jsonl" if reference else "summary.json")
+                target.write_text(canonical(record)+"\n")
+                corrupt = target.read_bytes()
                 p = self.invoke("--report", path, success=False)
                 self.assertRegex(p.stderr, "uint64|unsigned integer")
-                self.assertEqual(before, (path / "summary.json").read_bytes())
+                self.assertEqual(before if reference else corrupt, (path / "summary.json").read_bytes())
 
     def test_counter_overflow_preserves_committed_prefix(self):
         for sampler in ("floyd", "fisher-yates"):
@@ -196,18 +292,80 @@ class NativeTest(unittest.TestCase):
                 "--minimum-flipped-bits", 0, "--maximum-flipped-bits", 0,
                 fault=True, env=dict(os.environ, MC_TEST_COUNTER_OVERFLOW="1"), success=False)
             self.assertIn("uint64 counter addition overflow", p.stderr)
-            self.assertEqual(len(self.records(path)), 1)
+            self.assertFalse((path / "journal.jsonl").exists())
             self.assertEqual(self.count(path), 0)  # Last durable summary is unchanged.
             self.invoke("--replay" if sampler == "fisher-yates" else "--report", path)
-            self.assertEqual(self.count(path), 1)
+            self.assertEqual(self.count(path), 0)  # Uncommitted work is not recovered.
+
+    def test_atomic_snapshot_failure_preserves_authoritative_summary(self):
+        for sampler in ("floyd", "fisher-yates"):
+            path = self.root / sampler
+            p = self.invoke("--output", path, "--seed", 42, "--batches", 1,
+                "--batch-size", 3, "--sampler", sampler, "--n2", 175, "--k2", 173,
+                "--minimum-flipped-bits", 1, "--maximum-flipped-bits", 1,
+                fault=True, env=dict(os.environ, MC_TEST_SNAPSHOT_FAIL="1"), success=False)
+            self.assertIn("before atomic summary rename", p.stderr)
+            self.assertFalse((path / "journal.jsonl").exists())
+            self.assertEqual(self.count(path), 0)
+            self.assertEqual(self.read(path, "summary.json.tmp")["overall"]["statistics"]["completed blocks"], 3)
+            before = (path / "summary.json").read_bytes()
+            self.invoke("--replay" if sampler == "fisher-yates" else "--report", path)
+            self.assertEqual((path / "summary.json").read_bytes(), before)
+
+    def test_snapshot_report_rejects_corruption_without_rewriting(self):
+        for sampler in ("floyd", "fisher-yates"):
+            path = self.run_case(sampler, "--batches", 1, "--batch-size", 2,
+                                 "--sampler", sampler, "--n2", 175, "--k2", 173)
+            original = self.read(path)
+            mutations = [lambda s: s.update({"run identity": "wrong"}),
+                lambda s: s["overall"]["statistics"].update({"completed blocks": 0}),
+                lambda s: s["by flipped bit count"].append(copy.deepcopy(s["by flipped bit count"][0])),
+                lambda s: s["code parameters"].update(k2=172)]
+            if sampler == "fisher-yates":
+                mutations.extend([lambda s: s["checkpoint"].update({"flip end": 40}),
+                                  lambda s: s["checkpoint"].update({"flip end": 41}),
+                                  lambda s: s["checkpoint"].update({"flip end": 2**64-1})])
+            for mutation in mutations:
+                broken = copy.deepcopy(original)
+                mutation(broken)
+                (path / "summary.json").write_text(canonical(broken))
+                before = (path / "summary.json").read_bytes()
+                self.invoke("--report", path, success=False)
+                self.assertEqual((path / "summary.json").read_bytes(), before)
+            (path / "summary.json").unlink()
+            self.invoke("--report", path, success=False)
+            self.assertFalse((path / "summary.json").exists())
+
+    def test_periodic_snapshot_survives_abrupt_stop(self):
+        path = self.root / "crash"
+        p = subprocess.Popen([str(CLI), "--output", str(path), "--seed", "42",
+            "--threads", "1", "--batch-size", "1000000", "--n2", "175", "--k2", "173",
+            "--minimum-flipped-bits", "1800", "--maximum-flipped-bits", "1800",
+            "--sampler", "fisher-yates", "--fsync-seconds", "1"], stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic()+15
+            while not (path / "summary.json").exists() or self.count(path) == 0:
+                self.assertIsNone(p.poll())
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.02)
+            p.kill()
+            p.wait(timeout=10)
+        finally:
+            if p.poll() is None:
+                p.kill(); p.wait()
+        self.assertFalse((path / "journal.jsonl").exists())
+        before = (path / "summary.json").read_bytes()
+        self.assertGreater(self.count(path), 0)
+        self.invoke("--replay", path)
+        self.assertEqual((path / "summary.json").read_bytes(), before)
 
     def test_recovery_strictness_and_partial_tail(self):
-        path = self.run_case("source", "--checkpoint-trials", 1)
+        path = self.run_case("source", "--checkpoint-trials", 1, reference=True)
         before = (path / "summary.json").read_bytes()
         lines = (path / "journal.jsonl").read_text().splitlines(keepends=True)
         bad_identity = json.loads(lines[1]); bad_identity["run identity"] = "wrong"
         overlap = json.loads(lines[1]); overlap["first trial index"] = 0
-        bad_stats = json.loads(lines[1]); bad_stats["statistics"]["full-codeword bits"]["raw corrupted bits"] = 0
+        bad_stats = json.loads(lines[1]); bad_stats["statistics"]["initial full block corrupted bits"]["sum"] = 0
         for replacement in (lines[0], "garbage\n", "{}\n", canonical(bad_identity)+"\n",
                 canonical(overlap)+"\n", canonical(bad_stats)+"\n",
                 '{"schema revision":2,"schema revision":2}\n'):
@@ -238,9 +396,9 @@ class NativeTest(unittest.TestCase):
         seed = self.read(path, "metadata.json")["settings"]["root seed"]
         self.assertTrue(0 <= seed < 2**64)
         self.assertIn(f"root seed={seed}", (path / "progress.log").read_text())
-        before = (path / "journal.jsonl").read_bytes()
+        before = (path / "summary.json").read_bytes()
         self.invoke("--output", path, success=False)
-        self.assertEqual(before, (path / "journal.jsonl").read_bytes())
+        self.assertEqual(before, (path / "summary.json").read_bytes())
         self.invoke("--report", path, "--threads", 1, success=False)
         with (path / "run.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -255,15 +413,18 @@ class NativeTest(unittest.TestCase):
                 "--minimum-flipped-bits", 0, "--maximum-flipped-bits", 0,
                 "--sampler", sampler, fault=True, env=env, success=False)
             self.assertIn("index=5 failed: injected worker failure", p.stderr)
-            indices = [i for r in self.records(path) for i in range(r["first trial index"],r["past last trial index"])]
-            self.assertEqual(indices, sorted(set(indices)))
-            self.assertEqual(indices[:5], list(range(5)))
-            self.assertNotIn(5, indices)
-            self.assertTrue(any(i > 5 for i in indices))
-            self.assertEqual(self.count(path), len(indices))
+            self.assertFalse((path / "journal.jsonl").exists())
+            self.assertGreater(self.count(path), 5)
+            if sampler == "fisher-yates":
+                indices = self.saved_indices(path)
+                self.assertEqual(indices, sorted(set(indices)))
+                self.assertEqual(indices[:5], list(range(5)))
+                self.assertNotIn(5, indices)
+                self.assertTrue(any(i > 5 for i in indices))
+                self.assertEqual(self.count(path), len(indices))
             self.invoke("--replay" if sampler == "fisher-yates" else "--report", path)
 
-    def test_native_flip_sync_before_journal_publication(self):
+    def test_native_flip_sync_before_snapshot_publication(self):
         path = self.run_case("sync-order", "--sampler", "fisher-yates", "--threads", 4,
             "--checkpoint-trials", 3, fault=True, env=dict(os.environ, MC_TEST_SYNC_ORDER="1"))
         self.assertEqual(self.count(path), 34)
@@ -271,6 +432,7 @@ class NativeTest(unittest.TestCase):
 
     def test_signal_drains_bounded_window_and_plain_progress(self):
         for sig in (signal.SIGINT, signal.SIGTERM):
+            dimensions = ["--n2", "175", "--k2", "173"] if sig == signal.SIGTERM else []
             path = self.root / str(sig)
             err = self.root / f"stderr-{sig}"
             # Slow first block holds the ordered window; other workers must not
@@ -280,7 +442,7 @@ class NativeTest(unittest.TestCase):
                 p = subprocess.Popen([str(FAULT), "--output", str(path), "--seed", "42",
                     "--threads", "4", "--batch-size", "1000000", "--checkpoint-trials", "12",
                     "--minimum-flipped-bits", "0", "--maximum-flipped-bits", "0",
-                    "--sampler", "fisher-yates", "--report-seconds", "1"], stderr=stream, env=env)
+                    "--sampler", "fisher-yates", "--report-seconds", "1", *dimensions], stderr=stream, env=env)
                 try:
                     deadline = time.monotonic()+20
                     while not (path / "progress.log").exists() or "batch=0" not in (path / "progress.log").read_text():
@@ -292,7 +454,8 @@ class NativeTest(unittest.TestCase):
                 finally:
                     if p.poll() is None: p.kill(); p.wait()
             self.assertEqual(self.count(path), 12)
-            indices = [i for r in self.records(path) for i in range(r["first trial index"],r["past last trial index"])]
+            self.assertFalse((path / "journal.jsonl").exists())
+            indices = self.saved_indices(path)
             self.assertEqual(indices, list(range(12)))
             self.invoke("--replay", path)
             log = (path / "progress.log").read_text()
@@ -304,7 +467,7 @@ class NativeTest(unittest.TestCase):
             self.assertIsNotNone(match)
             rate, mib, elapsed = map(float, match.groups())
             self.assertAlmostEqual(rate, 12/elapsed, delta=.02)
-            self.assertAlmostEqual(mib, rate*56896/1048576, delta=.001)
+            self.assertAlmostEqual(mib, rate*224*(173 if dimensions else 254)/1048576, delta=.001)
 
     def test_tty_throttle_and_plain_log(self):
         path = self.root / "tty"

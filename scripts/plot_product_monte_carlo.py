@@ -15,7 +15,38 @@ METRICS = {"information": "residual information bits", "full": "residual full bl
 CODE = "RS256,224 x RS256,254 Cantor systematic row major"
 RANDOM = "splitmix64 domain seeds; mt19937_64; rejection modulo; Floyd complement v1"
 RANDOM_FY = "splitmix64 domain seeds; mt19937_64; rejection modulo; persistent Fisher-Yates complement v1; replay saved flips"
+SNAPSHOTS = "atomic summary v1"
 NEG_INF = -math.inf
+DEFAULT_DIMENSIONS = (256, 224, 256, 254)
+
+
+def dimensions(settings):
+    require(type(settings) is dict, "incompatible settings")
+    names = ("n1", "k1", "n2", "k2")
+    require(not any(name in settings for name in names) or all(name in settings for name in names),
+            "incomplete dimensions")
+    dims = tuple(settings.get(name, default) for name, default in zip(names, DEFAULT_DIMENSIONS))
+    require(all(natural(value, 256) for value in dims), "invalid dimensions")
+    n1, k1, n2, k2 = dims
+    power2 = lambda n: n > 0 and n & (n - 1) == 0
+    require(power2(n1) and 2 <= n1 - k1 <= k1 and power2(n1 - k1)
+            and 2 <= k2 < n2 <= 256 and n2 - k2 == 2, "unsupported dimensions")
+    return dims
+
+
+def denominators(dims):
+    n1, k1, n2, k2 = dims
+    return {"information": 8 * k1 * k2, "full": 8 * n1 * n2}
+
+
+def configuration(settings):
+    flags = (settings["maximum directional passes"], settings["anchors"], settings["binary image"])
+    dims = dimensions(settings)
+    return flags if dims == DEFAULT_DIMENSIONS else flags + dims
+
+
+def config_dimensions(config):
+    return config[3:] if len(config) == 7 else DEFAULT_DIMENSIONS
 
 
 def require(condition, message):
@@ -51,6 +82,8 @@ def identity(metadata):
 
 def minimal_rows(summary, settings):
     """Validate additive schema-2 counters and project the two BER numerators."""
+    ds = denominators(dimensions(settings))
+    n = ds["full"]
     rows = summary["by flipped bit count"]
     require(type(rows) is list, "invalid per-k rows")
     pooled, totals = {}, None
@@ -71,7 +104,7 @@ def minimal_rows(summary, settings):
             bits = stats[name]
             require(type(bits) is dict and set(bits) == {"total bits", "raw corrupted bits",
                 "post decoding corrupted bits"}, "invalid bit fields")
-            total = trials * DENOMINATORS[metric]
+            total = trials * ds[metric]
             require(bits["total bits"] == total and natural(bits["total bits"]), "invalid total bits")
             for field in ("raw corrupted bits", "post decoding corrupted bits"):
                 require(natural(bits[field], total), "invalid corrupted bits")
@@ -79,14 +112,14 @@ def minimal_rows(summary, settings):
             residuals[metric] = bits["post decoding corrupted bits"]
         for field in ("raw corrupted bits", "post decoding corrupted bits"):
             difference = stats["full-codeword bits"][field] - stats["information bits"][field]
-            require(0 <= difference <= trials * (N - DENOMINATORS["information"]),
+            require(0 <= difference <= trials * (n - ds["information"]),
                     "inconsistent full/information bits")
         if overall:
             require(flat == totals if rows else all(v == 0 for v in flat.values()),
                     "overall/per-k reconciliation failed")
             continue
         k = row["flipped bit count"]
-        require(natural(k, N) and settings["minimum flipped bits"] <= k <= settings[
+        require(natural(k, n) and settings["minimum flipped bits"] <= k <= settings[
             "maximum flipped bits"], "invalid flipped bit count")
         require(k not in pooled, f"duplicate k: {k}")
         require(stats["full-codeword bits"]["raw corrupted bits"] == trials*k,
@@ -107,41 +140,63 @@ def load_report(path):
     try:
         metadata = read_json(path.parent / "metadata.json")
         summary = read_json(path)
-        require(type(metadata) is dict and set(metadata) - {"codeword"} == {
+        require(type(metadata) is dict and set(metadata) - {"codeword", "storage"} == {
             "schema revision", "created at", "settings", "code", "random algorithm"},
             "incompatible metadata fields")
+        snapshot = "storage" in metadata
+        require(not snapshot or (metadata["storage"] == SNAPSHOTS and metadata["schema revision"] == 2),
+                "incompatible snapshot storage/schema")
         codeword = metadata.get("codeword", "random")
         require(codeword in ("zero", "random"), "incompatible codeword convention")
         require(type(metadata["schema revision"]) is int and metadata["schema revision"] in (1, 2)
-                and metadata["code"] == CODE and metadata["random algorithm"] in (RANDOM, RANDOM_FY),
+                and metadata["random algorithm"] in (RANDOM, RANDOM_FY),
                 "incompatible schema/code/random algorithm")
         require(isinstance(metadata["created at"], str), "invalid created at")
         settings = metadata["settings"]
+        dims = dimensions(settings)
+        n1, k1, n2, k2 = dims
+        ds = denominators(dims)
+        n = ds["full"]
+        require(metadata["code"] == f"RS{n1},{k1} x RS{n2},{k2} Cantor systematic row major",
+                "incompatible schema/code/random algorithm: code/dimensions/coordinates mismatch")
         integer_settings = {"root seed", "batch size", "batches", "threads",
                             "minimum flipped bits", "maximum flipped bits",
                             "maximum directional passes", "checkpoint trials",
-                            "report seconds", "fsync seconds"}
+                             "report seconds", "fsync seconds"}
+        if "n1" in settings:
+            integer_settings |= {"n1", "k1", "n2", "k2"}
         require(type(settings) is dict and set(settings) == integer_settings | {
             "anchors", "binary image"}, "incompatible settings")
         for name in integer_settings:
             require(natural(settings[name], (1 << 64) - 1), f"invalid {name}")
         for name in ("anchors", "binary image"):
             require(type(settings[name]) is bool, f"invalid {name}")
-        require(0 <= settings["minimum flipped bits"] <= settings["maximum flipped bits"] <= N,
+        require(0 <= settings["minimum flipped bits"] <= settings["maximum flipped bits"] <= n,
                 "invalid sampled k range")
         for name, low, high in (("batch size", 1, (1 << 64) - 1), ("threads", 1, 1024),
                                 ("maximum directional passes", 2, 1000000),
                                 ("checkpoint trials", 1, 4096), ("report seconds", 1, 86400),
                                 ("fsync seconds", 1, 86400)):
             require(low <= settings[name] <= high, f"invalid {name}")
-        require(type(summary) is dict and set(summary) == {
+        require(type(summary) is dict and set(summary) - {"code parameters", "checkpoint"} == {
             "schema revision", "run identity", "overall", "by flipped bit count"},
             "incompatible summary fields")
+        recorded_snapshot = snapshot and metadata["random algorithm"] == RANDOM_FY
+        require(("checkpoint" in summary) == recorded_snapshot, "invalid snapshot checkpoint")
+        if recorded_snapshot:
+            checkpoint = summary["checkpoint"]
+            require(type(checkpoint) is dict and set(checkpoint) == {"flip end"}
+                    and natural(checkpoint["flip end"], (1 << 64) - 1)
+                    and checkpoint["flip end"] >= 40, "invalid committed flip boundary")
+        if "code parameters" in summary:
+            parameters = summary["code parameters"]
+            require(type(parameters) is dict and set(parameters) == {"n1", "k1", "n2", "k2"}
+                    and dimensions(parameters) == dims, "summary code parameters mismatch")
         require(type(summary["schema revision"]) is int and summary["schema revision"] == metadata["schema revision"]
                 and summary["run identity"] == identity(metadata), "identity/schema mismatch")
         if summary["schema revision"] == 2:
             pooled = minimal_rows(summary, settings)
-            config = (settings["maximum directional passes"], settings["anchors"], settings["binary image"])
+            config = configuration(settings)
             return summary["run identity"], settings["root seed"], config, pooled, codeword
         rows = summary["by flipped bit count"]
         require(type(rows) is list, "invalid per-k rows")
@@ -165,7 +220,7 @@ def load_report(path):
                         and total * total <= trials * square, f"invalid moments: {name}")
                 require(trials > 0 or total == square == 0, "nonzero empty statistics")
                 if name in METRICS.values():
-                    d = DENOMINATORS[next(m for m in METRICS if METRICS[m] == name)]
+                    d = ds[next(m for m in METRICS if METRICS[m] == name)]
                     require(total <= trials * d and square <= d * total,
                             f"residual moments exceed bit count: {name}")
             require(stats[METRICS["information"]]["sum"] <= stats[METRICS["full"]]["sum"],
@@ -176,7 +231,7 @@ def load_report(path):
                     "overall/per-k reconciliation failed")
                 continue
             k = row["flipped bit count"]
-            require(natural(k, N) and settings["minimum flipped bits"] <= k <= settings[
+            require(natural(k, n) and settings["minimum flipped bits"] <= k <= settings[
                 "maximum flipped bits"], "invalid flipped bit count")
             require(k not in pooled, f"duplicate k: {k}")
             if "initial full block corrupted bits" in stats:
@@ -190,7 +245,7 @@ def load_report(path):
                     totals[name][field] += stats[name][field]
             count += trials
             pooled[k] = {"trials": trials, **{m: stats[name]["sum"] for m, name in METRICS.items()}}
-        config = (settings["maximum directional passes"], settings["anchors"], settings["binary image"])
+        config = configuration(settings)
         return summary["run identity"], settings["root seed"], config, pooled, codeword
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"{path}: {error}") from error
@@ -323,8 +378,10 @@ def evaluate(rows, p, n=N, denominators=None):
 
 
 def config_label(config):
-    passes, anchors, binary = config
-    return f"passes={passes}, anchors={'on' if anchors else 'off'}, binary-image={'on' if binary else 'off'}"
+    passes, anchors, binary = config[:3]
+    n1, k1, n2, k2 = config_dimensions(config)
+    return (f"RS{n1},{k1} x RS{n2},{k2}; passes={passes}, "
+            f"anchors={'on' if anchors else 'off'}, binary-image={'on' if binary else 'off'}")
 
 
 def plot_value(value):
@@ -332,15 +389,16 @@ def plot_value(value):
     return result if result > 0 else math.nan
 
 
-def conditional_values(rows, metric):
+def conditional_values(rows, metric, n=N, ds=None):
     """Yield provenance and normalized conditional BER in ascending k."""
+    ds = DENOMINATORS if ds is None else ds
     for k, row in sorted(rows.items()):
         total, trials = row[metric], row["trials"]
         mean = total / trials
         log_mean = math.log(total) - math.log(trials) if total else NEG_INF
-        log_ber = log_mean - math.log(DENOMINATORS[metric])
+        log_ber = log_mean - math.log(ds[metric])
         yield {"k": k, "residual_bits_sum": total, "completed_blocks": trials,
-               "mean": mean, "log10_mean": log_mean / math.log(10), "raw_ber": k / N,
+               "mean": mean, "log10_mean": log_mean / math.log(10), "raw_ber": k / n,
                "conditional_ber": math.exp(log_ber),
                "log10_conditional_ber": log_ber / math.log(10)}
 
@@ -349,9 +407,10 @@ def export_conditional(groups, metrics, path):
     """Export pooled conditional BER points, independent of plotted mode/limits."""
     records = []
     for config, rows in groups.items():
+        ds = denominators(config_dimensions(config))
         for metric in metrics:
             points = []
-            for value in conditional_values(rows, metric):
+            for value in conditional_values(rows, metric, ds["full"], ds):
                 log_ber = value["log10_conditional_ber"]
                 points.append({"raw_ber": value["raw_ber"],
                                "residual_ber": value["conditional_ber"],
@@ -378,16 +437,18 @@ def plot_results(groups, metrics, mode, ps, output, csv_path, plt, thin=0.5):
             "raw_ber", "conditional_ber", "log10_conditional_ber"])
         writer.writeheader()
         for index, (config, rows) in enumerate(groups.items()):
+            ds = denominators(config_dimensions(config))
+            n = ds["full"]
             label = config_label(config)
             color = colors[index % len(colors)]
             sampled.update(rows)
-            weighted = [evaluate(rows, p) for p in ps] if mode != "conditional" else []
+            weighted = [evaluate(rows, p, n, ds) for p in ps] if mode != "conditional" else []
             for metric in metrics:
                 zeros = sum(row[metric] == 0 for row in rows.values())
                 base = {"configuration": label, "metric": metric,
                         "sampled_strata": len(rows), "zero_observed_strata": zeros}
                 if mode != "ber":
-                    values = list(conditional_values(rows, metric))
+                    values = list(conditional_values(rows, metric, n, ds))
                     for value in values:
                         writer.writerow({**base, "record_type": "conditional", **value})
                     ys = [plot_value(v["log10_conditional_ber"] * math.log(10)) for v in values]
@@ -406,7 +467,7 @@ def plot_results(groups, metrics, mode, ps, output, csv_path, plt, thin=0.5):
                                  color=color, marker="o" if metric == "information" else "x",
                                  label=f"Fixed-weight conditional BER; {metric}: {label}\n{note}")
                 if mode != "conditional":
-                    print(f"{label}; {metric}: {len(rows)}/{N + 1} sampled strata, "
+                    print(f"{label}; {metric}: {len(rows)}/{n + 1} sampled strata, "
                           f"{zeros} zero-observed strata; log10 missing mass range "
                           f"[{min(v[2] for v in weighted) / math.log(10):.6g}, "
                           f"{max(v[2] for v in weighted) / math.log(10):.6g}]", file=sys.stderr)
@@ -419,7 +480,7 @@ def plot_results(groups, metrics, mode, ps, output, csv_path, plt, thin=0.5):
                               color=color, linestyle="-" if metric == "information" else "--",
                               label=f"Sampled-stratum BSC contribution; {metric}: {label}")
     axis.set(xscale="linear", yscale="log", xlim=(0.008, 0.0045), ylim=(1e-30, 1e-1),
-             xlabel="Raw BER (k / 524288 for conditional; p for BSC)",
+             xlabel="Raw BER (k / transmitted bits for conditional; p for BSC)",
              ylabel="Residual BER", title="Product-code BER")
     if mode == "conditional" and not positive:
         message = ("All observed residual sums are zero; no positive BERs to plot."
@@ -446,8 +507,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog="BER mode uses Binomial(N,p) weights, without renormalization. Conditional mode uses "
-        "raw BER k/524288 and residual BER sum(residual bits)/(sum(completed blocks)*D), "
-        "D=455168 for information or 524288 for full. Both mode overlays conditional scatter and "
+        "raw BER k/N and residual BER sum(residual bits)/(sum(completed blocks)*D), "
+        "N=8*n1*n2; D=8*k1*k2 for information or N for full, per code. Both mode overlays conditional scatter and "
         "sampled-stratum BSC contribution lines; conditional BER is not a full BSC expectation. "
         "All modes use descending linear x 0.008 to 0.0045 and log y 1e-30 to 1e-1; "
         "out-of-range points are clipped, not discarded from CSV. "
@@ -457,9 +518,10 @@ def main(argv=None):
         "Missing k are unknown; "
         "zero observed errors are not certainty. Arbitrarily low plotted values are not reliability "
         "evidence. No extrapolation or MSE fit: a fitting model has not been specified. "
-        "Matching decoder configurations pool per-k sums/counts; different flags/caps stay separate. "
+        "Matching decoder configurations pool per-k sums/counts; different dimensions/flags/caps stay separate. "
         "Repeated seeds within a configuration and overlapping inputs are rejected. "
-        f"Only the fixed code {CODE} is supported; other dimensions/coordinates are rejected. "
+        "Cantor systematic row-major codes only: strong N,R powers of two, N<=256, 2<=R<=K; "
+        "weak N<=256, K>=2, R=2, including shortening. Absent dimensions mean 256,224,256,254. "
         "Zero/random conventions must match unless --allow-mixed-codewords is explicit. "
         "Metadata has no source revision. "
         "Discovery stops at run directories, ignores unrelated files, and does not follow subdirectory "
@@ -504,7 +566,7 @@ def main(argv=None):
     print("Warning: metadata lacks source revision; decoder implementation compatibility cannot be verified. "
           "Missing strata are unknown; zero observed errors do not establish zero BER. "
           "No extrapolation or MSE fit is performed. "
-          f"Validated {len(reports)} report(s); only the fixed code {CODE} is supported.", file=sys.stderr)
+          f"Validated {len(reports)} report(s); dimensions and Cantor coordinates checked.", file=sys.stderr)
     metrics = list(METRICS) if args.metric == "both" else [args.metric]
     try:
         import matplotlib

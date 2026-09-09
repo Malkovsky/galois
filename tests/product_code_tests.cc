@@ -130,6 +130,17 @@ TEST(ProductCode, DimensionsAndInvalidCalls) {
     EXPECT_EQ(block, before);
   }
   EXPECT_FALSE(StrongWeakRSProductCode(8, 4, 8, 4).Valid());
+  for (auto [n, k] : {std::pair{3u, 1u},
+                      {257u, 255u},
+                      {175u, 174u},
+                      {175u, 175u},
+                      {175u, 176u}}) {
+    EXPECT_FALSE(StrongWeakRSProductCode(256, 224, n, k).Valid());
+  }
+  for (auto [n, k] :
+       {std::pair{4u, 2u}, {5u, 3u}, {175u, 173u}, {255u, 253u}}) {
+    EXPECT_TRUE(StrongWeakRSProductCode(256, 224, n, k).Valid());
+  }
   EXPECT_FALSE(
       StrongWeakRSProductCode(std::numeric_limits<size_t>::max(), 1).Valid());
   StrongWeakRSProductCode code(4, 2, 8, 6);
@@ -151,6 +162,8 @@ TEST(ProductCode, DimensionsAndInvalidCalls) {
 TEST(ProductCode, SystematicEncodingScalarAgreementAndAllComponentValidity) {
   for (const auto [ns, ks, nw, kw] : {std::array<size_t, 4>{4, 2, 8, 6},
                                       {16, 12, 16, 14},
+                                      {4, 2, 5, 3},
+                                      {256, 224, 175, 173},
                                       {256, 224, 256, 254}}) {
     StrongWeakRSProductCode code(ns, ks, nw, kw);
     std::mt19937 random(901);
@@ -394,7 +407,7 @@ TEST(WholeCodewordBatch, DifferentialDataParityFailuresAndTails) {
                             {256u, 224u},
                             {256u, 254u}}) {
     LCHDecoder decoder(k, n - k);
-    for (size_t lanes : {1u, 31u, 32u, 33u, 65u, 256u}) {
+    for (size_t lanes : {1u, 31u, 32u, 33u, 65u, 175u, 256u}) {
       std::vector<Element> packed(n * lanes);
       auto expected = packed;
       std::vector<CorrectionResult> results(lanes), reference(lanes);
@@ -524,10 +537,11 @@ TEST(ProductCode, InitialBatchChoicesMatchSingleOutputsAndAllCounters) {
   std::mt19937 random(0x5b5c0224);
   for (const auto dims : {std::array<size_t, 4>{4, 2, 8, 6},
                           {32, 16, 64, 62},
+                          {256, 224, 175, 173},
                           {256, 224, 256, 254}}) {
     const auto [ns, ks, nw, kw] = dims;
     StrongWeakRSProductCode code(ns, ks, nw, kw);
-    for (size_t trial = 0; trial < 16; ++trial) {
+    for (size_t trial = 0; trial < (nw == 175 ? 4u : 16u); ++trial) {
       std::vector<Element> input(code.BlockSize());
       for (auto& value : input) {
         value = static_cast<Element>(random());
@@ -599,8 +613,11 @@ TEST(ProductCode, InitialBatchChoicesMatchSingleOutputsAndAllCounters) {
 TEST(ProductCode,
      TrackedValidityMatchesIndependentParityAcrossCapsAndCancellations) {
   std::mt19937 random(0xc1ea0224);
-  for (const auto dims :
-       {std::array<size_t, 4>{4, 2, 8, 6}, {8, 4, 4, 2}, {32, 28, 32, 30}}) {
+  for (const auto dims : {std::array<size_t, 4>{4, 2, 8, 6},
+                          {8, 4, 4, 2},
+                          {32, 28, 32, 30},
+                          {4, 2, 5, 3},
+                          {32, 28, 31, 29}}) {
     const auto [ns, ks, nw, kw] = dims;
     StrongWeakRSProductCode code(ns, ks, nw, kw);
     for (size_t trial = 0; trial < 128; ++trial) {
@@ -817,6 +834,96 @@ TEST(ProductCode, CountsRepeatedCommittedWritesByIndependentPassDifferences) {
     }
   }
   EXPECT_TRUE(repeated);
+}
+
+TEST(ProductCode, ShortenedMotherParityAndVirtualRepairRejection) {
+  LCHEncoder encoder(254, 2);
+  LCHDecoder decoder(254, 2);
+  std::array<Element, 256> mother{};
+  std::array<const Element*, 254> data{};
+  std::array<Element*, 2> parity{&mother[254], &mother[255]};
+  for (size_t i = 0; i < data.size(); ++i) {
+    data[i] = &mother[i];
+  }
+  std::vector<Element> workspace(encoder.WorkspaceSize(1));
+  StrongWeakRSProductCode code(32, 28, 175, 173);
+  // Every one of the 81 omitted positions can be a plausible mother repair.
+  // The actual rows contain only its two parity symbols. Constant strong
+  // columns are already valid, leaving these weak candidates untouched.
+  for (size_t missing = 173; missing < 254; ++missing) {
+    mother.fill(0);
+    mother[missing] = 1;
+    ASSERT_EQ(encoder.Encode(data, parity, 1, workspace, Backend::scalar),
+              Status::ok);
+    auto received = mother;
+    received[missing] = 0;
+    const auto witness = CorrectCodeword(decoder, received);
+    ASSERT_EQ(witness.status, CorrectionStatus::ok);
+    ASSERT_EQ(witness.error_count, 1u);
+    ASSERT_EQ(received, mother);
+    std::vector<Element> input(code.BlockSize());
+    for (size_t row = 0; row < 32; ++row) {
+      input[row * 175 + 173] = mother[254];
+      input[row * 175 + 174] = mother[255];
+    }
+    for (bool anchors : {false, true}) {
+      for (bool binary : {false, true}) {
+        for (unsigned batches : {0u, 1u, 2u}) {
+          auto actual = input;
+          const auto result = detail::ProductCorrectionAccess::Correct(
+              code, actual, {16, anchors, binary}, batches);
+          EXPECT_EQ(actual, input) << missing;
+          EXPECT_EQ(result.changed_symbols, 0u);
+          EXPECT_EQ(result.changed_bits, 0u);
+          EXPECT_EQ(result.weak_changed_symbols, 0u);
+          EXPECT_EQ(result.strong_lines_visited, 175u);
+          EXPECT_EQ(result.weak_lines_visited, 32u);
+          EXPECT_EQ(result.directional_passes, 2u);
+          EXPECT_EQ(result.termination, ProductTermination::no_change);
+          EXPECT_FALSE(result.all_zero_syndromes);
+        }
+      }
+    }
+  }
+  StrongWeakRSProductCode target(256, 224, 175, 173);
+  std::vector<Element> block(target.BlockSize());
+  std::mt19937 random(173);
+  for (auto& value : block) {
+    value = static_cast<Element>(random());
+  }
+  ASSERT_EQ(target.Encode(block), Status::ok);
+  ASSERT_TRUE(AllComponentsValid(block, 256, 224, 175, 173));
+  for (size_t row = 0; row < 256; ++row) {
+    mother.fill(0);
+    std::copy_n(block.begin() + row * 175, 173, mother.begin());
+    ASSERT_EQ(encoder.Encode(data, parity, 1, workspace, Backend::scalar),
+              Status::ok);
+    EXPECT_EQ(mother[254], block[row * 175 + 173]);
+    EXPECT_EQ(mother[255], block[row * 175 + 174]);
+  }
+}
+
+TEST(ProductCode, ShortenedWeakActualParityRepairsAndSelectiveActivation) {
+  for (size_t ns : {4u, 32u, 256u}) {
+    StrongWeakRSProductCode code(ns, ns - 2, 175, 173);
+    for (size_t col : {0u, 172u, 173u, 174u}) {
+      for (unsigned batches : {0u, 1u, 2u}) {
+        std::vector<Element> block(code.BlockSize());
+        block[col] = block[175 + col] = 1;
+        const auto result = detail::ProductCorrectionAccess::Correct(
+            code, block, {16, true, true}, batches);
+        EXPECT_EQ(block, std::vector<Element>(code.BlockSize()));
+        EXPECT_EQ(result.changed_symbols, 2u);
+        EXPECT_EQ(result.weak_changed_symbols, 2u);
+        EXPECT_EQ(result.strong_changed_symbols, 0u);
+        EXPECT_EQ(result.changed_bits, 2u);
+        EXPECT_EQ(result.strong_lines_visited, 176u);
+        EXPECT_EQ(result.weak_lines_visited, ns);
+        EXPECT_EQ(result.directional_passes, 3u);
+        EXPECT_TRUE(result.all_zero_syndromes);
+      }
+    }
+  }
 }
 
 TEST(ProductCode, OptionsDefaultsAndInvalidCapsArePerCall) {

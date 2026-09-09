@@ -19,6 +19,36 @@ SPEC.loader.exec_module(plot)
 
 
 class NumericalTest(unittest.TestCase):
+    def test_dimension_specific_conditional_export_and_weighted_plot(self):
+        dims = (4, 2, 5, 3)
+        ds = plot.denominators(dims)
+        n = ds["full"]
+        config = (16, True, True) + dims
+        rows = {k: {"trials": 2, "information": min(k, ds["information"])*2,
+                    "full": 2*k} for k in range(n+1)}
+        p = 0.17
+        expected = sum(math.comb(n, k)*p**k*(1-p)**(n-k)*min(k, ds["information"])
+                       / ds["information"] for k in rows)
+        values, covered, missing = plot.evaluate(rows, p, n, ds)
+        self.assertAlmostEqual(math.exp(values["full"]), p, places=13)
+        self.assertAlmostEqual(math.exp(values["information"]), expected, places=13)
+        self.assertEqual((covered, missing), (0, -math.inf))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "export.json"
+            plot.export_conditional({config: rows}, ["information", "full"], path)
+            exports = json.loads(path.read_text())
+            self.assertIn("RS4,2 x RS5,3", exports[0]["configuration"])
+            self.assertEqual(exports[0]["points"][1]["raw_ber"], 1/n)
+            self.assertAlmostEqual(exports[0]["points"][1]["residual_ber"], 1/ds["information"])
+            plt = mock.MagicMock()
+            plt.subplots.return_value = (mock.MagicMock(), mock.MagicMock())
+            plt.rcParams.__getitem__.return_value.by_key.return_value = {"color": ["blue"]}
+            with mock.patch.object(plot, "evaluate", wraps=plot.evaluate) as evaluate, \
+                    mock.patch("sys.stderr", io.StringIO()):
+                plot.plot_results({config: rows}, ["full"], "both", [p],
+                                  Path(directory)/"out.svg", Path(directory)/"out.csv", plt)
+            evaluate.assert_called_once_with(rows, p, n, ds)
+
     def test_pure_conditional_export(self):
         groups = {(16, True, True): {
             1: {"trials": 10, "information": 0, "full": 0},
@@ -337,6 +367,60 @@ class ReportTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 plot.load_report(path)
 
+    def test_shortened_and_default_dimensions_never_pool(self):
+        default, _, _ = self.fixture("default")
+        short, metadata, summary = self.fixture("short")
+        metadata["settings"].update(n1=256, k1=224, n2=175, k2=173)
+        metadata["settings"]["maximum flipped bits"] = 8*256*175
+        metadata["code"] = "RS256,224 x RS175,173 Cantor systematic row major"
+        summary["run identity"] = plot.identity(metadata)
+        self.save(short, metadata, summary)
+        groups = plot.pool_reports([default, short])
+        self.assertEqual(len(groups), 2)
+        self.assertEqual({plot.config_dimensions(config) for config in groups},
+                         {(256, 224, 256, 254), (256, 224, 175, 173)})
+        before = (short / "metadata.json").read_bytes()
+        self.assertEqual(plot.load_report(short)[0], summary["run identity"])
+        self.assertEqual(before, (short / "metadata.json").read_bytes())
+        metadata["schema revision"] = summary["schema revision"] = 2
+        stats = {"completed blocks": 1, "total iterations": 2,
+                 "information bits": {"total bits": 8*224*173, "raw corrupted bits": 2000,
+                                      "post decoding corrupted bits": 1},
+                 "full-codeword bits": {"total bits": 8*256*175, "raw corrupted bits": 2600,
+                                        "post decoding corrupted bits": 1}}
+        summary["overall"] = {"statistics": copy.deepcopy(stats)}
+        summary["by flipped bit count"] = [{"flipped bit count": 2600, "statistics": stats}]
+        summary["run identity"] = plot.identity(metadata)
+        self.save(short, metadata, summary)
+        self.assertEqual(plot.pool_reports([default, short]), groups)
+        summary["code parameters"] = {"n1": 256, "k1": 224, "n2": 175, "k2": 173}
+        self.save(short, metadata, summary)
+        self.assertEqual(plot.pool_reports([default, short]), groups)
+        summary["code parameters"]["k2"] = 172
+        self.save(short, metadata, summary)
+        with self.assertRaises(ValueError):
+            plot.load_report(short)
+        summary["code parameters"]["k2"] = 173
+        for mutation in (lambda m: m["settings"].pop("k2"),
+                         lambda m: m["settings"].update(n2=174),
+                         lambda m: m["settings"].update({"maximum flipped bits": 358401}),
+                         lambda m: m.update(code=plot.CODE)):
+            broken = copy.deepcopy(metadata)
+            mutation(broken)
+            self.save(short, broken, summary)
+            with self.assertRaises(ValueError):
+                plot.load_report(short)
+
+    def test_explicit_default_dimensions_preserve_legacy_group_and_hash(self):
+        path, metadata, summary = self.fixture()
+        implicit = plot.load_report(path)
+        metadata["settings"].update(zip(("n1", "k1", "n2", "k2"), plot.DEFAULT_DIMENSIONS))
+        summary["run identity"] = plot.identity(metadata)
+        self.save(path, metadata, summary)
+        explicit = plot.load_report(path)
+        self.assertEqual(implicit[1:], explicit[1:])
+        self.assertEqual(explicit[0], plot.identity(metadata))
+
     def test_fisher_yates_metadata_preserves_summary_format(self):
         path, metadata, summary = self.fixture()
         expected = plot.load_report(path)[1:]
@@ -344,6 +428,28 @@ class ReportTest(unittest.TestCase):
         summary["run identity"] = plot.identity(metadata)
         self.save(path, metadata, summary)
         self.assertEqual(plot.load_report(path)[1:], expected)
+
+    def test_snapshot_storage_and_checkpoint_validation(self):
+        path, metadata, summary = self.fixture()
+        metadata["schema revision"] = summary["schema revision"] = 2
+        metadata["storage"] = plot.SNAPSHOTS
+        stats = {"completed blocks": 0, "total iterations": 0,
+                 "information bits": {"total bits": 0, "raw corrupted bits": 0, "post decoding corrupted bits": 0},
+                 "full-codeword bits": {"total bits": 0, "raw corrupted bits": 0, "post decoding corrupted bits": 0}}
+        summary["overall"] = {"statistics": stats}
+        summary["by flipped bit count"] = []
+        for sampler in (plot.RANDOM, plot.RANDOM_FY):
+            metadata["random algorithm"] = sampler
+            summary["run identity"] = plot.identity(metadata)
+            if sampler == plot.RANDOM_FY:
+                summary["checkpoint"] = {"flip end": 40}
+            self.save(path, metadata, summary)
+            self.assertEqual(plot.load_report(path)[3], {})
+        for checkpoint in ({"flip end": 39}, {"flip end": True}, {"flip end": 2**64}, {}):
+            summary["checkpoint"] = checkpoint
+            self.save(path, metadata, summary)
+            with self.assertRaises(ValueError):
+                plot.load_report(path)
 
     def test_codeword_conventions_and_explicit_pooling(self):
         legacy, _, _ = self.fixture("legacy")
@@ -585,7 +691,7 @@ class ReportTest(unittest.TestCase):
         self.assertIn("No extrapolation", result.stdout)
         self.assertIn("recursively", result.stdout)
         self.assertIn("merged.svg", result.stdout)
-        self.assertIn("Partial or malformed runs", result.stdout)
+        self.assertIn("Partial or malformed runs", " ".join(result.stdout.split()))
         if importlib.util.find_spec("matplotlib") is None:
             self.skipTest("matplotlib not installed")
         path, _, _ = self.fixture(residual=0)

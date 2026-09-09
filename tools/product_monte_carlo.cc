@@ -51,17 +51,10 @@ class File {
   ~File() { ::close(fd_); }
   File(const File&) = delete;
   File& operator=(const File&) = delete;
-  void Write(std::string_view bytes) {
 #ifdef GF256_MC_TEST_HOOKS
-    if (path_.filename() == "journal.jsonl" &&
-        std::getenv("MC_TEST_SYNC_ORDER")) {
-      const auto record = Parse(std::string(bytes));
-      if (record.contains("flip end")) {
-        Require(U64(record.at("flip end")) <= synced_flip_end_,
-                "journal referenced unsynced flip data");
-      }
-    }
+  static uint64_t SyncedFlipEnd() { return synced_flip_end_; }
 #endif
+  void Write(std::string_view bytes) {
     while (!bytes.empty()) {
       auto n = ::write(fd_, bytes.data(), bytes.size());
       if (n < 0 && errno == EINTR) {
@@ -112,6 +105,13 @@ void SyncDirectory(const fs::path& path) {
   dir.Sync();
 }
 void AtomicJson(const fs::path& path, const Json& value) {
+#ifdef GF256_MC_TEST_HOOKS
+  if (path.filename() == "summary.json" && value.contains("checkpoint") &&
+      std::getenv("MC_TEST_SYNC_ORDER")) {
+    Require(U64(value.at("checkpoint").at("flip end")) <= File::SyncedFlipEnd(),
+            "summary referenced unsynced flip data");
+  }
+#endif
   auto temp = path;
   temp += ".tmp";
   {
@@ -119,6 +119,14 @@ void AtomicJson(const fs::path& path, const Json& value) {
     out.Write(Dump(value, true) + "\n");
     out.Sync();
   }
+#ifdef GF256_MC_TEST_HOOKS
+  if (path.filename() == "summary.json" &&
+      std::getenv("MC_TEST_SNAPSHOT_FAIL") &&
+      Natural(value.at("overall").at("statistics").at("completed blocks")) !=
+          0) {
+    throw std::runtime_error("injected failure before atomic summary rename");
+  }
+#endif
   fs::rename(temp, path);
   SyncDirectory(path.parent_path());
 }
@@ -278,7 +286,7 @@ class Workers {
       try {
         if (recorded_) {
           slot.positions.resize(
-              std::max<uint64_t>(1, std::min(k_, 524288 - k_)));
+              std::max<uint64_t>(1, std::min(k_, s_.FullBits() - k_)));
         }
 #ifdef GF256_MC_TEST_HOOKS
         // Dedicated, noninstalled test executable only.
@@ -295,10 +303,11 @@ class Workers {
           }
         }
 #endif
-        int status = product_trial_reference(
+        int status = product_trial_dimensions(
             s_.seed, batch_, index, k_, s_.passes, s_.anchors, s_.binary,
             slot.metrics.data(), recorded_ ? 1 : 0,
-            recorded_ ? slot.positions.data() : nullptr, 0, nullptr);
+            recorded_ ? slot.positions.data() : nullptr, 0, nullptr, s_.n1,
+            s_.k1, s_.n2, s_.k2);
         Require(status == 0, "native status=" + std::to_string(status));
       } catch (...) {
         slot.error = std::current_exception();
@@ -325,14 +334,18 @@ class Workers {
   bool active_ = false, halted_ = false, shutdown_ = false;
 };
 
-void WriteFlips(File& file, uint64_t batch, uint64_t k, const Result& result) {
-  const auto count = std::min(k, 524288 - k);
+void WriteFlips(File& file,
+                uint64_t batch,
+                uint64_t k,
+                const Result& result,
+                uint64_t bits) {
+  const auto count = std::min(k, bits - k);
   std::string bytes(208 + 4 * count, '\0');
   PutLE(bytes, 0, batch, 8);
   PutLE(bytes, 8, result.index, 8);
   PutLE(bytes, 16, k, 4);
   PutLE(bytes, 20, count, 4);
-  bytes[24] = k > 262144;
+  bytes[24] = k > bits / 2;
   for (size_t i = 0; i < 22; ++i) {
     PutLE(bytes, 32 + 8 * i, result.metrics[i], 8);
   }
@@ -351,13 +364,12 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
   metadata["created at"] = Timestamp();
   metadata["settings"] = s.ToJson();
   metadata["codeword"] = "zero";
-  metadata["code"] = kCode;
+  metadata["code"] = s.Code();
   metadata["random algorithm"] = recorded ? kFisherYates : kFloyd;
+  metadata["storage"] = kSnapshots;
   AtomicJson(directory / "metadata.json", metadata);
   const auto digest = Hash(Dump(metadata));
-  Aggregate aggregate(Hex(digest), 2);
-  AtomicJson(directory / "summary.json", aggregate.Summary());
-  File journal(directory / "journal.jsonl", O_WRONLY | O_CREAT | O_EXCL);
+  Aggregate aggregate(Hex(digest), 2, s);
   File log(directory / "progress.log", O_WRONLY | O_CREAT | O_EXCL);
   std::optional<File> flips;
   if (recorded) {
@@ -365,6 +377,15 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
     flips->Write("RSFLIP01" + digest);
     flips->Sync();
   }
+  auto snapshot = [&] {
+    auto summary = aggregate.Summary();
+    if (flips) {
+      flips->Sync();
+      summary["checkpoint"]["flip end"] = flips->Offset();
+    }
+    AtomicJson(directory / "summary.json", summary);
+  };
+  snapshot();
   const bool tty = ::isatty(STDERR_FILENO);
   bool bar_visible = false;
   auto progress = [&](const std::string& text, bool console = true) {
@@ -380,7 +401,6 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
   };
   progress("root seed=" + std::to_string(s.seed) +
            " settings persisted before trials");
-  journal.Sync();
   log.Sync();
   SyncDirectory(directory);
   SyncDirectory(directory.parent_path());
@@ -388,10 +408,9 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
   const auto start = Clock::now();
   auto last_sync = start, last_report = start, last_bar = start,
        last_checkpoint = start;
-  uint64_t completed_total = 0, increment = 0;
+  uint64_t completed_total = 0, increment = 0, persisted_total = 0;
   uint64_t batch_completed = 0, batch = 0, k = 0;
   Stats staged;
-  uint64_t first = 0, end = 0, flip_start = 0;
   std::string error;
   auto throughput = [&](Clock::time_point now) {
     const double elapsed = std::chrono::duration<double>(now - start).count();
@@ -399,7 +418,7 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
         elapsed > 0 ? static_cast<double>(completed_total) / elapsed : 0;
     std::ostringstream out;
     out << std::fixed << std::setprecision(3) << "wall blocks/s=" << rate
-        << " information MiB/s=" << rate * 56896 / 1048576
+        << " information MiB/s=" << rate * (s.InfoBits() / 8) / 1048576
         << " elapsed seconds=" << elapsed;
     return out.str();
   };
@@ -411,32 +430,16 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
   };
   auto checkpoint = [&] {
     if (staged.blocks != 0) {
-      // Preflight every aggregate and derived total before publishing a record.
+      // Stage bounded increments in memory; only atomic summaries are durable.
 #ifdef GF256_MC_TEST_HOOKS
       if (increment == 1 && std::getenv("MC_TEST_COUNTER_OVERFLOW")) {
         auto exhausted = aggregate.overall;
         exhausted.iterations = UINT64_MAX;
-        exhausted.Add(staged);
+        exhausted.Add(staged, s.FullBits());
       }
 #endif
       auto next = aggregate.PrepareAdd(k, staged);
       const auto next_increment = CheckedAdd(increment, 1);
-      Json r;
-      r["schema revision"] = 2;
-      r["run identity"] = aggregate.identity;
-      r["increment id"] = Number(increment);
-      r["batch id"] = batch;
-      r["first trial index"] = first;
-      r["past last trial index"] = end;
-      r["trial count"] = end - first;
-      r["flipped bit count"] = k;
-      r["statistics"] = staged.ToJson();
-      if (flips) {
-        flips->Sync();
-        r["flip start"] = flip_start;
-        r["flip end"] = flips->Offset();
-      }
-      journal.Write(Dump(r) + "\n");
       aggregate.Commit(std::move(next));
       increment = next_increment;
       staged = Stats{};
@@ -445,9 +448,9 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
   };
   auto durable = [&] {
     checkpoint();
-    journal.Sync();
     log.Sync();
-    AtomicJson(directory / "summary.json", aggregate.Summary());
+    snapshot();
+    persisted_total = aggregate.overall.blocks;
     last_sync = Clock::now();
   };
   auto bar = [&](Clock::time_point now, bool force = false) {
@@ -497,22 +500,11 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
               }
             }
           } else {
-            if (staged.blocks != 0 && end != result.index) {
-              checkpoint();
-            }
-            if (staged.blocks == 0) {
-              first = result.index;
-              if (flips) {
-                flip_start = flips->Offset();
-              }
-            }
             auto next_staged = staged;
-            next_staged.Add(result.metrics);
-            const auto next_end = CheckedAdd(result.index, 1);
+            next_staged.Add(result.metrics, s.FullBits());
             if (flips) {
-              WriteFlips(*flips, batch, k, result);
+              WriteFlips(*flips, batch, k, result, s.FullBits());
             }
-            end = next_end;
             staged = next_staged;
             if (staged.blocks == s.checkpoint) {
               checkpoint();
@@ -528,8 +520,7 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
         }
         if (now - last_report >= std::chrono::seconds(s.report)) {
           progress(counts() + " persisted overall trials=" +
-                       std::to_string(aggregate.overall.blocks) + " " +
-                       throughput(now),
+                       std::to_string(persisted_total) + " " + throughput(now),
                    !tty);
           last_report = now;
         }
@@ -547,11 +538,9 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
     }
   } catch (const std::exception& e) {
     // Worker failures are drained above. Coordinator I/O/allocation failures
-    // stop and join workers. Never retry a possibly partially written record
-    // or replace the last good summary with a partially updated aggregate.
-    // Report mode can recover the complete journal prefix after storage repair.
+    // stop and join workers. Leave the last atomic summary authoritative;
+    // uncommitted flip tails and temporary snapshots are ignored by report.
     try {
-      journal.Sync();
       log.Sync();
     } catch (...) {
     }
@@ -581,16 +570,16 @@ void ReadFlips(std::istream& stream,
            k = U64(r.at("flipped bit count"));
   Stats stats;
   Json old = LegacyStats();
-  const size_t count = std::min(k, 524288 - k);
+  const size_t count = std::min(k, s.FullBits() - k);
   std::vector<uint32_t> positions(std::max<size_t>(1, count));
-  std::vector<bool> selected(524288);
+  std::vector<bool> selected(s.FullBits());
   for (uint64_t trial = first; trial < end; ++trial) {
     auto body = ReadExact(stream, 208);
     Require(GetLE(body, 0, 8) == batch && GetLE(body, 8, 8) == trial &&
                 GetLE(body, 16, 4) == k,
             "flip trial identity mismatch");
     Require(GetLE(body, 20, 4) == count &&
-                GetLE(body, 24, 1) == uint64_t(k > 262144),
+                GetLE(body, 24, 1) == uint64_t(k > s.FullBits() / 2),
             "invalid flip count/complement");
     body += ReadExact(stream, count * 4);
     Require(ReadExact(stream, 32) == Hash(body), "corrupt flip checksum");
@@ -608,14 +597,14 @@ void ReadFlips(std::istream& stream,
     }
     if (replay) {
       std::array<uint64_t, 22> actual{};
-      int status = product_trial_reference(
+      int status = product_trial_dimensions(
           s.seed, batch, trial, k, s.passes, s.anchors, s.binary, actual.data(),
-          2, positions.data(), random, nullptr);
+          2, positions.data(), random, nullptr, s.n1, s.k1, s.n2, s.k2);
       Require(status == 0 && actual == metrics,
               "replay mismatch batch=" + std::to_string(batch) + " trial=" +
                   std::to_string(trial) + " status=" + std::to_string(status));
     }
-    stats.Add(metrics);
+    stats.Add(metrics, s.FullBits());
     if (schema == 1) {
       AddLegacyTrial(old, metrics);
     }
@@ -624,8 +613,128 @@ void ReadFlips(std::istream& stream,
   Require(end_offset >= 0 &&
               static_cast<uint64_t>(end_offset) == U64(r.at("flip end")),
           "flip end offset mismatch");
-  Require((schema == 1 ? old : stats.ToJson()) == r.at("statistics"),
+  Require((schema == 1 ? old : stats.ToJson(s)) == r.at("statistics"),
           "flip metrics disagree with journal");
+}
+
+void ValidateSnapshot(const fs::path& directory,
+                      const Settings& settings,
+                      const std::string& digest,
+                      bool recorded,
+                      bool replay,
+                      bool random) {
+  std::ifstream input(directory / "summary.json", std::ios::binary);
+  Require(input.good(), "cannot read authoritative summary snapshot");
+  std::string text;
+  char c;
+  while (input.get(c)) {
+    Require(text.size() < 512 * 1024 * 1024, "summary exceeds size limit");
+    text += c;
+  }
+  Require(input.eof() && !input.bad(), "summary read failed");
+  auto summary = Parse(text);
+  std::set<std::string> fields{"schema revision", "run identity", "overall",
+                               "by flipped bit count"};
+  if (!settings.DefaultDimensions()) {
+    fields.insert("code parameters");
+  }
+  if (recorded) {
+    fields.insert("checkpoint");
+  }
+  Fields(summary, fields);
+  uint64_t flip_end = 0;
+  if (recorded) {
+    Fields(summary.at("checkpoint"), {"flip end"});
+    flip_end = U64(summary.at("checkpoint").at("flip end"));
+    Require(flip_end >= 40, "invalid committed flip boundary");
+    summary.erase("checkpoint");
+  }
+  Aggregate aggregate(Hex(digest), 2, settings);
+  const auto& overall = summary.at("overall").at("statistics");
+  Natural(overall.at("completed blocks"));
+  Natural(overall.at("total iterations"));
+  for (const auto* region : {"information bits", "full-codeword bits"}) {
+    for (const auto* field :
+         {"total bits", "raw corrupted bits", "post decoding corrupted bits"}) {
+      Natural(overall.at(region).at(field));
+    }
+  }
+  const auto& rows = summary.at("by flipped bit count");
+  Require(rows.is_array(), "invalid summary strata");
+  for (const auto& row : rows) {
+    Fields(row, {"flipped bit count", "statistics"});
+    const auto k = U64(row.at("flipped bit count"));
+    Require(k >= settings.lo && k <= settings.hi && !aggregate.by_k.contains(k),
+            "invalid or duplicate summary stratum");
+    const auto count = U64(row.at("statistics").at("completed blocks"));
+    Require(count > 0, "empty summary stratum");
+    aggregate.Add(k, Stats::FromJson(row.at("statistics"), count, k,
+                                     settings.passes, settings));
+  }
+  Require(summary == aggregate.Summary(),
+          "summary identity/parameters/totals reconciliation failed");
+  Require(settings.batches == 0 ||
+              __uint128_t(aggregate.overall.blocks) <=
+                  __uint128_t(settings.batches) * settings.size,
+          "summary exceeds configured trials");
+  if (recorded) {
+    std::ifstream flips(directory / "flips.bin", std::ios::binary);
+    Require(flips.good() && ReadExact(flips, 40) == "RSFLIP01" + digest,
+            "invalid flip file identity/version");
+    Aggregate verified(Hex(digest), 2, settings);
+    uint64_t offset = 40;
+    std::optional<std::pair<uint64_t, uint64_t>> previous;
+    while (offset < flip_end) {
+      Require(flip_end - offset >= 240, "invalid committed flip boundary");
+      const auto start = flips.tellg();
+      const auto header = ReadExact(flips, 208);
+      const auto batch = GetLE(header, 0, 8), trial = GetLE(header, 8, 8),
+                 k = GetLE(header, 16, 4);
+      const auto position = std::pair{batch, trial};
+      Require((settings.batches == 0 || batch < settings.batches) &&
+                  trial < settings.size && (!previous || position > *previous),
+              "invalid or overlapping saved trial identity");
+      Require(
+          k == product_batch_k(settings.seed, batch, settings.lo, settings.hi),
+          "saved batch k disagrees with seed/settings");
+      const auto next =
+          CheckedAdd(offset, 240 + 4 * std::min(k, settings.FullBits() - k));
+      Require(next <= flip_end, "flip record crosses committed boundary");
+      std::array<uint64_t, 22> metrics{};
+      for (size_t i = 0; i < metrics.size(); ++i) {
+        metrics[i] = GetLE(header, 32 + 8 * i, 8);
+      }
+      Stats stats;
+      stats.Add(metrics, settings.FullBits());
+      const auto json = stats.ToJson(settings);
+      Stats::FromJson(json, 1, k, settings.passes, settings);
+      // Reuse the legacy record verifier without persisting a journal record.
+      Json record{{"batch id", batch},
+                  {"first trial index", trial},
+                  {"past last trial index", trial + 1},
+                  {"flipped bit count", k},
+                  {"flip start", offset},
+                  {"flip end", next},
+                  {"statistics", json}};
+      flips.seekg(start);
+      ReadFlips(flips, record, settings, replay, random, 2);
+      verified.Add(k, stats);
+      previous = position;
+      offset = next;
+    }
+    Require(verified.Summary() == summary,
+            "saved flips disagree with summary snapshot");
+    if (flips.peek() != std::char_traits<char>::eof()) {
+      std::cerr << "unreferenced flip tail ignored (not committed trials)\n";
+    }
+  }
+  std::cerr << Timestamp()
+            << " validated snapshot: " << aggregate.overall.blocks
+            << " trials; summary unchanged\n";
+  if (replay) {
+    std::cerr << "verified replay: " << aggregate.overall.blocks
+              << " trials, all 22 metrics match\n";
+  }
 }
 
 void Recover(const fs::path& directory, bool replay) {
@@ -644,9 +753,16 @@ void Recover(const fs::path& directory, bool replay) {
   if (metadata.contains("codeword")) {
     fields.insert("codeword");
   }
+  const bool snapshot = metadata.contains("storage");
+  if (snapshot) {
+    fields.insert("storage");
+    Require(metadata.at("storage") == kSnapshots &&
+                U64(metadata.at("schema revision")) == 2,
+            "incompatible snapshot storage/schema");
+  }
   Fields(metadata, fields);
   auto schema = U64(metadata.at("schema revision"));
-  Require((schema == 1 || schema == 2) && metadata.at("code") == Json(kCode) &&
+  Require((schema == 1 || schema == 2) &&
               (metadata.at("random algorithm") == Json(kFloyd) ||
                metadata.at("random algorithm") == Json(kFisherYates)),
           "incompatible metadata schema/code/random algorithm");
@@ -657,11 +773,18 @@ void Recover(const fs::path& directory, bool replay) {
   Require(codeword == "zero" || codeword == "random",
           "incompatible codeword convention");
   auto settings = Settings::FromJson(metadata.at("settings"));
+  Require(metadata.at("code") == settings.Code(),
+          "incompatible code/dimensions/coordinates");
   // Never insert defaults before hashing legacy metadata.
   const auto digest = Hash(Dump(metadata));
-  Aggregate aggregate(Hex(digest), static_cast<unsigned>(schema));
+  Aggregate aggregate(Hex(digest), static_cast<unsigned>(schema), settings);
   const bool recorded = metadata.at("random algorithm") == Json(kFisherYates);
   Require(!replay || recorded, "this run has no saved flips");
+  if (snapshot) {
+    ValidateSnapshot(directory, settings, digest, recorded, replay,
+                     codeword == "random");
+    return;
+  }
   std::ifstream journal(directory / "journal.jsonl", std::ios::binary), flips;
   Require(journal.good(), "cannot read journal");
   if (recorded) {
@@ -709,7 +832,7 @@ void Recover(const fs::path& directory, bool replay) {
       Stats stats;
       if (schema == 1) {
         const auto& old = r.at("statistics");
-        ValidateLegacy(old, count, k, settings.passes);
+        ValidateLegacy(old, count, k, settings.passes, settings);
         stats.blocks = count;
         stats.iterations = Natural(old.at(kMetrics[12]).at("sum"));
         stats.info_raw = Natural(old.at(kMetrics[2]).at("sum"));
@@ -717,7 +840,8 @@ void Recover(const fs::path& directory, bool replay) {
         stats.full_raw = Natural(old.at(kMetrics[0]).at("sum"));
         stats.full_post = Natural(old.at(kMetrics[4]).at("sum"));
       } else {
-        stats = Stats::FromJson(r.at("statistics"), count, k, settings.passes);
+        stats = Stats::FromJson(r.at("statistics"), count, k, settings.passes,
+                                settings);
       }
       if (recorded) {
         ReadFlips(flips, r, settings, replay, codeword == "random", schema);
@@ -765,8 +889,12 @@ int Main(int argc, char** argv) {
              "--seed UINT64 (default: generated, printed and persisted before "
              "work)\n"
              "--batch-size 1000 --batches 0 (infinite) --threads 1 (1..1024)\n"
+             "--n1 256 --k1 224 --n2 256 --k2 254 (Cantor [data][parity])\n"
+             "Strong n1,R1 powers of two, n1<=256, 2<=R1<=k1; weak R2=2,\n"
+             "n2<=256, k2>=2; only weak shortening is supported.\n"
              "--minimum-flipped-bits 2500 --maximum-flipped-bits 2700 "
-             "(inclusive, 0..524288)\n"
+             "(inclusive, 0..8*n1*n2; small codes need explicit smaller "
+             "bounds, no cap)\n"
              "--max-directional-passes 16 (2..1000000)\n"
              "--[no-]anchors --[no-]binary-image (both enabled)\n"
              "--sampler floyd|fisher-yates (default floyd; Fisher-Yates saves "
@@ -784,13 +912,21 @@ int Main(int argc, char** argv) {
              "rejected.\n"
              "SIGINT/SIGTERM stop starts, drain whole in-flight blocks, "
              "checkpoint and fsync.\n"
-             "Crash loss: bounded worker window/staged increment plus journal "
-             "writes since fsync.\n"
-             "Ordered journal flush at least once/second subject to in-flight "
-             "completion and I/O.\n"
-             "Saved flips are fsynced before journal references; replay checks "
+             "New runs create no journal: atomic summary snapshots are "
+             "authoritative.\n"
+             "Snapshots are fsynced every --fsync-seconds and on graceful "
+             "exit;\n"
+             "crash loss is work since the last snapshot, plus in-flight "
+             "blocks.\n"
+             "Report validates snapshot-only runs without rewriting the "
+             "summary;\n"
+             "legacy journal runs still support report regeneration.\n"
+             "Saved flips are fsynced before the summary's committed boundary; "
+             "replay checks "
              "all 22 private metrics.\n"
-             "Legacy absent codeword means random; report ignores only an "
+             "Uncommitted flip tails are ignored. Legacy absent codeword means "
+             "random;\n"
+             "legacy journal report ignores only an "
              "incomplete final line.\n";
       return 0;
     }
@@ -834,6 +970,14 @@ int Main(int argc, char** argv) {
       s.batches = v;
     } else if (flag == "--threads") {
       s.threads = v;
+    } else if (flag == "--n1") {
+      s.n1 = v;
+    } else if (flag == "--k1") {
+      s.k1 = v;
+    } else if (flag == "--n2") {
+      s.n2 = v;
+    } else if (flag == "--k2") {
+      s.k2 = v;
     } else if (flag == "--minimum-flipped-bits") {
       s.lo = v;
     } else if (flag == "--maximum-flipped-bits") {

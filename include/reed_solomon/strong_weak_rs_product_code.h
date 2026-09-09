@@ -47,9 +47,11 @@ struct ProductCorrectionResult {
  * @brief Systematic Cantor RS product with strong columns and weak rows.
  * @details Row-major block has Nstrong rows and Nweak columns. The top-left
  * Kstrong by Kweak rectangle holds data; every column and every row, including
- * parity regions, is a component codeword. Errors only: no erasures,
- * shortening, or backtracking. Both N must be powers of two <=256; strong R
- * must be a power of two with 2<=R<=K, and weak R must equal 2.
+ * parity regions, is a component codeword. Errors only: no erasures or
+ * backtracking. Strong N and R must be powers of two, N<=256 and 2<=R<=K.
+ * Weak R=2, K>=2, N<=256 may be shortened from nextPow2(N): omitted data
+ * [K,nextPow2(N)-2) are known zeros. Public rows remain compact [data][parity].
+ * Mother-code candidates changing any omitted zero are rejected in full.
  */
 class StrongWeakRSProductCode {
  public:

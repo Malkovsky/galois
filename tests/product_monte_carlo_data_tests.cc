@@ -2,6 +2,46 @@
 
 #include <gtest/gtest.h>
 
+TEST(ProductMonteCarloData, DimensionsMetadataAndDynamicOverflowBounds) {
+  mc::Settings settings;
+  const auto legacy = settings.ToJson();
+  EXPECT_FALSE(legacy.contains("n1"));
+  EXPECT_EQ(mc::Settings::FromJson(legacy).ToJson(), legacy);
+  settings.n2 = 175;
+  settings.k2 = 173;
+  settings.Validate();
+  EXPECT_EQ(settings.FullBits(), 358400u);
+  EXPECT_EQ(settings.InfoBits(), 310016u);
+  EXPECT_EQ(mc::Settings::FromJson(settings.ToJson()).ToJson(),
+            settings.ToJson());
+  auto partial = settings.ToJson();
+  partial.erase("k2");
+  EXPECT_THROW(mc::Settings::FromJson(partial), std::runtime_error);
+  const uint64_t count = UINT64_MAX / settings.FullBits();
+  mc::Stats stats{count, 2 * count, count, 0, count, 0};
+  const auto json = stats.ToJson(settings);
+  EXPECT_NO_THROW(mc::Stats::FromJson(json, count, 1, 16, settings));
+  EXPECT_THROW(mc::Stats::FromJson(json, count, 1, 16), std::runtime_error);
+  mc::Aggregate aggregate("shortened", 2, settings);
+  aggregate.Add(1, stats);
+  const auto before = aggregate.Summary();
+  EXPECT_EQ(before.at("code parameters"),
+            (mc::Json{{"n1", 256}, {"k1", 224}, {"n2", 175}, {"k2", 173}}));
+  EXPECT_THROW(aggregate.Add(1, mc::Stats{1}), std::runtime_error);
+  EXPECT_EQ(aggregate.Summary(), before);
+  EXPECT_THROW(stats.Add(mc::Stats{1}, settings.FullBits()),
+               std::runtime_error);
+  EXPECT_EQ(stats.ToJson(settings), json);
+  settings.n1 = 4;
+  settings.k1 = 2;
+  settings.n2 = 5;
+  settings.k2 = 3;
+  EXPECT_THROW(settings.Validate(), std::runtime_error);
+  settings.lo = 0;
+  settings.hi = settings.FullBits();
+  EXPECT_NO_THROW(settings.Validate());
+}
+
 TEST(ProductMonteCarloData, ExactBoundedIntegers) {
   const uint64_t n = UINT64_MAX / 524288;
   mc::Stats s;

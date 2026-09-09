@@ -25,12 +25,12 @@ StrongWeakRSProductCode::StrongWeakRSProductCode(size_t strong_n,
       strong_k_(strong_k),
       weak_n_(weak_n),
       weak_k_(weak_k),
-      valid_(Aligned(strong_n, strong_k) && Aligned(weak_n, weak_k) &&
-             weak_n - weak_k == 2),
+      valid_(Aligned(strong_n, strong_k) && weak_n <= 256 && weak_k >= 2 &&
+             weak_k < weak_n && weak_n - weak_k == 2),
       strong_encoder_(valid_ ? strong_k : 0, valid_ ? strong_n - strong_k : 0),
       weak_encoder_(valid_ ? weak_k : 0, valid_ ? weak_n - weak_k : 0),
       strong_decoder_(valid_ ? strong_k : 0, valid_ ? strong_n - strong_k : 0),
-      weak_decoder_(valid_ ? weak_k : 0, valid_ ? weak_n - weak_k : 0) {}
+      weak_decoder_(valid_ ? std::bit_ceil(weak_n) - 2 : 0, valid_ ? 2 : 0) {}
 
 bool StrongWeakRSProductCode::Valid() const {
   return valid_ && strong_encoder_.Valid() && weak_encoder_.Valid() &&
@@ -113,7 +113,12 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
   std::array<bool, 256> clean_columns{}, clean_rows{};
   std::array<bool, 256> active{};
   std::array<Element, 256> candidate{};
-  std::vector<Element> packed(batch_passes != 0 ? block.size() : 0);
+  const size_t mother_n = std::bit_ceil(weak_n_);
+  const size_t mother_k = mother_n - 2;
+  const auto weak_position = [&](size_t pos) {
+    return pos < weak_k_ ? pos : mother_k + pos - weak_k_;
+  };
+  std::vector<Element> packed(batch_passes != 0 ? strong_n_ * mother_n : 0);
   std::vector<uint8_t> masks(packed.size());
   std::array<CorrectionResult, 256> outcomes{};
   std::array<Element*, 256> shards{};
@@ -121,6 +126,7 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
     const bool strong = pass % 2 == 0;
     const size_t lines = strong ? weak_n_ : strong_n_;
     const size_t length = strong ? strong_n_ : weak_n_;
+    const size_t decoder_length = strong ? length : mother_n;
     std::array<bool, 256> next{};
     size_t changes = 0;
     size_t bit_changes = 0;
@@ -131,18 +137,23 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
       if (strong) {
         std::copy(block.begin(), block.end(), packed.begin());
       }
-      for (size_t pos = 0; pos < length; ++pos) {
+      for (size_t pos = 0; pos < decoder_length; ++pos) {
         shards[pos] = packed.data() + pos * lines;
         if (!strong) {
           for (size_t line = 0; line < lines; ++line) {
-            shards[pos][line] = block[line * weak_n_ + pos];
+            shards[pos][line] =
+                pos >= weak_k_ && pos < mother_k
+                    ? Element{0}
+                    : block[line * weak_n_ +
+                            (pos < weak_k_ ? pos : weak_k_ + pos - mother_k)];
           }
         }
       }
       const auto status = detail::error_correction::CorrectCodewordBatch(
           strong ? strong_decoder_ : weak_decoder_,
-          std::span(shards).first(length), lines,
-          std::span(outcomes).first(lines), masks);
+          std::span(shards).first(decoder_length), lines,
+          std::span(outcomes).first(lines),
+          std::span(masks).first(decoder_length * lines));
       if (status != CorrectionStatus::ok) {
         return result;
       }
@@ -182,30 +193,38 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
           return strong ? pos * weak_n_ + line : line * weak_n_ + pos;
         };
         if (!batched) {
+          candidate.fill(0);
           for (size_t pos = 0; pos < length; ++pos) {
-            candidate[pos] = block[index(pos)];
+            candidate[strong ? pos : weak_position(pos)] = block[index(pos)];
           }
         }
         const auto correction =
-            batched ? outcomes[line]
-                    : CorrectCodeword(strong ? strong_decoder_ : weak_decoder_,
-                                      std::span(candidate).first(length));
+            batched
+                ? outcomes[line]
+                : CorrectCodeword(strong ? strong_decoder_ : weak_decoder_,
+                                  std::span(candidate).first(decoder_length));
+        if (batched) {
+          for (size_t pos = 0; pos < decoder_length; ++pos) {
+            candidate[pos] = shards[pos][line];
+          }
+        }
+        // A mother-code repair is not a shortened-code candidate if it
+        // changes any known-zero data. Reject before validity or gate updates.
+        const bool shortened_valid =
+            strong || std::all_of(candidate.begin() + weak_k_,
+                                  candidate.begin() + mother_k,
+                                  [](Element value) { return value == 0; });
         auto& clean = strong ? clean_columns[line] : clean_rows[line];
-        clean = correction.status == CorrectionStatus::ok &&
+        clean = shortened_valid && correction.status == CorrectionStatus::ok &&
                 correction.error_count == 0;
         if (strong) {
           protected_columns[line] = correction.status == CorrectionStatus::ok;
         }
-        if (correction.status != CorrectionStatus::ok) {
+        if (!shortened_valid || correction.status != CorrectionStatus::ok) {
           continue;
         }
         if (correction.error_count == 0) {
           continue;
-        }
-        if (batched) {
-          for (size_t pos = 0; pos < length; ++pos) {
-            candidate[pos] = shards[pos][line];
-          }
         }
         if (!strong) {
           if (correction.error_count != 1) {
@@ -213,7 +232,8 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
           }
           bool accept = true;
           for (size_t pos = 0; pos < length; ++pos) {
-            const unsigned delta = block[index(pos)] ^ candidate[pos];
+            const unsigned delta =
+                block[index(pos)] ^ candidate[weak_position(pos)];
             if (delta != 0 &&
                 ((options.use_anchors && protected_columns[pos]) ||
                  (options.use_binary_image && std::popcount(delta) > 2))) {
@@ -225,10 +245,11 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
           }
         }
         for (size_t pos = 0; pos < length; ++pos) {
-          if (block[index(pos)] != candidate[pos]) {
-            bit_changes += std::popcount(
-                static_cast<unsigned>(block[index(pos)] ^ candidate[pos]));
-            block[index(pos)] = candidate[pos];
+          const auto value = candidate[strong ? pos : weak_position(pos)];
+          if (block[index(pos)] != value) {
+            bit_changes +=
+                std::popcount(static_cast<unsigned>(block[index(pos)] ^ value));
+            block[index(pos)] = value;
             next[pos] = true;
             (strong ? clean_rows[pos] : clean_columns[pos]) = false;
             ++changes;
@@ -263,13 +284,14 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
           (strong ? clean_columns[line] : clean_rows[line])) {
         continue;
       }
+      candidate.fill(0);
       for (size_t pos = 0; pos < length; ++pos) {
-        candidate[pos] =
+        candidate[strong ? pos : weak_position(pos)] =
             block[strong ? pos * weak_n_ + line : line * weak_n_ + pos];
       }
-      const auto check =
-          CorrectCodeword(strong ? strong_decoder_ : weak_decoder_,
-                          std::span(candidate).first(length));
+      const auto check = CorrectCodeword(
+          strong ? strong_decoder_ : weak_decoder_,
+          std::span(candidate).first(strong ? length : mother_n));
       if (check.status != CorrectionStatus::ok || check.error_count != 0) {
         result.all_zero_syndromes = false;
       }

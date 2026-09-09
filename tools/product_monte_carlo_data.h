@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <charconv>
 #include <cstdint>
 #include <map>
@@ -16,6 +17,7 @@ namespace mc {
 using Json = nlohmann::json;
 inline constexpr std::string_view kCode =
     "RS256,224 x RS256,254 Cantor systematic row major";
+inline constexpr std::string_view kSnapshots = "atomic summary v1";
 inline constexpr std::string_view kFloyd =
     "splitmix64 domain seeds; mt19937_64; rejection modulo; Floyd complement "
     "v1";
@@ -131,13 +133,35 @@ inline void Fields(const Json& value, std::set<std::string> expected) {
 }
 
 struct Settings {
+  uint64_t n1 = 256, k1 = 224, n2 = 256, k2 = 254;
   uint64_t seed = 0, size = 1000, batches = 0, threads = 1, lo = 2500,
            hi = 2700, passes = 16, checkpoint = 64, report = 2, sync = 5;
   bool anchors = true, binary = true;
 
+  /** @brief Transmitted bits per block after dimension validation. */
+  uint64_t FullBits() const { return 8 * n1 * n2; }
+  /** @brief Information bits per block after dimension validation. */
+  uint64_t InfoBits() const { return 8 * k1 * k2; }
+  /** @brief Whether legacy implicit dimensions describe this code. */
+  bool DefaultDimensions() const {
+    return n1 == 256 && k1 == 224 && n2 == 256 && k2 == 254;
+  }
+  /** @brief Code and coordinate convention, preserving the legacy spelling. */
+  std::string Code() const {
+    return "RS" + std::to_string(n1) + "," + std::to_string(k1) + " x RS" +
+           std::to_string(n2) + "," + std::to_string(k2) +
+           " Cantor systematic row major";
+  }
+
   void Validate() const {
-    Require(lo <= hi && hi <= 524288,
-            "require 0 <= minimum <= maximum <= 524288");
+    Require(n1 <= 256 && std::has_single_bit(n1) && k1 < n1 && n1 - k1 >= 2 &&
+                n1 - k1 <= k1 && std::has_single_bit(n1 - k1) && n2 <= 256 &&
+                k2 >= 2 && k2 < n2 && n2 - k2 == 2,
+            "invalid dimensions: strong N,R powers of two, N<=256, 2<=R<=K; "
+            "weak N<=256, K>=2, R=2 (shortening supported)");
+    Require(lo <= hi && hi <= FullBits(),
+            "require 0 <= minimum <= maximum <= 8*n1*n2; set smaller explicit "
+            "flip bounds for small codes (defaults 2500..2700 are not capped)");
     Require(size > 0, "batch size must be positive");
     Require(threads >= 1 && threads <= 1024, "threads must be in [1,1024]");
     Require(passes >= 2 && passes <= 1000000,
@@ -161,14 +185,40 @@ struct Settings {
     j["fsync seconds"] = sync;
     j["anchors"] = anchors;
     j["binary image"] = binary;
+    if (!DefaultDimensions()) {
+      j["n1"] = n1;
+      j["k1"] = k1;
+      j["n2"] = n2;
+      j["k2"] = k2;
+    }
     return j;
   }
   static Settings FromJson(const Json& j) {
-    Fields(j, {"root seed", "batch size", "batches", "threads",
-               "minimum flipped bits", "maximum flipped bits",
-               "maximum directional passes", "checkpoint trials",
-               "report seconds", "fsync seconds", "anchors", "binary image"});
+    std::set<std::string> fields{"root seed",
+                                 "batch size",
+                                 "batches",
+                                 "threads",
+                                 "minimum flipped bits",
+                                 "maximum flipped bits",
+                                 "maximum directional passes",
+                                 "checkpoint trials",
+                                 "report seconds",
+                                 "fsync seconds",
+                                 "anchors",
+                                 "binary image"};
+    const bool dimensions = j.contains("n1") || j.contains("k1") ||
+                            j.contains("n2") || j.contains("k2");
+    if (dimensions) {
+      fields.insert({"n1", "k1", "n2", "k2"});
+    }
+    Fields(j, fields);
     Settings s;
+    if (dimensions) {
+      s.n1 = U64(j.at("n1"));
+      s.k1 = U64(j.at("k1"));
+      s.n2 = U64(j.at("n2"));
+      s.k2 = U64(j.at("k2"));
+    }
     s.seed = U64(j.at("root seed"));
     s.size = U64(j.at("batch size"));
     s.batches = U64(j.at("batches"));
@@ -191,25 +241,25 @@ struct Settings {
 struct Stats {
   uint64_t blocks = 0, iterations = 0, info_raw = 0, info_post = 0,
            full_raw = 0, full_post = 0;
-  void Add(const std::array<uint64_t, 22>& m) {
-    Add(Stats{1, m[12], m[2], m[6], m[0], m[4]});
+  void Add(const std::array<uint64_t, 22>& m, uint64_t full_bits = 524288) {
+    Add(Stats{1, m[12], m[2], m[6], m[0], m[4]}, full_bits);
   }
-  void Add(const Stats& s) {
+  void Add(const Stats& s, uint64_t full_bits = 524288) {
     Stats next{
         CheckedAdd(blocks, s.blocks),     CheckedAdd(iterations, s.iterations),
         CheckedAdd(info_raw, s.info_raw), CheckedAdd(info_post, s.info_post),
         CheckedAdd(full_raw, s.full_raw), CheckedAdd(full_post, s.full_post)};
-    CheckedMultiply(next.blocks, 524288);
+    CheckedMultiply(next.blocks, full_bits);
     *this = next;
   }
-  Json ToJson() const {
+  Json ToJson(const Settings& settings = {}) const {
     Json j;
     j["completed blocks"] = Number(blocks);
     j["total iterations"] = Number(iterations);
     for (bool info : {true, false}) {
       Json bits;
-      bits["total bits"] =
-          Number(CheckedMultiply(blocks, info ? 455168 : 524288));
+      bits["total bits"] = Number(CheckedMultiply(
+          blocks, info ? settings.InfoBits() : settings.FullBits()));
       bits["raw corrupted bits"] = Number(info ? info_raw : full_raw);
       bits["post decoding corrupted bits"] =
           Number(info ? info_post : full_post);
@@ -220,7 +270,8 @@ struct Stats {
   static Stats FromJson(const Json& j,
                         uint64_t count,
                         uint64_t k,
-                        uint64_t passes) {
+                        uint64_t passes,
+                        const Settings& settings = {}) {
     Fields(j, {"completed blocks", "total iterations", "information bits",
                "full-codeword bits"});
     Stats s;
@@ -236,7 +287,8 @@ struct Stats {
       const auto& bits = j.at(info ? "information bits" : "full-codeword bits");
       Fields(bits, {"total bits", "raw corrupted bits",
                     "post decoding corrupted bits"});
-      const auto total = CheckedMultiply(count, info ? 455168 : 524288);
+      const auto total = CheckedMultiply(
+          count, info ? settings.InfoBits() : settings.FullBits());
       auto raw = Natural(bits.at("raw corrupted bits"));
       auto post = Natural(bits.at("post decoding corrupted bits"));
       Require(Natural(bits.at("total bits")) == total && raw <= total &&
@@ -248,8 +300,12 @@ struct Stats {
     Require(s.full_raw == CheckedMultiply(count, k),
             "initial channel is not exact k");
     Require(s.info_raw <= s.full_raw && s.info_post <= s.full_post &&
-                s.full_raw - s.info_raw <= CheckedMultiply(count, 69120) &&
-                s.full_post - s.info_post <= CheckedMultiply(count, 69120),
+                s.full_raw - s.info_raw <=
+                    CheckedMultiply(
+                        count, settings.FullBits() - settings.InfoBits()) &&
+                s.full_post - s.info_post <=
+                    CheckedMultiply(count,
+                                    settings.FullBits() - settings.InfoBits()),
             "inconsistent information/full bit counters");
     return s;
   }
@@ -286,30 +342,32 @@ inline void AddLegacyTrial(Json& to, const std::array<uint64_t, 22>& m) {
 inline void ValidateLegacy(const Json& j,
                            uint64_t count,
                            uint64_t k,
-                           uint64_t passes) {
+                           uint64_t passes,
+                           const Settings& settings = {}) {
   Fields(j, std::set<std::string>(kMetrics.begin(), kMetrics.end()));
   Require(passes >= 2 && passes <= 1000000, "invalid legacy pass cap");
-  std::array<uint64_t, 22> bounds{524288,
-                                  65536,
-                                  455168,
-                                  56896,
-                                  524288,
-                                  65536,
-                                  455168,
-                                  56896,
+  const auto full = settings.FullBits(), info = settings.InfoBits();
+  std::array<uint64_t, 22> bounds{full,
+                                  full / 8,
+                                  info,
+                                  info / 8,
+                                  full,
+                                  full / 8,
+                                  info,
+                                  info / 8,
                                   1,
                                   1,
                                   1,
                                   1,
                                   passes,
-                                  passes * 524288,
-                                  passes * 524288,
-                                  passes * 524288,
-                                  passes * 524288,
-                                  passes * 524288,
-                                  passes * 524288,
-                                  passes * 524288,
-                                  passes * 524288,
+                                  passes * full,
+                                  passes * (full / 8),
+                                  passes * full,
+                                  passes * (full / 8),
+                                  passes * full,
+                                  passes * (full / 8),
+                                  passes * settings.n2,
+                                  passes * settings.n1,
                                   1};
   for (size_t i = 0; i < kMetrics.size(); ++i) {
     const auto& item = j.at(kMetrics[i]);
@@ -340,13 +398,14 @@ inline void ValidateLegacy(const Json& j,
 struct Aggregate {
   std::string identity;
   unsigned schema;
+  Settings settings;
   Stats overall;
   std::map<uint64_t, Stats> by_k;
   Json legacy = LegacyStats();
   std::map<uint64_t, Json> legacy_k;
   /** @brief Initialize an empty aggregate for a run and schema revision. */
-  Aggregate(std::string id, unsigned revision)
-      : identity(std::move(id)), schema(revision) {}
+  Aggregate(std::string id, unsigned revision, Settings dimensions = {})
+      : identity(std::move(id)), schema(revision), settings(dimensions) {}
 
   struct PreparedAdd {
     Stats overall;
@@ -368,10 +427,10 @@ struct Aggregate {
                          const Json& old = Json()) const {
     PreparedAdd next;
     next.overall = overall;
-    next.overall.Add(stats);
+    next.overall.Add(stats, settings.FullBits());
     const auto it = by_k.find(k);
     Stats row = it == by_k.end() ? Stats{} : it->second;
-    row.Add(stats);
+    row.Add(stats, settings.FullBits());
     // Stage just one node, with the same allocator as the destination map.
     decltype(by_k) rows;
     rows.emplace(k, row);
@@ -420,6 +479,12 @@ struct Aggregate {
     Json out;
     out["schema revision"] = schema;
     out["run identity"] = identity;
+    if (!settings.DefaultDimensions()) {
+      out["code parameters"] = {{"n1", settings.n1},
+                                {"k1", settings.k1},
+                                {"n2", settings.n2},
+                                {"k2", settings.k2}};
+    }
     Json rows = Json::array();
     for (const auto& [k, s] : by_k) {
       Json row;
@@ -428,7 +493,7 @@ struct Aggregate {
         row["trial count"] = Number(s.blocks);
         row["statistics"] = legacy_k.at(k);
       } else {
-        row["statistics"] = s.ToJson();
+        row["statistics"] = s.ToJson(settings);
       }
       rows.push_back(std::move(row));
     }
@@ -437,7 +502,7 @@ struct Aggregate {
       out["overall"]["trial count"] = Number(overall.blocks);
       out["overall"]["statistics"] = legacy;
     } else {
-      out["overall"]["statistics"] = overall.ToJson();
+      out["overall"]["statistics"] = overall.ToJson(settings);
     }
     return out;
   }

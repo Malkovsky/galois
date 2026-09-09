@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
-  printf 'Usage: %s [PREFIX]\nBuild native Release rs-product-monte-carlo and install it (default: ~/.local).\nRequires CMake, a C++20 compiler, OpenSSL 3 development files, and Git/network for pinned nlohmann/json v3.12.0 headers. No Python runtime or sudo.\n' "$0"
+  printf 'Usage: %s [PREFIX]\nBuild native Release rs-product-monte-carlo and install it (default: ~/.local).\nRuntime dimensions: --n1 256 --k1 224 --n2 256 --k2 254. Strong N,R remain aligned powers of two; only weak R=2 shortening is supported (e.g. --n2 175 --k2 173). Small codes need explicit flip bounds <=8*n1*n2.\nRequires CMake, a C++20 compiler, OpenSSL 3 development files, and Git/network for pinned nlohmann/json v3.12.0 headers. No Python runtime or sudo.\n' "$0"
   exit 0
 fi
 if (( $# > 1 )) || [[ ${1:-} == -* ]]; then

@@ -159,6 +159,50 @@ class ExperimentTest(unittest.TestCase):
             self.assertEqual(count.value, 0)
             self.assertEqual(list(output), before)
 
+    def test_dimension_state_reuse_equivariance_and_saved_flips(self):
+        lib = experiment.native()
+        c = experiment.ctypes
+        trial = lib.product_trial_dimensions
+        trial.argtypes = [c.c_uint64] * 5 + [c.c_int, c.c_int,
+            c.POINTER(c.c_uint64), c.c_int, c.POINTER(c.c_uint32), c.c_int,
+            c.POINTER(c.c_uint8)] + [c.c_uint64] * 4
+        trial.restype = c.c_int
+        seen = {}
+        for dims in ((256, 224, 175, 173), (4, 2, 5, 3), (256, 224, 256, 254),
+                     (32, 28, 31, 29), (256, 224, 175, 173)):
+            n1, k1, n2, k2 = dims
+            n = 8 * n1 * n2
+            for k in (0, 1, min(1800, n // 3), n // 2 + 1, n - 1, n):
+                for anchors, binary in ((0, 0), (1, 1), (0, 1), (1, 0)):
+                    outputs, residuals = [], []
+                    positions = (c.c_uint32 * max(1, min(k, n-k)))()
+                    for random, sampler in ((0, 0), (1, 0), (0, 2), (1, 2)):
+                        output = (c.c_uint64 * 22)()
+                        residual = (c.c_uint8 * (n1*n2))()
+                        self.assertEqual(trial(42, 7, 0, k, 4, anchors, binary,
+                            output, sampler, positions, random, residual, *dims), 0)
+                        self.assertEqual(output[0], k)
+                        self.assertLessEqual(output[2], 8*k1*k2)
+                        self.assertLessEqual(output[19], 4*n2)
+                        self.assertLessEqual(output[20], 4*n1)
+                        outputs.append(list(output)); residuals.append(bytes(residual))
+                    self.assertTrue(all(v == outputs[0] for v in outputs))
+                    self.assertTrue(all(v == residuals[0] for v in residuals))
+                    key = dims, k, anchors, binary
+                    self.assertEqual(seen.setdefault(key, outputs[0]), outputs[0])
+            # A persistent FY permutation must be resized when dimensions change.
+            k = n - 3
+            positions = (c.c_uint32 * 3)()
+            output, replay = (c.c_uint64 * 22)(), (c.c_uint64 * 22)()
+            self.assertEqual(trial(42, 0, 0, k, 2, 0, 0, output, 1, positions, 0, None, *dims), 0)
+            self.assertEqual(trial(42, 0, 0, k, 2, 0, 0, replay, 2, positions, 1, None, *dims), 0)
+            self.assertEqual(list(output), list(replay))
+        before = list(output)
+        for dims, k in (((256, 224, 175, 173), 358401), ((256, 224, 175, 172), 0),
+                        ((255, 223, 175, 173), 0), ((4, 2, 3, 1), 0)):
+            self.assertNotEqual(trial(42, 0, 0, k, 2, 0, 0, output, 0, None, 0, None, *dims), 0)
+            self.assertEqual(list(output), before)
+
     def test_chunk_failure_preserves_prefix_and_later_successes(self):
         source = self.run_case("chunk-settings", "--minimum-flipped-bits", "0", "--maximum-flipped-bits", "0")
         settings = self.read(source, "metadata.json")["settings"]
