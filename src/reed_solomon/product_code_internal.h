@@ -8,6 +8,36 @@ namespace gf2p8::rs::detail {
  * choices. */
 struct ProductCorrectionAccess {
   /**
+   * @brief Direct-R2 experiment: bits 0/1/2 select sparse masks, vector
+   * reduction, and padded strong batch lanes. Zero retains the R2 baseline.
+   * @param code Product dimensions and component decoders.
+   * @param block Mutable row-major block.
+   * @param options Directional pass limit and independent weak gates.
+   * @param optimizations Private per-call bitset, never shared mutable state.
+   * @return The normal product outcome and exact work counts.
+   */
+  static ProductCorrectionResult Experiment(const StrongWeakRSProductCode& code,
+                                            std::span<Element> block,
+                                            ProductDecodeOptions options,
+                                            unsigned optimizations) {
+    const unsigned batches = lch::BackendAvailable(lch::Backend::avx2) ? 2 : 0;
+    return code.CorrectImpl(block, options, batches, true, true, optimizations);
+  }
+  /**
+   * @brief Private compact weak-row candidate for independent mother tests.
+   * @param code Valid product code whose weak dimensions match row.
+   * @param row Compact input, unchanged by this operation.
+   * @param position Output public position for a one-error candidate only.
+   * @param magnitude Output XOR delta for a one-error candidate only.
+   * @return Clean, one-error, or uncorrectable outcome.
+   */
+  static CorrectionResult WeakCandidate(const StrongWeakRSProductCode& code,
+                                        std::span<const Element> row,
+                                        size_t& position,
+                                        Element& magnitude) {
+    return code.WeakCandidate(row, position, magnitude);
+  }
+  /**
    * @brief Runs the same scheduler with zero, one, or two initial batched
    * passes.
    * @param code Product dimensions and component decoders.

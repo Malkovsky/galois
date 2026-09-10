@@ -2,6 +2,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <random>
 #include <utility>
@@ -157,6 +158,97 @@ TEST(ProductCode, DimensionsAndInvalidCalls) {
             ProductTermination::invalid_argument);
   EXPECT_EQ(code.Encode(std::span(block).first(31)), Status::invalid_argument);
   EXPECT_EQ(block, before);
+}
+
+TEST(ProductCode, DirectWeakMatchesIndependentMotherForEveryLength) {
+  std::mt19937 random(0x721754);
+  for (size_t n = 4; n <= 256; ++n) {
+    const size_t k = n - 2, mother = std::bit_ceil(n), mk = mother - 2;
+    StrongWeakRSProductCode code(4, 2, n, k);
+    LCHDecoder decoder(mk, 2);
+    const auto original = Codeword(n, k, n);
+    auto compare = [&](const std::vector<Element>& row) {
+      std::vector<Element> reference(mother);
+      std::copy_n(row.begin(), k, reference.begin());
+      reference[mk] = row[k];
+      reference[mk + 1] = row[k + 1];
+      auto expected = CorrectCodeword(decoder, reference);
+      if (std::any_of(reference.begin() + k, reference.begin() + mk,
+                      [](Element x) { return x != 0; })) {
+        expected = {CorrectionStatus::uncorrectable, 0};
+      }
+      size_t position = n;
+      Element magnitude = 0;
+      const auto actual = detail::ProductCorrectionAccess::WeakCandidate(
+          code, row, position, magnitude);
+      ASSERT_EQ(actual.status, expected.status) << n;
+      ASSERT_EQ(actual.error_count, expected.error_count) << n;
+      if (actual.status == CorrectionStatus::ok) {
+        auto repaired = row;
+        if (actual.error_count) {
+          ASSERT_LT(position, n);
+          repaired[position] ^= magnitude;
+        }
+        for (size_t j = 0; j < n; ++j) {
+          ASSERT_EQ(repaired[j], reference[j < k ? j : mk + j - k]) << n;
+        }
+      }
+    };
+    compare(original);
+    // Force every possible locator, including virtual data and points outside
+    // the mother code. Two parity edits synthesize the requested check pair.
+    for (unsigned native = 0; native < 256; ++native) {
+      auto row = original;
+      const Element magnitude = static_cast<Element>(1 + random() % 255);
+      const Element weighted =
+          gf2p8::MultiplyCantor(magnitude, static_cast<Element>(native ^ 1));
+      row[k] ^= weighted;
+      row[k + 1] ^= weighted ^ magnitude;
+      compare(row);
+    }
+    // All positions at every supported shortening; full magnitude coverage at
+    // the smallest family boundary and the full/target-shortened lengths.
+    for (size_t pos = 0; pos < n; ++pos) {
+      const unsigned count = n == 4 || n == 175 || n == 256 ? 255 : 1;
+      for (unsigned magnitude = 1; magnitude <= count; ++magnitude) {
+        auto row = original;
+        row[pos] ^= static_cast<Element>(magnitude);
+        compare(row);
+      }
+    }
+    for (size_t trial = 0; trial < 64; ++trial) {
+      auto row = original;
+      for (size_t error = 0; error < 2 + trial % 7; ++error) {
+        row[random() % n] ^= static_cast<Element>(1 + random() % 255);
+      }
+      compare(row);
+    }
+  }
+}
+
+TEST(ProductCode, DirectEncodingMatchesScalarLCHForEveryWeakLength) {
+  for (size_t n = 4; n <= 256; ++n) {
+    StrongWeakRSProductCode code(4, 2, n, n - 2);
+    auto first = Codeword(n, n - 2, n);
+    auto second = Codeword(n, n - 2, n + 1);
+    std::vector<Element> block(code.BlockSize(), 0xa5);
+    std::copy_n(first.begin(), n - 2, block.begin());
+    std::copy_n(second.begin(), n - 2, block.begin() + n);
+    ASSERT_EQ(code.Encode(block, Backend::scalar), Status::ok);
+    EXPECT_TRUE(std::equal(first.begin(), first.end(), block.begin()));
+    EXPECT_TRUE(std::equal(second.begin(), second.end(), block.begin() + n));
+    // The complete product, not just the two weak information rows, must match
+    // the independent scalar strong encoder too.
+    LCHEncoder strong(2, 2);
+    std::array<const Element*, 2> data{first.data(), second.data()};
+    std::vector<Element> parity(2 * n);
+    std::array<Element*, 2> recovery{parity.data(), parity.data() + n};
+    std::vector<Element> workspace(strong.WorkspaceSize(n));
+    ASSERT_EQ(strong.Encode(data, recovery, n, workspace, Backend::scalar),
+              Status::ok);
+    EXPECT_TRUE(
+        std::equal(parity.begin(), parity.end(), block.begin() + 2 * n));
+  }
 }
 
 TEST(ProductCode, SystematicEncodingScalarAgreementAndAllComponentValidity) {
@@ -536,6 +628,10 @@ bool AllComponentsValid(const std::vector<Element>& block,
 TEST(ProductCode, InitialBatchChoicesMatchSingleOutputsAndAllCounters) {
   std::mt19937 random(0x5b5c0224);
   for (const auto dims : {std::array<size_t, 4>{4, 2, 8, 6},
+                          {32, 28, 31, 29},
+                          {32, 28, 32, 30},
+                          {32, 28, 33, 31},
+                          {32, 28, 65, 63},
                           {32, 16, 64, 62},
                           {256, 224, 175, 173},
                           {256, 224, 256, 254}}) {
@@ -581,10 +677,14 @@ TEST(ProductCode, InitialBatchChoicesMatchSingleOutputsAndAllCounters) {
                 code, reference, options, 0, false);
             EXPECT_EQ(expected.all_zero_syndromes,
                       AllComponentsValid(reference, ns, ks, nw, kw));
-            for (unsigned batches : {0u, 1u, 2u}) {
+            for (unsigned batches = 0; batches < 12; ++batches) {
               auto actual = input;
-              const auto result = detail::ProductCorrectionAccess::Correct(
-                  code, actual, options, batches);
+              const auto result =
+                  batches >= 4 ? detail::ProductCorrectionAccess::Experiment(
+                                     code, actual, options, batches - 4)
+                  : batches == 3 ? code.Correct(actual, options)
+                                 : detail::ProductCorrectionAccess::Correct(
+                                       code, actual, options, batches);
               ASSERT_EQ(actual, reference)
                   << ns << ':' << trial << ':' << cap << ':' << batches;
               EXPECT_EQ(result.termination, expected.termination);
@@ -608,6 +708,37 @@ TEST(ProductCode, InitialBatchChoicesMatchSingleOutputsAndAllCounters) {
       }
     }
   }
+}
+
+TEST(ProductCode, ConcurrentCallsShareConstCode) {
+  const StrongWeakRSProductCode code(32, 28, 175, 173);
+  std::vector<Element> input(code.BlockSize(), 0);
+  for (size_t i = 0; i < input.size(); i += 137) {
+    input[i] ^= 3;
+  }
+  auto reference = input;
+  const auto expected =
+      detail::ProductCorrectionAccess::Correct(code, reference, 16, 0, false);
+  auto worker = [&] {
+    for (size_t n : {256u, 4u, 175u, 32u, 256u}) {
+      StrongWeakRSProductCode other(32, 28, n, n - 2);
+      std::vector<Element> block(other.BlockSize(), 0);
+      EXPECT_TRUE(other.Correct(block).all_zero_syndromes);
+      EXPECT_EQ(other.Correct(block, 1).termination,
+                ProductTermination::invalid_argument);
+      auto actual = input;
+      const auto result = code.Correct(actual);
+      EXPECT_EQ(actual, reference);
+      EXPECT_EQ(result.changed_bits, expected.changed_bits);
+      EXPECT_EQ(result.changed_symbols, expected.changed_symbols);
+      EXPECT_EQ(result.termination, expected.termination);
+      EXPECT_EQ(result.all_zero_syndromes, expected.all_zero_syndromes);
+    }
+  };
+  auto first = std::async(std::launch::async, worker);
+  auto second = std::async(std::launch::async, worker);
+  first.get();
+  second.get();
 }
 
 TEST(ProductCode,

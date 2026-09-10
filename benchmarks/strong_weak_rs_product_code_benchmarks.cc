@@ -2,6 +2,7 @@
 #include <bit>
 #include <cstdint>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "benchmark/benchmark.h"
@@ -11,19 +12,32 @@
 namespace {
 
 void BenchmarkProductCorrectionBSC(benchmark::State& state,
-                                   int batch_passes = -1) {
+                                   int batch_passes = -1,
+                                   size_t weak_n = 256,
+                                   int optimizations = -1) {
   using gf2p8::Element;
   using gf2p8::rs::ProductCorrectionResult;
   using gf2p8::rs::ProductTermination;
   constexpr size_t kN = 256;
   constexpr size_t kStrongK = 224;
-  constexpr size_t kWeakK = 254;
-  constexpr size_t kInformationBytes = kStrongK * kWeakK;
-  constexpr size_t kBlockBytes = kN * kN;
+  const size_t kWeakK = weak_n - 2;
+  const size_t kInformationBytes = kStrongK * kWeakK;
+  const size_t kBlockBytes = kN * weak_n;
   constexpr size_t kCorpusCount = 64;
   constexpr size_t kPassLimit = 16;
   constexpr uint32_t kSeed = 0x5b5c0224;
-  gf2p8::rs::StrongWeakRSProductCode code(kN, kStrongK, kN, kWeakK);
+  gf2p8::rs::StrongWeakRSProductCode code(kN, kStrongK, weak_n, kWeakK);
+  const auto correct = [&](std::vector<Element>& block) {
+    if (optimizations >= 0) {
+      return gf2p8::rs::detail::ProductCorrectionAccess::Experiment(
+          code, block, gf2p8::rs::ProductDecodeOptions{kPassLimit},
+          optimizations);
+    }
+    return batch_passes < 0
+               ? code.Correct(block, kPassLimit)
+               : gf2p8::rs::detail::ProductCorrectionAccess::Correct(
+                     code, block, kPassLimit, batch_passes);
+  };
   if (!code.Valid() || code.BlockSize() != kBlockBytes) {
     state.SkipWithError("invalid product-code dimensions");
     return;
@@ -41,7 +55,7 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state,
     auto& block = original[sample];
     for (size_t row = 0; row < kStrongK; ++row) {
       for (size_t col = 0; col < kWeakK; ++col) {
-        block[row * kN + col] = static_cast<Element>(messages());
+        block[row * weak_n + col] = static_cast<Element>(messages());
       }
     }
     if (code.Encode(block) != gf2p8::lch::Status::ok) {
@@ -88,10 +102,7 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state,
     const auto expected = gf2p8::rs::detail::ProductCorrectionAccess::Correct(
         code, reference, kPassLimit, 0, false);
     work[sample] = corrupted[sample];
-    const auto actual =
-        batch_passes < 0 ? code.Correct(work[sample], kPassLimit)
-                         : gf2p8::rs::detail::ProductCorrectionAccess::Correct(
-                               code, work[sample], kPassLimit, batch_passes);
+    const auto actual = correct(work[sample]);
     if (work[sample] != reference ||
         actual.termination != expected.termination ||
         actual.all_zero_syndromes != expected.all_zero_syndromes ||
@@ -116,11 +127,7 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state,
     }
     state.ResumeTiming();
     for (size_t sample = 0; sample < kCorpusCount; ++sample) {
-      results[sample] =
-          batch_passes < 0
-              ? code.Correct(work[sample], kPassLimit)
-              : gf2p8::rs::detail::ProductCorrectionAccess::Correct(
-                    code, work[sample], kPassLimit, batch_passes);
+      results[sample] = correct(work[sample]);
       benchmark::DoNotOptimize(results[sample]);
       benchmark::ClobberMemory();
     }
@@ -136,7 +143,7 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state,
         const auto bits = std::popcount(
             static_cast<unsigned>(work[sample][pos] ^ original[sample][pos]));
         block_bits += bits;
-        if (pos / kN < kStrongK && pos % kN < kWeakK) {
+        if (pos / weak_n < kStrongK && pos % weak_n < kWeakK) {
           data_bits += bits;
         }
       }
@@ -209,7 +216,7 @@ void BenchmarkProductCorrectionBSC(benchmark::State& state,
   state.SetBytesProcessed(state.iterations() * kCorpusCount *
                           kInformationBytes);
   state.SetLabel(
-      "64 blocks/iteration; information bytes=224*254; "
+      "64 blocks/iteration; information bytes=Kstrong*Kweak; "
       "Correct includes exact final validity; tuned backend");
 }
 
@@ -218,14 +225,68 @@ const auto* kProductCorrectionBSC = benchmark::RegisterBenchmark(
     "Nstrong:256/Kstrong:224/Nweak:256/Kweak:254",
     [](benchmark::State& state) { BenchmarkProductCorrectionBSC(state); });
 
+const auto kProductExperiments = [] {
+  for (int variant : {0, 1, 2, 3, 4, 6, 7}) {
+    for (size_t n : {256u, 175u}) {
+      const auto name = "LCH/Owned/StrongWeakRSProductCode/Experiment/" +
+                        std::to_string(variant) + "/" + std::to_string(n);
+      benchmark::RegisterBenchmark(name.c_str(), [=](benchmark::State& state) {
+        BenchmarkProductCorrectionBSC(state, -1, n, variant);
+      });
+    }
+  }
+  return true;
+}();
+
 const auto* kProductCorrectionSingle = benchmark::RegisterBenchmark(
     "LCH/Owned/StrongWeakRSProductCode/Correct/BSC005/Single",
     [](benchmark::State& state) { BenchmarkProductCorrectionBSC(state, 0); });
+const auto* kProductCorrectionShortened = benchmark::RegisterBenchmark(
+    "LCH/Owned/StrongWeakRSProductCode/Correct/BSC005/"
+    "Nstrong:256/Kstrong:224/Nweak:175/Kweak:173",
+    [](benchmark::State& state) {
+      BenchmarkProductCorrectionBSC(state, -1, 175);
+    });
 const auto* kProductCorrectionStrongBatch = benchmark::RegisterBenchmark(
     "LCH/Owned/StrongWeakRSProductCode/Correct/BSC005/StrongBatch",
     [](benchmark::State& state) { BenchmarkProductCorrectionBSC(state, 1); });
 const auto* kProductCorrectionBothBatch = benchmark::RegisterBenchmark(
     "LCH/Owned/StrongWeakRSProductCode/Correct/BSC005/BothBatch",
     [](benchmark::State& state) { BenchmarkProductCorrectionBSC(state, 2); });
+
+const auto* kProductCorrectionGenericShortened = benchmark::RegisterBenchmark(
+    "LCH/Owned/StrongWeakRSProductCode/Correct/BSC005/Generic175",
+    [](benchmark::State& state) {
+      BenchmarkProductCorrectionBSC(state, 2, 175);
+    });
+
+void BenchmarkProductEncode(benchmark::State& state) {
+  const size_t n = state.range(0);
+  gf2p8::rs::StrongWeakRSProductCode code(256, 224, n, n - 2);
+  std::vector<gf2p8::Element> block(code.BlockSize());
+  std::mt19937 random(0x5b5c0224);
+  for (auto& value : block) {
+    value = static_cast<gf2p8::Element>(random());
+  }
+  if (code.Encode(block) != gf2p8::lch::Status::ok) {
+    state.SkipWithError("encoding failed");
+    return;
+  }
+  const auto original = block;
+  for (auto _ : state) {
+    benchmark::DoNotOptimize(code.Encode(block));
+    benchmark::ClobberMemory();
+  }
+  if (block != original || !code.Correct(block).all_zero_syndromes) {
+    state.SkipWithError("encoding mismatch");
+  }
+  state.SetBytesProcessed(state.iterations() * 224 * (n - 2));
+}
+
+const auto* kProductEncode =
+    benchmark::RegisterBenchmark("LCH/Owned/StrongWeakRSProductCode/Encode",
+                                 BenchmarkProductEncode)
+        ->Arg(256)
+        ->Arg(175);
 
 }  // namespace

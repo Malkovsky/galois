@@ -52,6 +52,8 @@ struct ProductCorrectionResult {
  * Weak R=2, K>=2, N<=256 may be shortened from nextPow2(N): omitted data
  * [K,nextPow2(N)-2) are known zeros. Public rows remain compact [data][parity].
  * Mother-code candidates changing any omitted zero are rejected in full.
+ * Const operations may share one code instance concurrently when each call owns
+ * a distinct block; all mutable scratch is local to the call.
  */
 class StrongWeakRSProductCode {
  public:
@@ -125,7 +127,25 @@ class StrongWeakRSProductCode {
   ProductCorrectionResult CorrectImpl(std::span<Element> block,
                                       ProductDecodeOptions options,
                                       unsigned batch_passes,
-                                      bool tracked_validation = true) const;
+                                      bool tracked_validation = true,
+                                      bool direct_weak = false,
+                                      unsigned optimizations = 7) const;
+  /**
+   * @brief Checks a compact weak row and optionally locates its one-error
+   * repair.
+   * @param row Exactly weak_n_ symbols for a valid code instance.
+   * @param position Receives the public position only for a one-error
+   * candidate.
+   * @param magnitude Receives its nonzero XOR delta only for that candidate.
+   * @param locate False requests zero-syndrome validation only.
+   * @param vector_reduce Enable the private SIMD reduction when available.
+   * @return Clean, one-error, or uncorrectable; never modifies the row.
+   */
+  CorrectionResult WeakCandidate(std::span<const Element> row,
+                                 size_t& position,
+                                 Element& magnitude,
+                                 bool locate = true,
+                                 bool vector_reduce = true) const;
   size_t strong_n_, strong_k_, weak_n_, weak_k_;
   bool valid_;
   LCHEncoder strong_encoder_, weak_encoder_;
