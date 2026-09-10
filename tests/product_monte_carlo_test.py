@@ -155,8 +155,36 @@ class NativeTest(unittest.TestCase):
                 self.assertEqual((path / "flips.bin").stat().st_size, 40+3*(240+4*min(k,n-k)))
                 self.assertEqual(before["overall"]["statistics"]["full-codeword bits"]["raw corrupted bits"], 3*k)
 
+    def test_r4_dimensions_threads_report_and_replay(self):
+        results = []
+        for threads in (1, 3):
+            path = self.run_case(f"r4-{threads}", "--n2", 256, "--k2", 252,
+                                 "--threads", threads, "--batches", 1, "--batch-size", 6,
+                                 "--sampler", "fisher-yates")
+            result = self.read(path)
+            self.assertEqual(result["code parameters"],
+                             {"n1": 256, "k1": 224, "n2": 256, "k2": 252})
+            stats = result["overall"]["statistics"]
+            self.assertEqual(stats["information bits"]["total bits"], 6*8*224*252)
+            self.assertEqual(stats["full-codeword bits"]["total bits"], 6*8*256*256)
+            before = (path / "metadata.json").read_bytes()
+            self.invoke("--report", path)
+            self.invoke("--replay", path)
+            self.assertEqual(before, (path / "metadata.json").read_bytes())
+            self.assertEqual(result, self.read(path))
+            results.append(result["overall"])
+        # Fisher-Yates intentionally retains worker-local permutations, so
+        # schedules may differ; saved-position replay above is the invariant.
+        results = []
+        for threads in (1, 3):
+            path = self.run_case(f"r4-floyd-{threads}", "--n2", 256, "--k2", 252,
+                                 "--threads", threads, "--batches", 1, "--batch-size", 6)
+            results.append(self.read(path)["overall"])
+        self.assertEqual(results[0], results[1])
+
     def test_dimension_and_dynamic_range_validation(self):
         for args in (("--n1", 255), ("--k1", 223), ("--n2", 175),
+                     ("--n2", 175, "--k2", 171), ("--n2", 8, "--k2", 4),
                      ("--n2", 257, "--k2", 255), ("--n2", 3, "--k2", 1),
                      ("--n2", 175, "--k2", 173, "--maximum-flipped-bits", 358401),
                      ("--n1", 4, "--k1", 2, "--n2", 5, "--k2", 3)):

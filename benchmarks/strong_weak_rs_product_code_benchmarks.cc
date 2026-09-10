@@ -14,13 +14,14 @@ namespace {
 void BenchmarkProductCorrectionBSC(benchmark::State& state,
                                    int batch_passes = -1,
                                    size_t weak_n = 256,
-                                   int optimizations = -1) {
+                                   int optimizations = -1,
+                                   size_t weak_r = 2) {
   using gf2p8::Element;
   using gf2p8::rs::ProductCorrectionResult;
   using gf2p8::rs::ProductTermination;
   constexpr size_t kN = 256;
   constexpr size_t kStrongK = 224;
-  const size_t kWeakK = weak_n - 2;
+  const size_t kWeakK = weak_n - weak_r;
   const size_t kInformationBytes = kStrongK * kWeakK;
   const size_t kBlockBytes = kN * weak_n;
   constexpr size_t kCorpusCount = 64;
@@ -241,6 +242,16 @@ const auto kProductExperiments = [] {
 const auto* kProductCorrectionSingle = benchmark::RegisterBenchmark(
     "LCH/Owned/StrongWeakRSProductCode/Correct/BSC005/Single",
     [](benchmark::State& state) { BenchmarkProductCorrectionBSC(state, 0); });
+const auto* kProductCorrectionR4 = benchmark::RegisterBenchmark(
+    "LCH/Owned/StrongWeakRSProductCode/R4/Direct256252",
+    [](benchmark::State& state) {
+      BenchmarkProductCorrectionBSC(state, -1, 256, -1, 4);
+    });
+const auto* kProductCorrectionGenericR4 = benchmark::RegisterBenchmark(
+    "LCH/Owned/StrongWeakRSProductCode/R4/Generic256252",
+    [](benchmark::State& state) {
+      BenchmarkProductCorrectionBSC(state, 2, 256, -1, 4);
+    });
 const auto* kProductCorrectionShortened = benchmark::RegisterBenchmark(
     "LCH/Owned/StrongWeakRSProductCode/Correct/BSC005/"
     "Nstrong:256/Kstrong:224/Nweak:175/Kweak:173",

@@ -169,7 +169,7 @@ class ExperimentTest(unittest.TestCase):
         trial.restype = c.c_int
         seen = {}
         for dims in ((256, 224, 175, 173), (4, 2, 5, 3), (256, 224, 256, 254),
-                     (32, 28, 31, 29), (256, 224, 175, 173)):
+                     (256, 224, 256, 252), (32, 28, 31, 29), (256, 224, 175, 173)):
             n1, k1, n2, k2 = dims
             n = 8 * n1 * n2
             for k in (0, 1, min(1800, n // 3), n // 2 + 1, n - 1, n):

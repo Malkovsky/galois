@@ -367,6 +367,18 @@ class ReportTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 plot.load_report(path)
 
+    def test_r4_and_default_dimensions_never_pool(self):
+        default, _, _ = self.fixture("default")
+        r4, metadata, summary = self.fixture("r4")
+        metadata["settings"].update(n1=256, k1=224, n2=256, k2=252)
+        metadata["code"] = "RS256,224 x RS256,252 Cantor systematic row major"
+        summary["run identity"] = plot.identity(metadata)
+        self.save(r4, metadata, summary)
+        groups = plot.pool_reports([default, r4])
+        self.assertEqual(len(groups), 2)
+        self.assertEqual({plot.config_dimensions(config) for config in groups},
+                         {(256, 224, 256, 254), (256, 224, 256, 252)})
+
     def test_shortened_and_default_dimensions_never_pool(self):
         default, _, _ = self.fixture("default")
         short, metadata, summary = self.fixture("short")

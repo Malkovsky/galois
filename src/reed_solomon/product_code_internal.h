@@ -7,6 +7,14 @@ namespace gf2p8::rs::detail {
 /** @brief Private differential-test and benchmark access to initial-pass
  * choices. */
 struct ProductCorrectionAccess {
+  /** @brief Exposes the full R=4 candidate for independent differential tests.
+   */
+  static CorrectionResult WeakCandidateR4(const StrongWeakRSProductCode& code,
+                                          std::span<const Element> row,
+                                          std::array<size_t, 2>& positions,
+                                          std::array<Element, 2>& magnitudes) {
+    return code.WeakCandidateR4(row, positions, magnitudes);
+  }
   /**
    * @brief Direct-R2 experiment: bits 0/1/2 select sparse masks, vector
    * reduction, and padded strong batch lanes. Zero retains the R2 baseline.

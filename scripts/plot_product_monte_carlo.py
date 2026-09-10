@@ -30,7 +30,7 @@ def dimensions(settings):
     n1, k1, n2, k2 = dims
     power2 = lambda n: n > 0 and n & (n - 1) == 0
     require(power2(n1) and 2 <= n1 - k1 <= k1 and power2(n1 - k1)
-            and 2 <= k2 < n2 <= 256 and n2 - k2 == 2, "unsupported dimensions")
+            and 2 <= k2 < n2 <= 256 and (n2 - k2 == 2 or (n2, k2) == (256, 252)), "unsupported dimensions")
     return dims
 
 
@@ -521,7 +521,7 @@ def main(argv=None):
         "Matching decoder configurations pool per-k sums/counts; different dimensions/flags/caps stay separate. "
         "Repeated seeds within a configuration and overlapping inputs are rejected. "
         "Cantor systematic row-major codes only: strong N,R powers of two, N<=256, 2<=R<=K; "
-        "weak N<=256, K>=2, R=2, including shortening. Absent dimensions mean 256,224,256,254. "
+        "weak N<=256, K>=2, R=2, including shortening, or RS(256,252). Absent dimensions mean 256,224,256,254. "
         "Zero/random conventions must match unless --allow-mixed-codewords is explicit. "
         "Metadata has no source revision. "
         "Discovery stops at run directories, ignores unrelated files, and does not follow subdirectory "

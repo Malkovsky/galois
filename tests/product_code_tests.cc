@@ -251,6 +251,173 @@ TEST(ProductCode, DirectEncodingMatchesScalarLCHForEveryWeakLength) {
   }
 }
 
+TEST(ProductCode, R4ExhaustiveSinglesAndPositionPairs) {
+  const StrongWeakRSProductCode code(4, 2, 256, 252);
+  ASSERT_TRUE(code.Valid());
+  const auto original = Codeword(256, 252, 42);
+  auto check = [&](size_t p, Element e, size_t q, Element f) {
+    auto row = original;
+    row[p] ^= e;
+    row[q] ^= f;
+    std::array<size_t, 2> positions{};
+    std::array<Element, 2> magnitudes{};
+    const auto result = detail::ProductCorrectionAccess::WeakCandidateR4(
+        code, row, positions, magnitudes);
+    ASSERT_EQ(result.status, CorrectionStatus::ok);
+    ASSERT_EQ(result.error_count, (e != 0) + (f != 0));
+    for (size_t i = 0; i < result.error_count; ++i) {
+      ASSERT_LT(positions[i], 256u);
+      row[positions[i]] ^= magnitudes[i];
+    }
+    ASSERT_EQ(row, original);
+  };
+  check(0, 0, 1, 0);
+  for (size_t p = 0; p < 256; ++p) {
+    for (unsigned e = 1; e < 256; ++e) {
+      check(p, e, 0, 0);
+    }
+    for (size_t q = p + 1; q < 256; ++q) {
+      check(p, 1, q, 1);  // S0=0 must not be mistaken for failure.
+      check(p, 3, q, 128);
+    }
+  }
+}
+
+TEST(ProductCode, R4AllArtinSchreierValuesAndGenericDifferential) {
+  const StrongWeakRSProductCode code(4, 2, 256, 252);
+  LCHDecoder decoder(252, 4);
+  const auto original = Codeword(256, 252, 73);
+  auto compare = [&](const std::vector<Element>& input) {
+    auto reference = input;
+    const auto expected = CorrectCodeword(decoder, reference);
+    std::array<size_t, 2> positions{};
+    std::array<Element, 2> magnitudes{};
+    const auto actual = detail::ProductCorrectionAccess::WeakCandidateR4(
+        code, input, positions, magnitudes);
+    EXPECT_EQ(actual.status, expected.status);
+    EXPECT_EQ(actual.error_count, expected.error_count);
+    auto repaired = input;
+    if (actual.status == CorrectionStatus::ok) {
+      for (size_t i = 0; i < actual.error_count; ++i) {
+        ASSERT_LT(positions[i], 256u);
+        repaired[positions[i]] ^= magnitudes[i];
+      }
+    }
+    EXPECT_EQ(repaired, reference);
+  };
+  // Invert the parity Vandermonde independently to synthesize moments
+  // (0,1,1,1+q), whose locator is X^2+X+q, for all 256 q.
+  for (unsigned q = 0; q < 259; ++q) {
+    std::array<std::array<Element, 5>, 4> matrix{};
+    for (size_t x = 0; x < 4; ++x) {
+      Element power = 1;
+      for (size_t j = 0; j < 4; ++j) {
+        matrix[j][x] = power;
+        power = gf2p8::MultiplyCantor(power, x);
+      }
+    }
+    matrix[1][4] = matrix[2][4] = 1;
+    matrix[3][4] = 1 ^ q;
+    if (q >= 256) {
+      // Inconsistent rank-one moments, repeated-root locator (a=0),
+      // and determinant zero with S0=0 but a nonzero higher moment.
+      const std::array<std::array<Element, 4>, 3> invalid{
+          {{1, 0, 0, 1}, {0, 1, 0, 0}, {0, 0, 0, 1}}};
+      for (size_t j = 0; j < 4; ++j) {
+        matrix[j][4] = invalid[q - 256][j];
+      }
+    }
+    for (size_t col = 0; col < 4; ++col) {
+      size_t pivot = col;
+      while (pivot < 4 && matrix[pivot][col] == 0) {
+        ++pivot;
+      }
+      ASSERT_LT(pivot, 4u);
+      std::swap(matrix[pivot], matrix[col]);
+      const auto inverse = gf2p8::InvCantor(matrix[col][col]);
+      for (auto& value : matrix[col]) {
+        value = gf2p8::MultiplyCantor(value, inverse);
+      }
+      for (size_t r = 0; r < 4; ++r) {
+        if (r == col) {
+          continue;
+        }
+        const auto factor = matrix[r][col];
+        for (size_t j = 0; j < 5; ++j) {
+          matrix[r][j] ^= gf2p8::MultiplyCantor(factor, matrix[col][j]);
+        }
+      }
+    }
+    auto row = original;
+    for (size_t j = 0; j < 4; ++j) {
+      row[252 + j] ^= matrix[j][4];
+    }
+    compare(row);
+    unsigned roots = 0;
+    for (unsigned x = 0; q < 256 && x < 256; ++x) {
+      roots += (gf2p8::MultiplyCantor(x, x) ^ x) == q;
+    }
+    std::array<size_t, 2> positions{};
+    std::array<Element, 2> magnitudes{};
+    const auto actual = detail::ProductCorrectionAccess::WeakCandidateR4(
+        code, row, positions, magnitudes);
+    EXPECT_EQ(actual.status, roots == 2 ? CorrectionStatus::ok
+                                        : CorrectionStatus::uncorrectable);
+  }
+  std::mt19937 random(0x4252);
+  compare(original);
+  for (size_t trial = 0; trial < 4096; ++trial) {
+    auto row = original;
+    for (size_t error = 0; error < 1 + trial % 9; ++error) {
+      row[random() % 256] ^= static_cast<Element>(1 + random() % 255);
+    }
+    compare(row);
+  }
+}
+
+TEST(ProductCode, R4EncodingAndTransactionalBinaryGate) {
+  StrongWeakRSProductCode code(4, 2, 256, 252);
+  auto row = Codeword(256, 252, 92);
+  std::vector<Element> block(code.BlockSize());
+  std::copy_n(row.begin(), 252, block.begin());
+  ASSERT_EQ(code.Encode(block, Backend::scalar), Status::ok);
+  EXPECT_TRUE(std::equal(row.begin(), row.end(), block.begin()));
+  EXPECT_TRUE(code.Correct(block).all_zero_syndromes);
+  for (bool binary : {false, true}) {
+    // Constant columns are valid strong codewords, protecting both targets.
+    // Disable anchors to isolate the all-or-nothing per-byte binary gate.
+    std::vector<Element> input(code.BlockSize());
+    for (size_t r = 0; r < 4; ++r) {
+      input[r * 256] = 1;
+      input[r * 256 + 255] = 7;
+    }
+    const auto before = input;
+    auto result = code.Correct(input, ProductDecodeOptions{2, false, binary});
+    EXPECT_EQ(result.weak_changed_symbols, binary ? 0u : 8u);
+    EXPECT_EQ(result.weak_changed_bits, binary ? 0u : 16u);
+    EXPECT_EQ(input, binary ? before : std::vector<Element>(code.BlockSize()));
+    input = before;
+    result = code.Correct(input, ProductDecodeOptions{2, true, binary});
+    EXPECT_EQ(input, before);
+    EXPECT_EQ(result.changed_symbols, 0u);
+  }
+  std::vector<Element> input(code.BlockSize());
+  for (size_t r = 0; r < 4; ++r) {
+    input[r * 256] = 1;
+  }
+  input[255] = input[511] = 1;
+  const auto before = input;
+  // Only the first target column is protected. Reject both repairs in rows
+  // 0/1, rather than committing the unprotected half of each candidate.
+  auto result = code.Correct(input, ProductDecodeOptions{2, true, true});
+  EXPECT_EQ(input, before);
+  EXPECT_EQ(result.changed_symbols, 0u);
+  result = code.Correct(input, ProductDecodeOptions{2, false, true});
+  EXPECT_EQ(input, std::vector<Element>(code.BlockSize()));
+  EXPECT_EQ(result.weak_changed_symbols, 6u);
+  EXPECT_EQ(result.weak_changed_bits, 6u);
+}
+
 TEST(ProductCode, SystematicEncodingScalarAgreementAndAllComponentValidity) {
   for (const auto [ns, ks, nw, kw] : {std::array<size_t, 4>{4, 2, 8, 6},
                                       {16, 12, 16, 14},
@@ -633,6 +800,8 @@ TEST(ProductCode, InitialBatchChoicesMatchSingleOutputsAndAllCounters) {
                           {32, 28, 33, 31},
                           {32, 28, 65, 63},
                           {32, 16, 64, 62},
+                          {4, 2, 256, 252},
+                          {256, 224, 256, 252},
                           {256, 224, 175, 173},
                           {256, 224, 256, 254}}) {
     const auto [ns, ks, nw, kw] = dims;

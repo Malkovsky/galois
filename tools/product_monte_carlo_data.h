@@ -156,9 +156,10 @@ struct Settings {
   void Validate() const {
     Require(n1 <= 256 && std::has_single_bit(n1) && k1 < n1 && n1 - k1 >= 2 &&
                 n1 - k1 <= k1 && std::has_single_bit(n1 - k1) && n2 <= 256 &&
-                k2 >= 2 && k2 < n2 && n2 - k2 == 2,
+                k2 >= 2 && k2 < n2 &&
+                (n2 - k2 == 2 || (n2 == 256 && k2 == 252)),
             "invalid dimensions: strong N,R powers of two, N<=256, 2<=R<=K; "
-            "weak N<=256, K>=2, R=2 (shortening supported)");
+            "weak N<=256, K>=2, R=2 (shortening supported), or RS(256,252)");
     Require(lo <= hi && hi <= FullBits(),
             "require 0 <= minimum <= maximum <= 8*n1*n2; set smaller explicit "
             "flip bounds for small codes (defaults 2500..2700 are not capped)");

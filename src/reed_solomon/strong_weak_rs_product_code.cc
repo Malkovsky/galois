@@ -93,11 +93,13 @@ StrongWeakRSProductCode::StrongWeakRSProductCode(size_t strong_n,
       weak_n_(weak_n),
       weak_k_(weak_k),
       valid_(Aligned(strong_n, strong_k) && weak_n <= 256 && weak_k >= 2 &&
-             weak_k < weak_n && weak_n - weak_k == 2),
+             weak_k < weak_n &&
+             (weak_n - weak_k == 2 || (weak_n == 256 && weak_k == 252))),
       strong_encoder_(valid_ ? strong_k : 0, valid_ ? strong_n - strong_k : 0),
       weak_encoder_(valid_ ? weak_k : 0, valid_ ? weak_n - weak_k : 0),
       strong_decoder_(valid_ ? strong_k : 0, valid_ ? strong_n - strong_k : 0),
-      weak_decoder_(valid_ ? std::bit_ceil(weak_n) - 2 : 0, valid_ ? 2 : 0) {}
+      weak_decoder_(valid_ ? std::bit_ceil(weak_n) - (weak_n - weak_k) : 0,
+                    valid_ ? weak_n - weak_k : 0) {}
 
 bool StrongWeakRSProductCode::Valid() const {
   return valid_ && strong_encoder_.Valid() && weak_encoder_.Valid() &&
@@ -117,7 +119,24 @@ lch::Status StrongWeakRSProductCode::Encode(std::span<Element> block,
   std::array<const Element*, 256> data{};
   std::array<Element*, 256> recovery{};
   std::vector<Element> workspace(strong_encoder_.WorkspaceSize(weak_n_));
+  std::vector<Element> weak_workspace(
+      weak_n_ - weak_k_ == 4 ? weak_encoder_.WorkspaceSize(1) : 0);
   for (size_t row = 0; row < strong_k_; ++row) {
+    if (weak_n_ - weak_k_ == 4) {
+      for (size_t j = 0; j < weak_k_; ++j) {
+        data[j] = &candidate[row * weak_n_ + j];
+      }
+      for (size_t j = 0; j < 4; ++j) {
+        recovery[j] = &candidate[row * weak_n_ + weak_k_ + j];
+      }
+      const auto status = weak_encoder_.Encode(std::span(data).first(weak_k_),
+                                               std::span(recovery).first(4), 1,
+                                               weak_workspace, backend);
+      if (status != lch::Status::ok) {
+        return status;
+      }
+      continue;
+    }
     const auto [s0, s1] =
         WeakDataSyndromes(std::span(candidate).subspan(row * weak_n_, weak_k_));
     candidate[row * weak_n_ + weak_k_] = s0;
@@ -154,6 +173,88 @@ ProductCorrectionResult StrongWeakRSProductCode::Correct(
                                ? 2
                                : 0;
   return CorrectImpl(block, options, batches, true, true);
+}
+
+CorrectionResult StrongWeakRSProductCode::WeakCandidateR4(
+    std::span<const Element> row,
+    std::array<size_t, 2>& positions,
+    std::array<Element, 2>& magnitudes,
+    bool locate) const {
+  // Full-field evaluation code: parity at native 0..3, data at 4..255.
+  // These are ordinary power moments, not the novel-basis syndrome entries.
+  const auto& tables = Tables().shuffle;
+  const auto mul = [&](Element a, Element b) -> Element {
+    return tables[a][b & 15] ^ tables[a][32 + (b >> 4)];
+  };
+  std::array<Element, 4> s{};
+  for (size_t pos = 0; pos < 256; ++pos) {
+    const Element x = static_cast<Element>((pos + 4) % 256);
+    Element value = row[pos];
+    for (size_t j = 0; j < 4; ++j) {
+      s[j] ^= value;
+      if (j != 3) {
+        value = mul(value, x);
+      }
+    }
+  }
+  if (s == std::array<Element, 4>{}) {
+    return {CorrectionStatus::ok, 0};
+  }
+  const CorrectionResult failure{CorrectionStatus::uncorrectable, 0};
+  if (!locate) {
+    return failure;
+  }
+  const Element determinant = mul(s[1], s[1]) ^ mul(s[0], s[2]);
+  std::array<Element, 2> roots{};
+  size_t count = 1;
+  if (determinant == 0) {
+    if (s[0] == 0) {
+      return failure;
+    }
+    roots[0] = mul(s[1], InvCantor(s[0]));
+    magnitudes[0] = s[0];
+  } else {
+    const Element inverse = InvCantor(determinant);
+    const Element a = mul(mul(s[1], s[2]) ^ mul(s[0], s[3]), inverse);
+    const Element b = mul(mul(s[1], s[3]) ^ mul(s[2], s[2]), inverse);
+    if (a == 0) {
+      return failure;  // Repeated roots cannot describe two errors.
+    }
+    // -1 distinguishes insoluble values from the valid representative zero.
+    static const auto artin_schreier = [] {
+      std::array<int16_t, 256> result{};
+      result.fill(-1);
+      for (unsigned y = 0; y < 256; ++y) {
+        result[MultiplyCantor(y, y) ^ y] = static_cast<int16_t>(y);
+      }
+      return result;
+    }();
+    const Element inv_a = InvCantor(a);
+    const int y = artin_schreier[mul(b, mul(inv_a, inv_a))];
+    if (y < 0) {
+      return failure;
+    }
+    roots[0] = mul(a, static_cast<Element>(y));
+    roots[1] = roots[0] ^ a;
+    magnitudes[0] = mul(s[1] ^ mul(s[0], roots[1]), inv_a);
+    magnitudes[1] = s[0] ^ magnitudes[0];
+    count = 2;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    if (magnitudes[i] == 0) {
+      return failure;
+    }
+    positions[i] = roots[i] < 4 ? 252 + roots[i] : roots[i] - 4;
+    Element value = magnitudes[i];
+    for (size_t j = 0; j < 4; ++j) {
+      s[j] ^= value;
+      value = mul(value, roots[i]);
+    }
+  }
+  if (s != std::array<Element, 4>{}) {
+    return failure;
+  }
+  return {CorrectionStatus::ok, count};
 }
 
 CorrectionResult StrongWeakRSProductCode::WeakCandidate(
@@ -207,7 +308,7 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
       (optimizations & 1) && lch::BackendAvailable(lch::Backend::avx2);
 #endif
   const size_t mother_n = std::bit_ceil(weak_n_);
-  const size_t mother_k = mother_n - 2;
+  const size_t mother_k = mother_n - (weak_n_ - weak_k_);
   const auto weak_position = [&](size_t pos) {
     return pos < weak_k_ ? pos : mother_k + pos - weak_k_;
   };
@@ -320,27 +421,39 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
           ++result.weak_lines_visited;
         }
         if (!strong && direct_weak) {
-          size_t position = 0;
-          Element magnitude = 0;
+          std::array<size_t, 2> positions{};
+          std::array<Element, 2> magnitudes{};
           const auto correction =
-              WeakCandidate(block.subspan(line * weak_n_, weak_n_), position,
-                            magnitude, true, optimizations & 2);
+              weak_n_ - weak_k_ == 4
+                  ? WeakCandidateR4(block.subspan(line * weak_n_, weak_n_),
+                                    positions, magnitudes)
+                  : WeakCandidate(block.subspan(line * weak_n_, weak_n_),
+                                  positions[0], magnitudes[0], true,
+                                  optimizations & 2);
           auto& clean = clean_rows[line];
           clean = correction.status == CorrectionStatus::ok &&
                   correction.error_count == 0;
           if (correction.status != CorrectionStatus::ok || clean) {
             continue;
           }
-          const auto bits = std::popcount(static_cast<unsigned>(magnitude));
-          if ((options.use_anchors && protected_columns[position]) ||
-              (options.use_binary_image && bits > 2)) {
+          bool accept = true;
+          for (size_t i = 0; i < correction.error_count; ++i) {
+            if ((options.use_anchors && protected_columns[positions[i]]) ||
+                (options.use_binary_image &&
+                 std::popcount(static_cast<unsigned>(magnitudes[i])) > 2)) {
+              accept = false;
+            }
+          }
+          if (!accept) {
             continue;
           }
-          block[line * weak_n_ + position] ^= magnitude;
-          bit_changes += bits;
-          ++changes;
-          next[position] = true;
-          clean_columns[position] = false;
+          for (size_t i = 0; i < correction.error_count; ++i) {
+            block[line * weak_n_ + positions[i]] ^= magnitudes[i];
+            bit_changes += std::popcount(static_cast<unsigned>(magnitudes[i]));
+            ++changes;
+            next[positions[i]] = true;
+            clean_columns[positions[i]] = false;
+          }
           clean = true;
           continue;
         }
@@ -382,7 +495,7 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
           continue;
         }
         if (!strong) {
-          if (correction.error_count != 1) {
+          if (correction.error_count > (weak_n_ - weak_k_) / 2) {
             continue;
           }
           bool accept = true;
@@ -440,11 +553,15 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
         continue;
       }
       if (!strong && direct_weak) {
-        size_t position = 0;
-        Element magnitude = 0;
+        std::array<size_t, 2> positions{};
+        std::array<Element, 2> magnitudes{};
         const auto check =
-            WeakCandidate(block.subspan(line * weak_n_, weak_n_), position,
-                          magnitude, false, optimizations & 2);
+            weak_n_ - weak_k_ == 4
+                ? WeakCandidateR4(block.subspan(line * weak_n_, weak_n_),
+                                  positions, magnitudes, false)
+                : WeakCandidate(block.subspan(line * weak_n_, weak_n_),
+                                positions[0], magnitudes[0], false,
+                                optimizations & 2);
         if (check.status != CorrectionStatus::ok || check.error_count != 0) {
           result.all_zero_syndromes = false;
         }

@@ -1,5 +1,198 @@
 # Strong-Weak Reed-Solomon Product Code Acceleration Report
 
+## Applied R=4 Weak Code (2026-09-10)
+
+**Implemented and retained:** `StrongWeakRSProductCode(256,224,256,252)` now
+encodes and corrects with a direct two-error weak decoder. This section supersedes
+the earlier statements that R=4 was deferred. Strong kernels and behavior are
+unchanged. Default construction remains 256/224 x 256/254, and all existing R=2
+shortenings, including 175/173, retain their coordinate mapping and behavior.
+R=4 support is deliberately restricted to full RS(256,252); smaller or shortened
+R=4 codes, including the low-rate K=R boundary, are rejected rather than assumed
+equivalent. Other already-supported strong dimensions can use this full weak code.
+
+### Exact Native Parity Checks
+
+All arithmetic below is in native Cantor GF(256); addition is XOR. Public weak
+rows are `[252 data][4 parity]`. Native evaluation points for public data index
+`j` are `j+4`, and parity index `252+i` has point `i`. Thus public index `p`
+maps to native byte `(p+4) mod 256`. This is an index permutation, not field
+addition by integer 4.
+
+The full native LCH code is evaluation of polynomials of degree at most 251.
+Changing from its monic novel basis to ordinary monomials preserves that
+polynomial space. For the full field, the vanishing polynomial is
+\(P(X)=X^{256}+X\), with \(P'(X)=1\). Consequently all dual evaluation weights
+are one. Equivalently, \(\sum_{x\in GF(256)}x^m=0\) for \(0\leq m\leq254\),
+including \(m=0\), since 256 is zero in characteristic two. Therefore these
+four ordinary power moments vanish on every encoded row:
+
+\[
+ S_j=\sum_x c(x)x^j,\qquad j=0,1,2,3.
+\]
+
+The four check rows have rank four: a nonzero polynomial of degree at most
+three cannot vanish at all 256 distinct points. Their kernel thus has dimension
+252 and is **exactly** the native code, not merely a necessary validity test.
+These moments are not asserted to be the individual novel-basis syndrome
+entries used internally by generic FDMA. They are an independent complete
+parity-check system for the same code. Scalar LCH encoding and the untouched
+generic `CorrectCodeword(LCHDecoder(252,4), ...)` supply independent checks.
+
+### Locator, Magnitudes, and Degeneracies
+
+For errors at distinct points \(x_1,x_2\) with nonzero magnitudes \(e_1,e_2\),
+\(S_j=e_1x_1^j+e_2x_2^j\). Write the locator as
+\(L(X)=X^2+aX+b\), where \(a=x_1+x_2\) and \(b=x_1x_2\). Its recurrence gives
+
+\[
+ \begin{pmatrix}S_1&S_0\\S_2&S_1\end{pmatrix}
+ \begin{pmatrix}a\\b\end{pmatrix}
+ =\begin{pmatrix}S_2\\S_3\end{pmatrix},\qquad
+ D=S_1^2+S_0S_2=e_1e_2(x_1+x_2)^2.
+\]
+
+Thus a genuine two-error pattern always has nonzero determinant, even when
+equal magnitudes make \(S_0=0\). No division by \(S_0\) occurs on this branch:
+
+\[
+ a=(S_1S_2+S_0S_3)/D,\qquad
+ b=(S_1S_3+S_2^2)/D.
+\]
+
+For \(a\ne0\), substitute \(X=ay\) and solve
+\(y^2+y=b/a^2\). The Artin-Schreier map has kernel \(\{0,1\}\) and its
+128-element image consists exactly of trace-zero field elements. A private
+512-byte immutable table stores a representative for each solvable value and
+`-1` for insoluble values, keeping solvable zero distinct from failure. It is
+generated once, thread-safely, using native `MultiplyCantor`; there is no global
+mutable field setup or large multiplication table. The roots are \(ay\) and
+\(ay+a\), and their magnitudes are
+
+\[
+ e_1=(S_1+S_0x_2)/a,\qquad e_2=S_0+e_1.
+\]
+
+The implementation handles every branch explicitly:
+
+- All four moments zero: already a codeword, not proof of original content.
+- Nonzero syndrome with `D=0`: require `S0!=0`, propose `e=S0`, `x=S1/S0`,
+  and verify all four moments. Rank-one-looking but inconsistent moments fail.
+- `D!=0` with `a=0`: reject the repeated-root locator; square roots cannot
+  produce two distinct error positions.
+- Insoluble quadratic or zero proposed magnitude: reject.
+- For either candidate size, XOR its contribution out of all four moments and
+  require zero before reporting success. No input bytes are modified here.
+
+All byte-valued roots belong to this full mother code; there are no omitted
+positions. That fact is specific to the retained full-length R=4 scope. The
+existing R=2 virtual-position rejection remains unchanged. Distance five makes
+a candidate within radius two unique, but over-radius received words can still
+lie within radius two of a different codeword. The direct and generic paths
+preserve that BDD behavior; neither promises detection of all larger errors.
+
+### Integration and Coverage
+
+`WeakCandidateR4` in `src/reed_solomon/strong_weak_rs_product_code.cc` performs
+three native table products per received symbol to accumulate four moments.
+It performs no weak transposition or full candidate copy, and final weak
+validation requests moments only, without locator solving. R=4 encoding uses
+the existing `LCHEncoder(252,4)` on each information row before the unchanged
+strong encode; no closed-form encoder speedup is claimed.
+
+The scheduler checks **every** proposed byte against the optional binary-image
+gate (`popcount(delta)<=2`) and its protected column before committing **any**
+byte in that row. Rejection is transactional for the entire candidate. Accepted
+writes update exact bit/symbol counters, invalidate intersecting column validity,
+and activate those columns. Generic reference scheduling now accepts one or two
+weak repairs for R=4 while R=2 still accepts only one.
+
+Tests cover 65,280 single errors; all 32,640 position pairs with magnitudes
+`(1,1)` and `(3,128)`; every normalized Artin-Schreier input, both soluble and
+insoluble; explicit inconsistent rank-one and repeated-root cases; and 4,096
+random one-through-nine-injection comparisons against generic BDD. Exhaustive
+position tests use independently scalar-encoded nonzero rows as their oracle.
+All Artin-Schreier and randomized cases compare generic status, count, and full
+output. Product scheduler differential coverage includes strong 4/2 and 256/224
+with weak 256/252, all gate combinations, caps 2/3/4/5/6/16, generic single and
+batch paths, public direct correction, and every retained optimization bitset.
+It compares final bytes, independent component validity, and every result field.
+Dedicated tests reject both repairs if only one delta exceeds two bits or only
+one target is protected, including data/parity targets.
+
+Native CLI dimension validation/help, atomic summary metadata, report/replay,
+and plotting accept the new dimensions without changing schema or old defaults.
+R=2 and R=4 reports never pool into one code group. Random-message native trials
+already route nondefault dimensions through `code->Encode`, so the legacy
+default-only R=2 encoder helper requires no change. Extended tests check this
+route against all-zero trials, all gate combinations and saved-position replay.
+Floyd remains thread-count reproducible; Fisher-Yates intentionally retains
+worker-local permutations and is tested by saved-position replay instead.
+
+```cpp
+gf2p8::rs::StrongWeakRSProductCode code(256, 224, 256, 252);
+// code.Encode(block), then code.Correct(block, options), as before.
+```
+
+```bash
+rs-product-monte-carlo --output /tmp/kilo/mc-r4 --n2 256 --k2 252 --seed 42 --batches 1 --batch-size 64 --threads 1
+```
+
+### Matched R=4 Measurements
+
+AMD Ryzen 7 8845HS, WSL2, GCC 13.3.0, Google Benchmark 1.9.4, Release
+`-O3 -DNDEBUG`. Native uses `-march=native`; AVX2-only disables GFNI and AVX-512.
+Runs were CPU-0 pinned, sequential, three randomly interleaved repetitions of
+at least 0.3s, with `CPP_JOBS=2`. Process inspection showed active editor indexing
+and agent processes, but no Monte Carlo worker. Nothing was killed or re-pinned.
+Host load and clocks are uncontrolled; these are bounded local measurements,
+not Intel-host or multithread scaling evidence.
+
+Both rows use the same 64-block BSC(0.005) corpus, seed `0x5b5c0224`, strong
+256/224, weak 256/252, cap 16, both gates enabled. Corpus setup compares every
+output byte and result field with generic scalar/full-validation scheduling.
+Timing includes correction and final validity, excludes encode/reset/accounting,
+and normalizes to **224*252 = 56,448 information bytes per block**.
+
+| Profile | Generic batch CPU ms / 64 blocks | Direct CPU ms / 64 blocks | Generic MiB/s | Direct MiB/s | Throughput gain | Generic / direct CPU CV |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native | 20.290 | 17.756 | 169.801 | 194.033 | 14.3% | 0.48% / 2.30% |
+| AVX2-only | 23.501 | 20.852 | 146.600 | 165.230 | 12.7% | 3.38% / 0.34% |
+
+All measured corpus residual bits and message/block/validity/valid-wrong/pass-limit
+failures were zero. Both paths had mean 3.734375 passes, 262.218750 strong lines,
+258.765625 weak lines, 2570.328125 byte writes and 2615.734375 bit toggles;
+weak-only writes/toggles were 103.453125/105.453125. These are corpus results,
+not error-floor estimates. R=2 numbers elsewhere describe a different code and
+are not the denominator of these speedup claims. No new instruction-count,
+assembly-model, or isolated arithmetic throughput claim is made.
+
+Reproduction, with exported `CPP_JOBS=2 CPP_BENCH_CPU=0`,
+`BENCHMARK_OUT_FORMAT=json` and distinct `BENCHMARK_OUT` paths:
+
+```bash
+/home/user/.config/kilo/scripts/cpp-bench native matrix '^LCH/Owned/StrongWeakRSProductCode/R4/(Direct|Generic)256252$' 3 0.3s
+/home/user/.config/kilo/scripts/cpp-bench avx2 matrix '^LCH/Owned/StrongWeakRSProductCode/R4/(Direct|Generic)256252$' 3 0.3s
+```
+
+Artifacts: `/tmp/kilo/product-r4-native.json` and
+`/tmp/kilo/product-r4-avx2.json`. `/check quick` passed portable and native
+unfiltered CTest suites; `/check avx2` passed its unfiltered suite. Focused
+ASan/UBSan `/check sanitize` with
+`GTEST_FILTER='ProductCode.*:WholeCodewordBatch.*'` passed (204.40s selected RS
+tests, 268.02s total including CLI/legacy/plot integration). This sanitizer run
+excludes unrelated GTest suites and is not described as a full sanitizer pass.
+`/check cli` passed all seven tests, including the unrelated fragmenter CLI.
+`/check fallback` passed; because that wrapper omits the product source, these
+additional strict compilations also passed:
+
+```bash
+g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I include -I src -mno-avx2 -mno-ssse3 -mno-gfni -mno-avx512f -mno-avx512bw -c src/reed_solomon/strong_weak_rs_product_code.cc -o /tmp/kilo/product-r4-scalar.o
+g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I include -I src -mavx2 -mssse3 -mno-gfni -mno-avx512f -mno-avx512bw -c src/reed_solomon/strong_weak_rs_product_code.cc -o /tmp/kilo/product-r4-avx2.o
+```
+
+Formatting uses clang-format 18.1.3; `git diff --check` passed. No commits made.
+
 ## Post-Profile Experiments (2026-09-10)
 
 All three requested experiments were implemented, differentially tested and

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include "reed_solomon/error_correction.h"
 #include "reed_solomon/lch_encoder.h"
 
@@ -52,6 +54,8 @@ struct ProductCorrectionResult {
  * Weak R=2, K>=2, N<=256 may be shortened from nextPow2(N): omitted data
  * [K,nextPow2(N)-2) are known zeros. Public rows remain compact [data][parity].
  * Mother-code candidates changing any omitted zero are rejected in full.
+ * Weak RS(256,252) is also supported, with two-error BDD; other R=4
+ * dimensions are not supported.
  * Const operations may share one code instance concurrently when each call owns
  * a distinct block; all mutable scratch is local to the call.
  */
@@ -87,7 +91,8 @@ class StrongWeakRSProductCode {
                      lch::Backend backend = lch::Backend::tuned) const;
 
   /**
-   * @brief Applies alternating strong BDD and gated weak single-error passes.
+   * @brief Applies alternating strong BDD and gated weak bounded-distance
+   * passes.
    * @param block Exactly BlockSize() mutable symbols.
    * @param max_directional_passes Cap counting each direction separately; >=2.
    * @return Termination, pass/work counts, and final all-component validity.
@@ -97,8 +102,8 @@ class StrongWeakRSProductCode {
    * (including the initial weak pass), or the cap; no-change takes precedence.
    * Strong success, including zero syndromes, protects that column; failure
    * leaves its bytes unchanged and unprotects it. Unvisited protection
-   * persists. Weak candidates commit only for one changed symbol with
-   * popcount(old XOR new)<=2 in an unprotected column; rejected rows are
+   * persists. Weak candidates commit only for 1..Rweak/2 changed symbols, each
+   * with popcount(old XOR new)<=2 in an unprotected column; rejected rows are
    * unchanged. Protection changes alone never activate lines. Accepted repairs
    * are retained at exit; the entire iterative operation is not transactional.
    * Invalid arguments leave the block untouched. Validity is checked separately
@@ -114,7 +119,7 @@ class StrongWeakRSProductCode {
    * @param options Pass cap and optional anchor and binary-image gates.
    * @return Termination, pass/work counts, and final all-component validity.
    * @details Uses the same scheduling and stopping rules as the cap overload.
-   * Weak BDD always requires exactly one changed symbol. Disabling anchors
+   * Weak BDD accepts one error for R=2 and up to two for R=4. Disabling anchors
    * bypasses only target-column protection; disabling binary image bypasses
    * only the two-bit delta limit. Every accepted write still invalidates
    * intersecting cached validity and activates the next direction.
@@ -124,6 +129,18 @@ class StrongWeakRSProductCode {
 
  private:
   friend struct detail::ProductCorrectionAccess;
+  /**
+   * @brief Verifies or locates up to two errors in a full RS(256,252) row.
+   * @param row Compact 256-symbol row, never modified.
+   * @param positions Public repair positions, valid only on success.
+   * @param magnitudes Nonzero XOR deltas, valid only on success.
+   * @param locate False requests only four-moment zero validation.
+   * @return Clean, verified one/two-error candidate, or uncorrectable.
+   */
+  CorrectionResult WeakCandidateR4(std::span<const Element> row,
+                                   std::array<size_t, 2>& positions,
+                                   std::array<Element, 2>& magnitudes,
+                                   bool locate = true) const;
   ProductCorrectionResult CorrectImpl(std::span<Element> block,
                                       ProductDecodeOptions options,
                                       unsigned batch_passes,
