@@ -9,7 +9,7 @@
     {
       "name": "experimental",
       "displayName": "Experimental Tools",
-      "description": "Native Release build of the RS product Monte Carlo tool",
+      "description": "Native Release build of the RS product Monte Carlo and fixture tools",
       "binaryDir": "${sourceDir}/build/experimental-preset",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
@@ -82,7 +82,8 @@
       "displayName": "Build Experimental Tools",
       "configurePreset": "experimental",
       "targets": [
-        "rs-product-monte-carlo"
+        "rs-product-monte-carlo",
+        "rs-product-test"
       ]
     },
     {

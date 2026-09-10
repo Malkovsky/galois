@@ -88,9 +88,7 @@ if(GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT)
     GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT=1)
 endif()
 
-if(GF256_BUILD_MONTE_CARLO)
-  find_package(Threads REQUIRED)
-  find_package(OpenSSL 3 REQUIRED COMPONENTS Crypto)
+if(GF256_BUILD_MONTE_CARLO OR GF256_BUILD_TOOLS OR GF256_BUILD_TESTS)
   FetchContent_Declare(nlohmann_json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
     GIT_TAG v3.12.0
@@ -98,6 +96,18 @@ if(GF256_BUILD_MONTE_CARLO)
   set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
   set(JSON_Install OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(nlohmann_json)
+endif()
+
+if(GF256_BUILD_MONTE_CARLO OR GF256_BUILD_TOOLS OR GF256_BUILD_TESTS)
+  add_executable(rs-product-test tools/rs_product_test.cc)
+  target_link_libraries(rs-product-test PRIVATE gf256_core nlohmann_json::nlohmann_json)
+  include(GNUInstallDirs)
+  install(TARGETS rs-product-test
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT product-test)
+endif()
+
+if(GF256_BUILD_MONTE_CARLO)
+  find_package(Threads REQUIRED)
   add_library(product_monte_carlo_trials OBJECT tools/product_monte_carlo_native.cc)
   target_link_libraries(product_monte_carlo_trials PRIVATE gf256_core)
   set_target_properties(product_monte_carlo_trials PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -106,7 +116,7 @@ if(GF256_BUILD_MONTE_CARLO)
   endif()
   add_executable(rs-product-monte-carlo tools/product_monte_carlo.cc)
   target_link_libraries(rs-product-monte-carlo PRIVATE product_monte_carlo_trials
-    gf256_core Threads::Threads OpenSSL::Crypto nlohmann_json::nlohmann_json)
+    gf256_core Threads::Threads nlohmann_json::nlohmann_json)
   include(GNUInstallDirs)
   install(TARGETS rs-product-monte-carlo
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT product-monte-carlo)
@@ -164,6 +174,11 @@ endif()
 if(GF256_BUILD_TESTS)
   FetchContent_MakeAvailable(googletest)
   enable_testing()
+  find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME RSProductTestCli
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/rs_product_test.py
+      $<TARGET_FILE:rs-product-test>)
+  set_tests_properties(RSProductTestCli PROPERTIES TIMEOUT 60)
 
   add_executable(gf_unittests tests/field_tests.cc)
   target_link_libraries(gf_unittests PRIVATE gf256_core gtest gtest_main)
@@ -201,7 +216,7 @@ if(GF256_BUILD_TESTS)
     add_executable(product_monte_carlo_fault_cli tools/product_monte_carlo.cc)
     target_compile_definitions(product_monte_carlo_fault_cli PRIVATE GF256_MC_TEST_HOOKS=1)
     target_link_libraries(product_monte_carlo_fault_cli PRIVATE product_monte_carlo_trials
-      gf256_core Threads::Threads OpenSSL::Crypto nlohmann_json::nlohmann_json)
+      gf256_core Threads::Threads nlohmann_json::nlohmann_json)
     add_test(NAME ProductMonteCarloCli
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/product_monte_carlo_test.py
               ${PROJECT_BINARY_DIR}/rs-product-monte-carlo)

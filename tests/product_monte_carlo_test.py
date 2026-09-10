@@ -424,6 +424,14 @@ class NativeTest(unittest.TestCase):
         seed = self.read(path, "metadata.json")["settings"]["root seed"]
         self.assertTrue(0 <= seed < 2**64)
         self.assertIn(f"root seed={seed}", (path / "progress.log").read_text())
+        generated = self.root / "generated-again"
+        self.invoke("--output", generated, "--batches", 1, "--batch-size", 1,
+                    "--minimum-flipped-bits", 0, "--maximum-flipped-bits", 0, env=env)
+        other_seed = self.read(generated, "metadata.json")["settings"]["root seed"]
+        self.assertTrue(0 <= other_seed < 2**64)
+        self.assertNotEqual(seed, other_seed)
+        self.invoke("--report", path)
+        self.assertEqual(seed, self.read(path, "metadata.json")["settings"]["root seed"])
         before = (path / "summary.json").read_bytes()
         self.invoke("--output", path, success=False)
         self.assertEqual(before, (path / "summary.json").read_bytes())

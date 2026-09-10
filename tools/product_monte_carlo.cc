@@ -1,10 +1,9 @@
 #include <fcntl.h>
-#include <openssl/evp.h>
-#include <openssl/rand.h>
 #include <sys/file.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -22,6 +21,7 @@
 #include <utility>
 
 #include "product_monte_carlo_data.h"
+#include "product_monte_carlo_sha256.h"
 #include "product_monte_carlo_trials.h"
 
 namespace mc {
@@ -131,14 +131,36 @@ void AtomicJson(const fs::path& path, const Json& value) {
   SyncDirectory(path.parent_path());
 }
 std::string Hash(std::string_view data) {
-  std::string result(32, '\0');
-  unsigned size = 0;
-  Require(EVP_Digest(data.data(), data.size(),
-                     reinterpret_cast<unsigned char*>(result.data()), &size,
-                     EVP_sha256(), nullptr) == 1 &&
-              size == 32,
-          "OpenSSL SHA256 failed");
-  return result;
+  const auto digest =
+      Sha256({reinterpret_cast<const uint8_t*>(data.data()), data.size()});
+  return {reinterpret_cast<const char*>(digest.data()), digest.size()};
+}
+uint64_t RandomSeed() {
+  int fd;
+  do {
+    fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "open /dev/urandom");
+  }
+  uint64_t seed;
+  auto bytes = std::span(reinterpret_cast<unsigned char*>(&seed), sizeof(seed));
+  while (!bytes.empty()) {
+    const auto n = ::read(fd, bytes.data(), bytes.size());
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n <= 0) {
+      const int error = n < 0 ? errno : EIO;
+      ::close(fd);
+      throw std::system_error(error, std::generic_category(),
+                              "read /dev/urandom");
+    }
+    bytes = bytes.subspan(static_cast<size_t>(n));
+  }
+  ::close(fd);
+  return seed;
 }
 std::string Hex(std::string_view data) {
   constexpr char digits[] = "0123456789abcdef";
@@ -1006,9 +1028,7 @@ int Main(int argc, char** argv) {
   s.Validate();
   Require(sampler == "floyd" || sampler == "fisher-yates", "invalid sampler");
   if (!seeded) {
-    Require(RAND_bytes(reinterpret_cast<unsigned char*>(&s.seed),
-                       sizeof(s.seed)) == 1,
-            "OpenSSL random seed generation failed");
+    s.seed = RandomSeed();
   }
   Require(fs::create_directory(directory),
           "output directory must not already exist");
