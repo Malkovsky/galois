@@ -228,17 +228,17 @@ size_t PublicPosition(CodeFamily family,
                                           : native_position - recovery_count;
 }
 
-CorrectionStatus RecoverDataWithEvaluator(
-    CodeFamily family,
-    std::span<Element> data,
-    std::span<const Element> recovery,
-    size_t recovery_count,
-    std::span<const uint8_t> root_positions,
-    const Values& locator_samples,
-    const Values& locator_coefficients,
-    size_t locator_degree,
-    const Values& syndrome_samples,
-    const MultiplicationTables& tables) {
+CorrectionStatus RecoverWithEvaluator(CodeFamily family,
+                                      std::span<Element> data,
+                                      std::span<const Element> recovery,
+                                      std::span<Element> mutable_recovery,
+                                      size_t recovery_count,
+                                      std::span<const uint8_t> root_positions,
+                                      const Values& locator_samples,
+                                      const Values& locator_coefficients,
+                                      size_t locator_degree,
+                                      const Values& syndrome_samples,
+                                      const MultiplicationTables& tables) {
   const size_t data_count = data.size();
   const size_t codeword_size = data_count + recovery_count;
   const size_t correction_radius = recovery_count / 2;
@@ -369,6 +369,8 @@ CorrectionStatus RecoverDataWithEvaluator(
         PublicPosition(family, data_count, recovery_count, position);
     if (data_position < data_count) {
       data[data_position] ^= corrections[position];
+    } else if (!mutable_recovery.empty()) {
+      mutable_recovery[data_position - data_count] ^= corrections[position];
     }
   }
   return CorrectionStatus::ok;
@@ -376,10 +378,11 @@ CorrectionStatus RecoverDataWithEvaluator(
 
 }  // namespace
 
-CorrectionResult CorrectOne(const LCHDecoder& decoder,
-                            std::span<Element> data,
-                            std::span<const Element> recovery,
-                            std::span<uint8_t> error_mask) {
+static CorrectionResult CorrectOneImpl(const LCHDecoder& decoder,
+                                       std::span<Element> data,
+                                       std::span<const Element> recovery,
+                                       std::span<uint8_t> error_mask,
+                                       std::span<Element> mutable_recovery) {
   if (RangesOverlap(error_mask, data) || RangesOverlap(error_mask, recovery)) {
     return Result(CorrectionStatus::invalid_argument);
   }
@@ -636,7 +639,10 @@ CorrectionResult CorrectOne(const LCHDecoder& decoder,
   }
 
   CorrectionStatus recovery_status = CorrectionStatus::ok;
-  if (has_data_error && root_count == 1) {
+  // Whole-codeword mode verifies every candidate, including parity-only roots.
+  // Retain the existing data-only fast path for CorrectOne/CorrectBatch
+  // callers.
+  if (has_data_error && root_count == 1 && mutable_recovery.empty()) {
     // Every aligned R-point native Cantor IFFT has unit leading Lagrange
     // coefficient. Therefore the highest syndrome coefficient is the error
     // magnitude when exactly one error is present.
@@ -644,9 +650,9 @@ CorrectionResult CorrectOne(const LCHDecoder& decoder,
     const size_t data_index = PublicPosition(parameters.family, data_count,
                                              recovery_count, root_positions[0]);
     data[data_index] ^= magnitude;
-  } else if (has_data_error) {
-    recovery_status = RecoverDataWithEvaluator(
-        parameters.family, data, recovery, recovery_count,
+  } else if (has_data_error || !mutable_recovery.empty()) {
+    recovery_status = RecoverWithEvaluator(
+        parameters.family, data, recovery, mutable_recovery, recovery_count,
         std::span(root_positions).first(root_count), locator_samples,
         locator_coefficients, locator_degree, syndrome_samples, tables);
   }
@@ -661,4 +667,28 @@ CorrectionResult CorrectOne(const LCHDecoder& decoder,
   return Result(CorrectionStatus::ok, root_count);
 }
 
+CorrectionResult CorrectOne(const LCHDecoder& decoder,
+                            std::span<Element> data,
+                            std::span<const Element> recovery,
+                            std::span<uint8_t> error_mask) {
+  return CorrectOneImpl(decoder, data, recovery, error_mask, {});
+}
+
 }  // namespace gf2p8::rs::detail::error_correction
+
+namespace gf2p8::rs {
+
+CorrectionResult CorrectCodeword(const LCHDecoder& decoder,
+                                 std::span<Element> codeword) {
+  if (!decoder.Valid() ||
+      codeword.size() != decoder.DataCount() + decoder.RecoveryCount()) {
+    return {.status = CorrectionStatus::invalid_argument};
+  }
+  std::array<uint8_t, 256> mask{};
+  auto recovery = codeword.subspan(decoder.DataCount());
+  return detail::error_correction::CorrectOneImpl(
+      decoder, codeword.first(decoder.DataCount()), recovery,
+      std::span(mask).first(codeword.size()), recovery);
+}
+
+}  // namespace gf2p8::rs

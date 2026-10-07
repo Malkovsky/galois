@@ -105,13 +105,15 @@ const Element* NativeSource(std::span<Element* const> data,
 }
 #endif
 
-CorrectionStatus CorrectColumnsScalar(const LCHDecoder& decoder,
-                                      std::span<Element* const> data,
-                                      std::span<const Element* const> recovery,
-                                      size_t byte_count,
-                                      size_t first_column,
-                                      std::span<CorrectionResult> results,
-                                      std::span<uint8_t> error_masks) {
+CorrectionStatus CorrectColumnsScalar(
+    const LCHDecoder& decoder,
+    std::span<Element* const> data,
+    std::span<const Element* const> recovery,
+    size_t byte_count,
+    size_t first_column,
+    std::span<CorrectionResult> results,
+    std::span<uint8_t> error_masks,
+    std::span<Element* const> mutable_recovery) {
   const size_t data_count = data.size();
   const size_t recovery_count = recovery.size();
   const size_t codeword_size = data_count + recovery_count;
@@ -126,14 +128,29 @@ CorrectionStatus CorrectColumnsScalar(const LCHDecoder& decoder,
     for (size_t i = 0; i < recovery_count; ++i) {
       recovery_values[i] = recovery[i][column];
     }
-    const CorrectionResult result = CorrectOne(
-        decoder, std::span(data_values).first(data_count),
-        std::span<const Element>(recovery_values).first(recovery_count),
-        std::span(mask).first(codeword_size));
+    CorrectionResult result;
+    if (mutable_recovery.empty()) {
+      result = CorrectOne(
+          decoder, std::span(data_values).first(data_count),
+          std::span<const Element>(recovery_values).first(recovery_count),
+          std::span(mask).first(codeword_size));
+    } else {
+      std::copy_n(recovery_values.begin(), recovery_count,
+                  data_values.begin() + data_count);
+      const auto before = data_values;
+      result =
+          CorrectCodeword(decoder, std::span(data_values).first(codeword_size));
+      for (size_t i = 0; i < codeword_size; ++i) {
+        mask[i] = before[i] != data_values[i];
+      }
+    }
     results[column] = result;
     if (result.status == CorrectionStatus::ok) {
       for (size_t i = 0; i < data_count; ++i) {
         data[i][column] = data_values[i];
+      }
+      for (size_t i = 0; i < mutable_recovery.size(); ++i) {
+        mutable_recovery[i][column] = data_values[data_count + i];
       }
     }
     for (size_t position = 0; position < codeword_size; ++position) {
@@ -584,7 +601,8 @@ void CorrectChunk32(std::span<Element* const> data,
                     const CodeParameters& parameters,
                     const lch::detail::ResolvedKernels& kernels,
                     std::span<CorrectionResult> results,
-                    std::span<uint8_t> error_masks) {
+                    std::span<uint8_t> error_masks,
+                    std::span<Element* const> mutable_recovery) {
 #if !defined(__GFNI__)
   static_assert(!UseGFNI);
 #endif
@@ -786,8 +804,12 @@ void CorrectChunk32(std::span<Element* const> data,
       data_error_lanes |= root_masks[native_position];
     }
   }
-  const uint32_t location_only_lanes = candidate_lanes & ~data_error_lanes;
-  candidate_lanes &= data_error_lanes;
+  // Whole-codeword mode must evaluate and verify parity-only candidates too.
+  const uint32_t location_only_lanes =
+      mutable_recovery.empty() ? candidate_lanes & ~data_error_lanes : 0;
+  if (mutable_recovery.empty()) {
+    candidate_lanes &= data_error_lanes;
+  }
   if (candidate_lanes == 0) {
     PublishChunkResults(results, error_masks, byte_count, column,
                         parameters.family, data_count, recovery_count,
@@ -936,19 +958,21 @@ void CorrectChunk32(std::span<Element* const> data,
        ++native_position) {
     const size_t public_position = PublicPosition(
         parameters.family, data_count, recovery_count, native_position);
-    if (public_position >= data_count) {
+    if (public_position >= data_count && mutable_recovery.empty()) {
       continue;
     }
+    Element* destination = public_position < data_count
+                               ? data[public_position]
+                               : mutable_recovery[public_position - data_count];
     const uint32_t active = root_masks[native_position] & candidate_lanes;
     const __m256i old_data = _mm256_loadu_si256(
-        reinterpret_cast<const __m256i*>(data[public_position] + column));
+        reinterpret_cast<const __m256i*>(destination + column));
     const __m256i correction = _mm256_and_si256(
         _mm256_load_si256(
             reinterpret_cast<const __m256i*>(Row(work, native_position))),
         LaneMask(active));
-    _mm256_storeu_si256(
-        reinterpret_cast<__m256i*>(data[public_position] + column),
-        _mm256_xor_si256(old_data, correction));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination + column),
+                        _mm256_xor_si256(old_data, correction));
   }
   PublishChunkResults(results, error_masks, byte_count, column,
                       parameters.family, data_count, recovery_count,
@@ -960,12 +984,14 @@ void CorrectChunk32(std::span<Element* const> data,
 
 }  // namespace
 
-CorrectionStatus CorrectBatch(const LCHDecoder& decoder,
-                              std::span<Element* const> data,
-                              std::span<const Element* const> recovery,
-                              size_t byte_count,
-                              std::span<CorrectionResult> results,
-                              std::span<uint8_t> error_masks) {
+static CorrectionStatus CorrectBatchImpl(
+    const LCHDecoder& decoder,
+    std::span<Element* const> data,
+    std::span<const Element* const> recovery,
+    size_t byte_count,
+    std::span<CorrectionResult> results,
+    std::span<uint8_t> error_masks,
+    std::span<Element* const> mutable_recovery) {
   if (!decoder.Valid()) {
     return CorrectionStatus::invalid_argument;
   }
@@ -1026,19 +1052,46 @@ CorrectionStatus CorrectBatch(const LCHDecoder& decoder,
 #if defined(__GFNI__)
       for (; column + kBatchLanes <= byte_count; column += kBatchLanes) {
         CorrectChunk32<true>(data, recovery, byte_count, column, parameters,
-                             *kernels, results, error_masks);
+                             *kernels, results, error_masks, mutable_recovery);
       }
 #else
       for (; column + kBatchLanes <= byte_count; column += kBatchLanes) {
         CorrectChunk32<false>(data, recovery, byte_count, column, parameters,
-                              *kernels, results, error_masks);
+                              *kernels, results, error_masks, mutable_recovery);
       }
 #endif
     }
   }
 #endif
   return CorrectColumnsScalar(decoder, data, recovery, byte_count, column,
-                              results, error_masks);
+                              results, error_masks, mutable_recovery);
+}
+
+CorrectionStatus CorrectBatch(const LCHDecoder& decoder,
+                              std::span<Element* const> data,
+                              std::span<const Element* const> recovery,
+                              size_t byte_count,
+                              std::span<CorrectionResult> results,
+                              std::span<uint8_t> error_masks) {
+  return CorrectBatchImpl(decoder, data, recovery, byte_count, results,
+                          error_masks, {});
+}
+
+CorrectionStatus CorrectCodewordBatch(const LCHDecoder& decoder,
+                                      std::span<Element* const> shards,
+                                      size_t byte_count,
+                                      std::span<CorrectionResult> results,
+                                      std::span<uint8_t> error_masks) {
+  if (!decoder.Valid() || shards.size() > kFieldSize ||
+      shards.size() != decoder.DataCount() + decoder.RecoveryCount()) {
+    return CorrectionStatus::invalid_argument;
+  }
+  const auto recovery = shards.subspan(decoder.DataCount());
+  std::array<const Element*, kFieldSize> immutable_recovery{};
+  std::copy(recovery.begin(), recovery.end(), immutable_recovery.begin());
+  return CorrectBatchImpl(decoder, shards.first(decoder.DataCount()),
+                          std::span(immutable_recovery).first(recovery.size()),
+                          byte_count, results, error_masks, recovery);
 }
 
 }  // namespace gf2p8::rs::detail::error_correction

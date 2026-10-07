@@ -71,10 +71,11 @@ void InitializeXDRS(XDRSTables& tables, unsigned bytes, unsigned k) {
   ::function::init_dec();
 }
 
-bool VerifyXDRSRecovery(
-    unsigned k, unsigned bytes, bool low_rate,
-    const std::vector<std::vector<GFSymbol>>& data,
-    const std::vector<std::vector<GFSymbol>>& recovery) {
+bool VerifyXDRSRecovery(unsigned k,
+                        unsigned bytes,
+                        bool low_rate,
+                        const std::vector<std::vector<GFSymbol>>& data,
+                        const std::vector<std::vector<GFSymbol>>& recovery) {
   const unsigned recovery_count = Size - k;
   auto data_pointers = ConstPointers(data);
   auto recovery_pointers = ConstPointers(recovery);

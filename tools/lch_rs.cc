@@ -212,13 +212,12 @@ class ProgressDisplay {
           indicators::option::ShowRemainingTime{true},
           indicators::option::Stream{std::cerr});
     } else {
-      spinner_ =
-          std::make_unique<indicators::IndeterminateProgressBar>(
-              indicators::option::BarWidth{30},
-              indicators::option::PrefixText{label_ + " "},
-              indicators::option::Start{"["}, indicators::option::Fill{"."},
-              indicators::option::Lead{"<=>"}, indicators::option::End{"]"},
-              indicators::option::Stream{std::cerr});
+      spinner_ = std::make_unique<indicators::IndeterminateProgressBar>(
+          indicators::option::BarWidth{30},
+          indicators::option::PrefixText{label_ + " "},
+          indicators::option::Start{"["}, indicators::option::Fill{"."},
+          indicators::option::Lead{"<=>"}, indicators::option::End{"]"},
+          indicators::option::Stream{std::cerr});
     }
     reporter_ = std::thread([this] { Report(); });
   }
@@ -248,11 +247,11 @@ class ProgressDisplay {
  private:
   std::string Postfix(bool failed) const {
     const uint64_t completed = completed_.load(std::memory_order_relaxed);
-    const double elapsed = std::chrono::duration<double>(
-                               std::chrono::steady_clock::now() - start_)
-                               .count();
-    const double rate = elapsed > 0.0 ? static_cast<double>(completed) / elapsed
-                                      : 0.0;
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start_)
+            .count();
+    const double rate =
+        elapsed > 0.0 ? static_cast<double>(completed) / elapsed : 0.0;
     std::string text = FormatBytes(static_cast<double>(completed));
     if (bar_) {
       text += "/" + FormatBytes(static_cast<double>(total_));
@@ -1018,7 +1017,7 @@ bool ProcessEncodeStripe(EncodeState* state,
   std::memset(work->data(), 0, encoded_bytes);
   std::memcpy(work->data(), data->data(), live);
   if (!EncodeStripe(*state->encoder, work->data(), encoded_chunk_size,
-                     workspace)) {
+                    workspace)) {
     return false;
   }
   uint64_t payload_index = 0;
@@ -1211,15 +1210,14 @@ int RunEncode(const Options& options) {
     return kExitUsage;
   }
   Verbose(options.verbose, "encode k=", options.k, " r=", options.r,
-          " chunk=", options.chunk_size, " jobs=", options.jobs,
-          " backend=",
+          " chunk=", options.chunk_size, " jobs=", options.jobs, " backend=",
           BackendName(gf2p8::lch::SelectBackend(options.chunk_size)),
           " input=", read_stdin ? "stdin" : options.input.c_str());
   ProgressDisplay progress("Encoding", options.progress_mode, !read_stdin,
                            source_size);
 
   auto consume = [&](uint32_t stripe, size_t live, AlignedBuffer* data,
-                      AlignedBuffer* work, std::span<Element> workspace) {
+                     AlignedBuffer* work, std::span<Element> workspace) {
     if (!ProcessEncodeStripe(&state, stripe, live, data, work, workspace)) {
       SetError(&state.error, kExitUsage);
       return false;
@@ -1249,7 +1247,7 @@ int RunEncode(const Options& options) {
   AlignedBuffer workspace_buffer;
   const bool serial = options.jobs == 1;
   if (serial && (!work.Allocate(static_cast<size_t>(n) * options.chunk_size) ||
-                  !workspace_buffer.Allocate(workspace_bytes))) {
+                 !workspace_buffer.Allocate(workspace_bytes))) {
     progress.Finish(false);
     Error("out of memory");
     return kExitUsage;
@@ -1549,14 +1547,14 @@ int RunVerify(const Options& options) {
       geometry.m == 0 ? 1 : std::min(options.jobs, geometry.m);
   Verbose(options.verbose, "verify k=", geometry.k, " r=", geometry.r,
           " chunk=", geometry.c, " stripes=", geometry.m, " jobs=", jobs,
-          " shares=", shares.size(), " backend=",
-          BackendName(gf2p8::lch::SelectBackend(geometry.c)));
+          " shares=", shares.size(),
+          " backend=", BackendName(gf2p8::lch::SelectBackend(geometry.c)));
   ProgressDisplay progress("Verifying", options.progress_mode, true,
                            geometry.original_size);
   auto worker = [&] {
     AlignedBuffer storage;
     if (!storage.Allocate(static_cast<size_t>(ShareCount(geometry)) *
-                           geometry.c)) {
+                          geometry.c)) {
       operation_error.store(true);
       return;
     }
@@ -1666,9 +1664,9 @@ int RunDecode(const Options& options) {
   const uint32_t jobs = serial ? 1 : std::min(options.jobs, geometry.m);
   Verbose(options.verbose, "decode k=", geometry.k, " r=", geometry.r,
           " chunk=", geometry.c, " stripes=", geometry.m, " jobs=", jobs,
-          " shares=", shares.size(), " backend=",
-          BackendName(gf2p8::lch::SelectBackend(geometry.c)), " output=",
-          write_stdout ? "stdout" : dest_path.c_str());
+          " shares=", shares.size(),
+          " backend=", BackendName(gf2p8::lch::SelectBackend(geometry.c)),
+          " output=", write_stdout ? "stdout" : dest_path.c_str());
   ProgressDisplay progress("Decoding", options.progress_mode, true,
                            geometry.original_size);
   std::atomic<int> error{0};
@@ -1708,7 +1706,7 @@ int RunDecode(const Options& options) {
         return false;
       }
     } else if (!PWriteAll(dest.get(), storage, static_cast<size_t>(live),
-                           offset)) {
+                          offset)) {
       SetError(&error, kExitUsage);
       return false;
     }
@@ -1742,7 +1740,7 @@ int RunDecode(const Options& options) {
     AlignedBuffer storage;
     AlignedBuffer workspace_buffer;
     if (!storage.Allocate(static_cast<size_t>(ShareCount(geometry)) *
-                           geometry.c) ||
+                          geometry.c) ||
         !workspace_buffer.Allocate(workspace_bytes)) {
       progress.Finish(false);
       Error("out of memory");

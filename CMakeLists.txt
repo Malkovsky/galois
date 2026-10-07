@@ -22,6 +22,7 @@ endif()
 
 option(GF256_BUILD_TESTS "Build unit tests" ON)
 option(GF256_BUILD_TOOLS "Build CLI tools" ON)
+option(GF256_BUILD_MONTE_CARLO "Build the product Monte Carlo CLI (also in test profiles)" ON)
 option(GF256_BUILD_BENCHMARKS "Build benchmarks" ON)
 option(GF256_BUILD_REFERENCE_BENCHMARKS "Build external RS baselines" OFF)
 option(GF256_ENABLE_NATIVE_ISA "Compile owned sources for the build host" OFF)
@@ -62,8 +63,10 @@ add_library(gf256_core STATIC
     src/reed_solomon/decoder/high_rate.cc
     src/reed_solomon/lch_encoder.cc
     src/reed_solomon/lch_decoder.cc
+    src/reed_solomon/strong_weak_rs_product_code.cc
 )
 target_compile_features(gf256_core PUBLIC cxx_std_20)
+set_target_properties(gf256_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(gf256_core
   PUBLIC ${PROJECT_SOURCE_DIR}/include
   PRIVATE ${PROJECT_SOURCE_DIR}/src)
@@ -83,6 +86,40 @@ if(GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT)
   endif()
   target_compile_definitions(gf256_core PRIVATE
     GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT=1)
+endif()
+
+if(GF256_BUILD_MONTE_CARLO OR GF256_BUILD_TOOLS OR GF256_BUILD_TESTS)
+  FetchContent_Declare(nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.12.0
+    GIT_SHALLOW TRUE)
+  set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+  set(JSON_Install OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(nlohmann_json)
+endif()
+
+if(GF256_BUILD_MONTE_CARLO OR GF256_BUILD_TOOLS OR GF256_BUILD_TESTS)
+  add_executable(rs-product-test tools/rs_product_test.cc)
+  target_link_libraries(rs-product-test PRIVATE gf256_core nlohmann_json::nlohmann_json)
+  include(GNUInstallDirs)
+  install(TARGETS rs-product-test
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT product-test)
+endif()
+
+if(GF256_BUILD_MONTE_CARLO)
+  find_package(Threads REQUIRED)
+  add_library(product_monte_carlo_trials OBJECT tools/product_monte_carlo_native.cc)
+  target_link_libraries(product_monte_carlo_trials PRIVATE gf256_core)
+  set_target_properties(product_monte_carlo_trials PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  if(GF256_ENABLE_NATIVE_ISA AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(product_monte_carlo_trials PRIVATE -march=native)
+  endif()
+  add_executable(rs-product-monte-carlo tools/product_monte_carlo.cc)
+  target_link_libraries(rs-product-monte-carlo PRIVATE product_monte_carlo_trials
+    gf256_core Threads::Threads nlohmann_json::nlohmann_json)
+  include(GNUInstallDirs)
+  install(TARGETS rs-product-monte-carlo
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT product-monte-carlo)
 endif()
 
 if(GF256_BUILD_TOOLS)
@@ -113,7 +150,7 @@ if(GF256_BUILD_TOOLS)
   target_link_libraries(lch-rs PRIVATE
     gf256_core xxhash indicators::indicators Threads::Threads)
   include(GNUInstallDirs)
-  install(TARGETS lch-rs RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS lch-rs RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT lch-rs)
 endif()
 
 if(GF256_ENABLE_GFNI512_RADIX8_EXPERIMENT)
@@ -137,12 +174,18 @@ endif()
 if(GF256_BUILD_TESTS)
   FetchContent_MakeAvailable(googletest)
   enable_testing()
+  find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME RSProductTestCli
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/rs_product_test.py
+      $<TARGET_FILE:rs-product-test>)
+  set_tests_properties(RSProductTestCli PROPERTIES TIMEOUT 60)
 
   add_executable(gf_unittests tests/field_tests.cc)
   target_link_libraries(gf_unittests PRIVATE gf256_core gtest gtest_main)
   add_test(NAME Unittests COMMAND gf_unittests)
 
-  add_executable(lch_rs_unittests tests/lch_tests.cc tests/rs_tests.cc)
+  add_executable(lch_rs_unittests tests/lch_tests.cc tests/rs_tests.cc
+    tests/product_code_tests.cc)
   target_include_directories(lch_rs_unittests PRIVATE ${PROJECT_SOURCE_DIR}/src)
   target_link_libraries(lch_rs_unittests PRIVATE gf256_core gtest gtest_main)
   if(GF256_ENABLE_NATIVE_ISA AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -159,6 +202,41 @@ if(GF256_BUILD_TESTS)
       GF256_ENABLE_CODEWORD_CANTOR_AFFINE_EXPERIMENT=1)
   endif()
   add_test(NAME LCHRSUnittests COMMAND lch_rs_unittests)
+  if(GF256_BUILD_MONTE_CARLO)
+    find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
+    add_library(product_monte_carlo_native SHARED $<TARGET_OBJECTS:product_monte_carlo_trials>)
+    set_target_properties(product_monte_carlo_native PROPERTIES PREFIX "")
+    target_link_libraries(product_monte_carlo_native PRIVATE gf256_core Threads::Threads)
+    configure_file(tests/reference/product_monte_carlo.py product_monte_carlo_reference.py COPYONLY)
+    add_executable(product_monte_carlo_data_tests tests/product_monte_carlo_data_tests.cc)
+    target_include_directories(product_monte_carlo_data_tests PRIVATE tools)
+    target_link_libraries(product_monte_carlo_data_tests PRIVATE nlohmann_json::nlohmann_json gtest_main)
+    target_compile_features(product_monte_carlo_data_tests PRIVATE cxx_std_20)
+    add_test(NAME ProductMonteCarloData COMMAND product_monte_carlo_data_tests)
+    add_executable(product_monte_carlo_fault_cli tools/product_monte_carlo.cc)
+    target_compile_definitions(product_monte_carlo_fault_cli PRIVATE GF256_MC_TEST_HOOKS=1)
+    target_link_libraries(product_monte_carlo_fault_cli PRIVATE product_monte_carlo_trials
+      gf256_core Threads::Threads nlohmann_json::nlohmann_json)
+    add_test(NAME ProductMonteCarloCli
+      COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/product_monte_carlo_test.py
+              ${PROJECT_BINARY_DIR}/rs-product-monte-carlo)
+    set_tests_properties(ProductMonteCarloCli PROPERTIES TIMEOUT 180)
+    add_test(NAME ProductMonteCarloLegacy
+      COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/product_monte_carlo_legacy_test.py
+        ${PROJECT_BINARY_DIR}/product_monte_carlo_reference.py)
+    set_tests_properties(ProductMonteCarloLegacy PROPERTIES TIMEOUT 180)
+    add_test(NAME ProductMonteCarloPlot
+      COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/plot_product_monte_carlo_test.py)
+    if(CMAKE_CXX_FLAGS MATCHES "fsanitize=address")
+      # ctypes loads an instrumented DSO into an otherwise uninstrumented Python.
+      execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libasan.so
+        OUTPUT_VARIABLE GF256_ASAN_RUNTIME OUTPUT_STRIP_TRAILING_WHITESPACE)
+      set_tests_properties(ProductMonteCarloLegacy PROPERTIES
+        ENVIRONMENT "LD_PRELOAD=${GF256_ASAN_RUNTIME}")
+      set_tests_properties(ProductMonteCarloCli PROPERTIES
+        ENVIRONMENT "MC_REFERENCE_LD_PRELOAD=${GF256_ASAN_RUNTIME}")
+    endif()
+  endif()
 
   if(GF256_BUILD_TOOLS)
     add_test(NAME LCHRSCli
@@ -170,8 +248,10 @@ endif()
 if(GF256_BUILD_BENCHMARKS)
   FetchContent_MakeAvailable(googlebenchmark)
 
-  add_executable(benchmarks benchmarks/matrix_multiplication.cc)
+  add_executable(benchmarks benchmarks/matrix_multiplication.cc
+    benchmarks/strong_weak_rs_product_code_benchmarks.cc)
   target_link_libraries(benchmarks PRIVATE gf256_core benchmark benchmark_main)
+  target_include_directories(benchmarks PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
   add_executable(rs_verbose_benchmarks
     benchmarks/lch_rs_benchmarks.cc
