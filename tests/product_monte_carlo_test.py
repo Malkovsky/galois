@@ -1,5 +1,6 @@
 """Black-box tests of the native executable; Python is not a runtime dependency."""
 import copy
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -30,6 +31,8 @@ def projected(row):
     s = row["statistics"]
     count = row["trial count"]
     return {"completed blocks": count, "total iterations": s["directional passes"]["sum"],
+        "stall patterns corrected": 0, "strong miscorrections detected": 0,
+        "strong miscorrections corrected": 0,
         "information bits": {"total bits": count * 455168,
             "raw corrupted bits": s["initial information corrupted bits"]["sum"],
             "post decoding corrupted bits": s["residual information bits"]["sum"]},
@@ -39,6 +42,87 @@ def projected(row):
 
 
 class NativeTest(unittest.TestCase):
+    def test_postprocessing_supplemental_abi_known_stall_and_miscorrection(self):
+        preload = os.environ.get("MC_REFERENCE_LD_PRELOAD")
+        if preload and os.environ.get("LD_PRELOAD") != preload:
+            child = subprocess.run([sys.executable, __file__, str(CLI),
+                "NativeTest.test_postprocessing_supplemental_abi_known_stall_and_miscorrection"],
+                env={**os.environ, "LD_PRELOAD": preload}, capture_output=True, text=True, timeout=90)
+            self.assertEqual(child.returncode, 0, child.stderr)
+            return
+        lib = ctypes.CDLL(str(CLI.parent / "product_monte_carlo_native.so"))
+        trial = lib.product_trial_postprocessing
+        u64, u32 = ctypes.c_uint64, ctypes.c_uint32
+        trial.argtypes = [u64] * 5 + [ctypes.c_int] * 2 + [ctypes.POINTER(u64),
+            ctypes.c_int, ctypes.POINTER(u32), ctypes.c_int, ctypes.POINTER(ctypes.c_uint8)] + [u64] * 4 + [ctypes.c_int, ctypes.POINTER(u64)]
+        for hidden in (False, True):
+            indices = [8 * (row * 256 + col) + bit
+                       for row in range(256 if hidden else 17)
+                       for col in ([0] if hidden else [254, 255]) for bit in range(8)]
+            positions = (u32 * len(indices))(*indices)
+            metrics, supplemental = (u64 * 22)(), (u64 * 3)()
+            residual = (ctypes.c_uint8 * 65536)()
+            self.assertEqual(trial(42, 0, 0, len(indices), 2, 1, 1, metrics, 2,
+                positions, 0, residual, 256, 224, 256, 254, 1, supplemental), 0)
+            self.assertEqual(list(supplemental), [0, 1, 1] if hidden else [1, 0, 0])
+            self.assertFalse(any(residual))
+            self.assertEqual(metrics[13], len(indices))
+            self.assertEqual(metrics[13], metrics[15] + metrics[17])
+            self.assertEqual(metrics[14], metrics[16] + metrics[18])
+            self.assertEqual(metrics[12], 2)
+
+    def test_postprocessing_saved_replay_metadata_and_seed_reproducibility(self):
+        extra = ("--postprocessing", "--n1", 8, "--k1", 4, "--n2", 5, "--k2", 3,
+                 "--minimum-flipped-bits", 20, "--maximum-flipped-bits", 20)
+        first = self.run_case("pp-floyd", *extra)
+        second = self.run_case("pp-repeat", *extra, "--threads", 4)
+        self.assertEqual(self.read(first)["overall"], self.read(second)["overall"])
+        self.assertEqual(self.read(first)["by flipped bit count"], self.read(second)["by flipped bit count"])
+        self.assertTrue(self.read(first, "metadata.json")["settings"]["postprocessing"])
+        self.invoke("--report", first)
+        saved = self.run_case("pp-saved", *extra, "--sampler", "fisher-yates")
+        before = (saved / "summary.json").read_bytes()
+        self.assertEqual((saved / "flips.bin").read_bytes()[:8], b"RSFLIP02")
+        self.invoke("--report", saved)
+        replay = self.invoke("--replay", saved)
+        self.assertIn("all 3 postprocessing counters match", replay.stderr)
+        self.assertEqual((saved / "summary.json").read_bytes(), before)
+        stats = self.read(saved)["overall"]["statistics"]
+        for name in ("stall patterns corrected", "strong miscorrections detected", "strong miscorrections corrected"):
+            self.assertEqual(stats[name], sum(row["statistics"][name] for row in self.read(saved)["by flipped bit count"]))
+        self.assertGreater(stats["stall patterns corrected"] + stats["strong miscorrections detected"], 0)
+        self.invoke("--output", self.root / "badpp", "--postprocessing=false", success=False)
+
+        # Alter only a supplemental counter, recompute checksum and matching
+        # summary totals: report is structurally valid, replay must still fail.
+        binary = bytearray((saved / "flips.bin").read_bytes())
+        offset = 40
+        count = struct.unpack_from("<I", binary, offset + 20)[0]
+        previous = struct.unpack_from("<Q", binary, offset + 208)[0]
+        replacement = 1 - previous
+        struct.pack_into("<Q", binary, offset + 208, replacement)
+        end = offset + 232 + 4 * count
+        binary[end:end + 32] = hashlib.sha256(binary[offset:end]).digest()
+        (saved / "flips.bin").write_bytes(binary)
+        summary = self.read(saved)
+        for row in [summary["overall"], *summary["by flipped bit count"]]:
+            row["statistics"]["stall patterns corrected"] += replacement - previous
+        (saved / "summary.json").write_text(canonical(summary))
+        self.invoke("--report", saved)
+        self.assertIn("replay mismatch", self.invoke("--replay", saved, success=False).stderr)
+
+    def test_old_snapshot_missing_supplemental_counters_is_unchanged(self):
+        path = self.run_case("old-minimal", "--sampler", "fisher-yates")
+        summary = self.read(path)
+        for row in [summary["overall"], *summary["by flipped bit count"]]:
+            for name in ("stall patterns corrected", "strong miscorrections detected", "strong miscorrections corrected"):
+                row["statistics"].pop(name)
+        (path / "summary.json").write_text(canonical(summary))
+        before = (path / "summary.json").read_bytes()
+        self.invoke("--report", path)
+        self.invoke("--replay", path)
+        self.assertEqual((path / "summary.json").read_bytes(), before)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="native-mc-")
         self.root = Path(self.tmp.name)

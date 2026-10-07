@@ -24,6 +24,9 @@ inline constexpr std::string_view kFloyd =
 inline constexpr std::string_view kFisherYates =
     "splitmix64 domain seeds; mt19937_64; rejection modulo; persistent "
     "Fisher-Yates complement v1; replay saved flips";
+inline constexpr std::array<const char*, 3> kPostprocessingMetrics{
+    "stall patterns corrected", "strong miscorrections detected",
+    "strong miscorrections corrected"};
 inline constexpr std::array<const char*, 22> kMetrics{
     "initial full block corrupted bits",
     "initial full block corrupted bytes",
@@ -136,7 +139,7 @@ struct Settings {
   uint64_t n1 = 256, k1 = 224, n2 = 256, k2 = 254;
   uint64_t seed = 0, size = 1000, batches = 0, threads = 1, lo = 2500,
            hi = 2700, passes = 16, checkpoint = 64, report = 2, sync = 5;
-  bool anchors = true, binary = true;
+  bool anchors = true, binary = true, postprocessing = false;
 
   /** @brief Transmitted bits per block after dimension validation. */
   uint64_t FullBits() const { return 8 * n1 * n2; }
@@ -186,6 +189,9 @@ struct Settings {
     j["fsync seconds"] = sync;
     j["anchors"] = anchors;
     j["binary image"] = binary;
+    if (postprocessing) {
+      j["postprocessing"] = true;
+    }
     if (!DefaultDimensions()) {
       j["n1"] = n1;
       j["k1"] = k1;
@@ -212,6 +218,9 @@ struct Settings {
     if (dimensions) {
       fields.insert({"n1", "k1", "n2", "k2"});
     }
+    if (j.contains("postprocessing")) {
+      fields.insert("postprocessing");
+    }
     Fields(j, fields);
     Settings s;
     if (dimensions) {
@@ -234,6 +243,11 @@ struct Settings {
             "gates must be boolean");
     s.anchors = j.at("anchors").get<bool>();
     s.binary = j.at("binary image").get<bool>();
+    if (j.contains("postprocessing")) {
+      Require(j.at("postprocessing").is_boolean(),
+              "postprocessing must be boolean");
+      s.postprocessing = j.at("postprocessing").get<bool>();
+    }
     s.Validate();
     return s;
   }
@@ -242,8 +256,11 @@ struct Settings {
 struct Stats {
   uint64_t blocks = 0, iterations = 0, info_raw = 0, info_post = 0,
            full_raw = 0, full_post = 0;
-  void Add(const std::array<uint64_t, 22>& m, uint64_t full_bits = 524288) {
-    Add(Stats{1, m[12], m[2], m[6], m[0], m[4]}, full_bits);
+  std::array<uint64_t, 3> postprocessing{};
+  void Add(const std::array<uint64_t, 22>& m,
+           uint64_t full_bits = 524288,
+           std::array<uint64_t, 3> supplemental = {}) {
+    Add(Stats{1, m[12], m[2], m[6], m[0], m[4], supplemental}, full_bits);
   }
   void Add(const Stats& s, uint64_t full_bits = 524288) {
     Stats next{
@@ -251,12 +268,19 @@ struct Stats {
         CheckedAdd(info_raw, s.info_raw), CheckedAdd(info_post, s.info_post),
         CheckedAdd(full_raw, s.full_raw), CheckedAdd(full_post, s.full_post)};
     CheckedMultiply(next.blocks, full_bits);
+    for (size_t i = 0; i < postprocessing.size(); ++i) {
+      next.postprocessing[i] =
+          CheckedAdd(postprocessing[i], s.postprocessing[i]);
+    }
     *this = next;
   }
   Json ToJson(const Settings& settings = {}) const {
     Json j;
     j["completed blocks"] = Number(blocks);
     j["total iterations"] = Number(iterations);
+    for (size_t i = 0; i < postprocessing.size(); ++i) {
+      j[kPostprocessingMetrics[i]] = Number(postprocessing[i]);
+    }
     for (bool info : {true, false}) {
       Json bits;
       bits["total bits"] = Number(CheckedMultiply(
@@ -273,9 +297,31 @@ struct Stats {
                         uint64_t k,
                         uint64_t passes,
                         const Settings& settings = {}) {
-    Fields(j, {"completed blocks", "total iterations", "information bits",
-               "full-codeword bits"});
+    std::set<std::string> fields{"completed blocks", "total iterations",
+                                 "information bits", "full-codeword bits"};
+    const bool supplemental = j.contains(kPostprocessingMetrics[0]) ||
+                              j.contains(kPostprocessingMetrics[1]) ||
+                              j.contains(kPostprocessingMetrics[2]);
+    if (supplemental) {
+      fields.insert(kPostprocessingMetrics.begin(),
+                    kPostprocessingMetrics.end());
+    }
+    Require(supplemental || !settings.postprocessing,
+            "missing postprocessing counters");
+    Fields(j, fields);
     Stats s;
+    if (supplemental) {
+      for (size_t i = 0; i < s.postprocessing.size(); ++i) {
+        s.postprocessing[i] = Natural(j.at(kPostprocessingMetrics[i]));
+      }
+    }
+    Require(s.postprocessing[0] <= count &&
+                __uint128_t(s.postprocessing[1]) <=
+                    __uint128_t(count) * settings.n2 &&
+                s.postprocessing[2] <= s.postprocessing[1] &&
+                (settings.postprocessing ||
+                 s.postprocessing == std::array<uint64_t, 3>{}),
+            "invalid postprocessing counters");
     s.blocks = Natural(j.at("completed blocks"));
     s.iterations = Natural(j.at("total iterations"));
     // Compare the upper bound by division: count*passes need not fit u64

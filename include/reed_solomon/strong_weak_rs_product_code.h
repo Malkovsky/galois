@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 
 #include "reed_solomon/error_correction.h"
 #include "reed_solomon/lch_encoder.h"
@@ -25,6 +26,9 @@ struct ProductDecodeOptions {
   bool use_anchors = true;
   /** @brief Require weak repair deltas to have at most two set bits. */
   bool use_binary_image = true;
+  /** @brief Run one transactional final erasure/consensus stage after stall or
+   * cap, without adding directional passes. Default off. */
+  bool use_postprocessing = false;
 };
 
 /** @brief Product correction outcome; validity does not prove original content.
@@ -43,14 +47,25 @@ struct ProductCorrectionResult {
   size_t strong_changed_symbols = 0, strong_changed_bits = 0;
   /** @brief Accepted weak-direction symbol writes and bit toggles. */
   size_t weak_changed_symbols = 0, weak_changed_bits = 0;
+  /** @brief Number of nonzero-strong-syndrome patterns repaired (0 or 1). */
+  uint64_t stall_patterns_corrected = 0;
+  /** @brief Distinct syndrome-clean strong columns implicated by validated
+   * repair, or an existence lower bound of one when known-failure-only erasure
+   * equations are inconsistent. Not a truth-oracle count or a claimed location;
+   * the lower bound is not added again to located detections. */
+  uint64_t strong_miscorrections_detected = 0;
+  /** @brief Distinct syndrome-clean strong columns changed by a validated final
+   * repair. Accepted postprocessing writes count as weak writes above. */
+  uint64_t strong_miscorrections_corrected = 0;
 };
 
 /**
  * @brief Systematic Cantor RS product with strong columns and weak rows.
  * @details Row-major block has Nstrong rows and Nweak columns. The top-left
  * Kstrong by Kweak rectangle holds data; every column and every row, including
- * parity regions, is a component codeword. Errors only: no erasures or
- * backtracking. Strong N and R must be powers of two, N<=256 and 2<=R<=K.
+ * parity regions, is a component codeword. No external erasures. Optional
+ * postprocessing infers erasures transactionally. Strong N and R must be
+ * powers of two, N<=256 and 2<=R<=K.
  * Weak R=2, K>=2, N<=256 may be shortened from nextPow2(N): omitted data
  * [K,nextPow2(N)-2) are known zeros. Public rows remain compact [data][parity].
  * Mother-code candidates changing any omitted zero are rejected in full.
@@ -116,13 +131,24 @@ class StrongWeakRSProductCode {
   /**
    * @brief Corrects with independent per-call weak acceptance gates.
    * @param block Exactly BlockSize() mutable symbols.
-   * @param options Pass cap and optional anchor and binary-image gates.
+   * @param options Pass cap, weak gates, and optional final postprocessing.
    * @return Termination, pass/work counts, and final all-component validity.
    * @details Uses the same scheduling and stopping rules as the cap overload.
    * Weak BDD accepts one error for R=2 and up to two for R=4. Disabling anchors
    * bypasses only target-column protection; disabling binary image bypasses
    * only the two-bit delta limit. Every accepted write still invalidates
    * intersecting cached validity and activates the next direction.
+   * Postprocessing runs once after either stopping condition, without changing
+   * termination, directional passes, or line-visit counts. It first erases up
+   * to Rweak syndrome-nonzero columns in all weak rows. Otherwise ungated weak
+   * proposals may identify at most Rweak/2 syndrome-clean columns with at least
+   * Rstrong+1 distinct supporting rows each; participating proposals cannot
+   * name another syndrome-clean column. These columns and known failures may
+   * be erased together if their union fits Rweak. Every surviving weak symbol
+   * and every strong parity check must agree before the whole candidate
+   * commits. Consensus overrides both weak gates, but never final validation.
+   * Membership checks cannot distinguish the original product word from another
+   * valid one.
    */
   ProductCorrectionResult Correct(std::span<Element> block,
                                   ProductDecodeOptions options) const;

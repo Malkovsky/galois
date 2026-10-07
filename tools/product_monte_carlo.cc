@@ -209,6 +209,7 @@ uint64_t GetLE(std::string_view bytes, size_t offset, size_t width) {
 struct Result {
   uint64_t index = 0;
   std::array<uint64_t, 22> metrics{};
+  std::array<uint64_t, 3> supplemental{};
   std::vector<uint32_t> positions;
   std::exception_ptr error;
   bool ready = false;
@@ -325,11 +326,11 @@ class Workers {
           }
         }
 #endif
-        int status = product_trial_dimensions(
+        int status = product_trial_postprocessing(
             s_.seed, batch_, index, k_, s_.passes, s_.anchors, s_.binary,
             slot.metrics.data(), recorded_ ? 1 : 0,
             recorded_ ? slot.positions.data() : nullptr, 0, nullptr, s_.n1,
-            s_.k1, s_.n2, s_.k2);
+            s_.k1, s_.n2, s_.k2, s_.postprocessing, slot.supplemental.data());
         Require(status == 0, "native status=" + std::to_string(status));
       } catch (...) {
         slot.error = std::current_exception();
@@ -360,9 +361,11 @@ void WriteFlips(File& file,
                 uint64_t batch,
                 uint64_t k,
                 const Result& result,
-                uint64_t bits) {
+                uint64_t bits,
+                bool postprocessing) {
   const auto count = std::min(k, bits - k);
-  std::string bytes(208 + 4 * count, '\0');
+  const size_t header = postprocessing ? 232 : 208;
+  std::string bytes(header + 4 * count, '\0');
   PutLE(bytes, 0, batch, 8);
   PutLE(bytes, 8, result.index, 8);
   PutLE(bytes, 16, k, 4);
@@ -372,7 +375,12 @@ void WriteFlips(File& file,
     PutLE(bytes, 32 + 8 * i, result.metrics[i], 8);
   }
   for (size_t i = 0; i < count; ++i) {
-    PutLE(bytes, 208 + 4 * i, result.positions[i], 4);
+    PutLE(bytes, header + 4 * i, result.positions[i], 4);
+  }
+  if (postprocessing) {
+    for (size_t i = 0; i < 3; ++i) {
+      PutLE(bytes, 208 + 8 * i, result.supplemental[i], 8);
+    }
   }
   file.Write(bytes);
   file.Write(Hash(bytes));
@@ -396,7 +404,8 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
   std::optional<File> flips;
   if (recorded) {
     flips.emplace(directory / "flips.bin", O_WRONLY | O_CREAT | O_EXCL);
-    flips->Write("RSFLIP01" + digest);
+    flips->Write(std::string(s.postprocessing ? "RSFLIP02" : "RSFLIP01") +
+                 digest);
     flips->Sync();
   }
   auto snapshot = [&] {
@@ -523,9 +532,10 @@ void Run(const fs::path& directory, const Settings& s, bool recorded) {
             }
           } else {
             auto next_staged = staged;
-            next_staged.Add(result.metrics, s.FullBits());
+            next_staged.Add(result.metrics, s.FullBits(), result.supplemental);
             if (flips) {
-              WriteFlips(*flips, batch, k, result, s.FullBits());
+              WriteFlips(*flips, batch, k, result, s.FullBits(),
+                         s.postprocessing);
             }
             staged = next_staged;
             if (staged.blocks == s.checkpoint) {
@@ -596,7 +606,8 @@ void ReadFlips(std::istream& stream,
   std::vector<uint32_t> positions(std::max<size_t>(1, count));
   std::vector<bool> selected(s.FullBits());
   for (uint64_t trial = first; trial < end; ++trial) {
-    auto body = ReadExact(stream, 208);
+    const size_t header = s.postprocessing ? 232 : 208;
+    auto body = ReadExact(stream, header);
     Require(GetLE(body, 0, 8) == batch && GetLE(body, 8, 8) == trial &&
                 GetLE(body, 16, 4) == k,
             "flip trial identity mismatch");
@@ -607,7 +618,7 @@ void ReadFlips(std::istream& stream,
     Require(ReadExact(stream, 32) == Hash(body), "corrupt flip checksum");
     std::fill(selected.begin(), selected.end(), false);
     for (size_t i = 0; i < count; ++i) {
-      auto p = GetLE(body, 208 + 4 * i, 4);
+      auto p = GetLE(body, header + 4 * i, 4);
       Require(p < selected.size() && !selected[p],
               "invalid or duplicate flip position");
       selected[p] = true;
@@ -617,16 +628,25 @@ void ReadFlips(std::istream& stream,
     for (size_t i = 0; i < 22; ++i) {
       metrics[i] = GetLE(body, 32 + 8 * i, 8);
     }
+    std::array<uint64_t, 3> supplemental{};
+    if (s.postprocessing) {
+      for (size_t i = 0; i < 3; ++i) {
+        supplemental[i] = GetLE(body, 208 + 8 * i, 8);
+      }
+    }
     if (replay) {
       std::array<uint64_t, 22> actual{};
-      int status = product_trial_dimensions(
+      std::array<uint64_t, 3> actual_supplemental{};
+      int status = product_trial_postprocessing(
           s.seed, batch, trial, k, s.passes, s.anchors, s.binary, actual.data(),
-          2, positions.data(), random, nullptr, s.n1, s.k1, s.n2, s.k2);
-      Require(status == 0 && actual == metrics,
+          2, positions.data(), random, nullptr, s.n1, s.k1, s.n2, s.k2,
+          s.postprocessing, actual_supplemental.data());
+      Require(status == 0 && actual == metrics &&
+                  actual_supplemental == supplemental,
               "replay mismatch batch=" + std::to_string(batch) + " trial=" +
                   std::to_string(trial) + " status=" + std::to_string(status));
     }
-    stats.Add(metrics, s.FullBits());
+    stats.Add(metrics, s.FullBits(), supplemental);
     if (schema == 1) {
       AddLegacyTrial(old, metrics);
     }
@@ -635,7 +655,11 @@ void ReadFlips(std::istream& stream,
   Require(end_offset >= 0 &&
               static_cast<uint64_t>(end_offset) == U64(r.at("flip end")),
           "flip end offset mismatch");
-  Require((schema == 1 ? old : stats.ToJson(s)) == r.at("statistics"),
+  Require((schema == 1 ? old : stats.ToJson(s)) ==
+              (schema == 1 ? r.at("statistics")
+                           : Stats::FromJson(r.at("statistics"), end - first, k,
+                                             s.passes, s)
+                                 .ToJson(s)),
           "flip metrics disagree with journal");
 }
 
@@ -655,6 +679,23 @@ void ValidateSnapshot(const fs::path& directory,
   }
   Require(input.eof() && !input.bad(), "summary read failed");
   auto summary = Parse(text);
+  // Normalize older schema-2 zero counters without changing its persisted file
+  // or metadata identity. Partial/malformed counter sets remain invalid.
+  const auto normalize = [&](Json& stats) {
+    bool any = false;
+    for (const auto* name : kPostprocessingMetrics) {
+      any |= stats.contains(name);
+    }
+    if (!any && !settings.postprocessing) {
+      for (const auto* name : kPostprocessingMetrics) {
+        stats[name] = uint64_t{0};
+      }
+    }
+  };
+  normalize(summary.at("overall").at("statistics"));
+  for (auto& row : summary.at("by flipped bit count")) {
+    normalize(row.at("statistics"));
+  }
   std::set<std::string> fields{"schema revision", "run identity", "overall",
                                "by flipped bit count"};
   if (!settings.DefaultDimensions()) {
@@ -701,15 +742,21 @@ void ValidateSnapshot(const fs::path& directory,
           "summary exceeds configured trials");
   if (recorded) {
     std::ifstream flips(directory / "flips.bin", std::ios::binary);
-    Require(flips.good() && ReadExact(flips, 40) == "RSFLIP01" + digest,
-            "invalid flip file identity/version");
+    Require(
+        flips.good() &&
+            ReadExact(flips, 40) ==
+                std::string(settings.postprocessing ? "RSFLIP02" : "RSFLIP01") +
+                    digest,
+        "invalid flip file identity/version");
     Aggregate verified(Hex(digest), 2, settings);
     uint64_t offset = 40;
     std::optional<std::pair<uint64_t, uint64_t>> previous;
     while (offset < flip_end) {
-      Require(flip_end - offset >= 240, "invalid committed flip boundary");
+      const size_t header_size = settings.postprocessing ? 232 : 208;
+      Require(flip_end - offset >= header_size + 32,
+              "invalid committed flip boundary");
       const auto start = flips.tellg();
-      const auto header = ReadExact(flips, 208);
+      const auto header = ReadExact(flips, header_size);
       const auto batch = GetLE(header, 0, 8), trial = GetLE(header, 8, 8),
                  k = GetLE(header, 16, 4);
       const auto position = std::pair{batch, trial};
@@ -719,15 +766,21 @@ void ValidateSnapshot(const fs::path& directory,
       Require(
           k == product_batch_k(settings.seed, batch, settings.lo, settings.hi),
           "saved batch k disagrees with seed/settings");
-      const auto next =
-          CheckedAdd(offset, 240 + 4 * std::min(k, settings.FullBits() - k));
+      const auto next = CheckedAdd(
+          offset, header_size + 32 + 4 * std::min(k, settings.FullBits() - k));
       Require(next <= flip_end, "flip record crosses committed boundary");
       std::array<uint64_t, 22> metrics{};
       for (size_t i = 0; i < metrics.size(); ++i) {
         metrics[i] = GetLE(header, 32 + 8 * i, 8);
       }
       Stats stats;
-      stats.Add(metrics, settings.FullBits());
+      std::array<uint64_t, 3> supplemental{};
+      if (settings.postprocessing) {
+        for (size_t i = 0; i < 3; ++i) {
+          supplemental[i] = GetLE(header, 208 + 8 * i, 8);
+        }
+      }
+      stats.Add(metrics, settings.FullBits(), supplemental);
       const auto json = stats.ToJson(settings);
       Stats::FromJson(json, 1, k, settings.passes, settings);
       // Reuse the legacy record verifier without persisting a journal record.
@@ -755,7 +808,10 @@ void ValidateSnapshot(const fs::path& directory,
             << " trials; summary unchanged\n";
   if (replay) {
     std::cerr << "verified replay: " << aggregate.overall.blocks
-              << " trials, all 22 metrics match\n";
+              << " trials, all 22 metrics match"
+              << (settings.postprocessing
+                      ? "; all 3 postprocessing counters match\n"
+                      : "\n");
   }
 }
 
@@ -795,6 +851,8 @@ void Recover(const fs::path& directory, bool replay) {
   Require(codeword == "zero" || codeword == "random",
           "incompatible codeword convention");
   auto settings = Settings::FromJson(metadata.at("settings"));
+  Require(!settings.postprocessing || snapshot,
+          "postprocessing requires schema-2 snapshot storage");
   Require(metadata.at("code") == settings.Code(),
           "incompatible code/dimensions/coordinates");
   // Never insert defaults before hashing legacy metadata.
@@ -903,56 +961,58 @@ int Main(int argc, char** argv) {
       flag.resize(equals);
     }
     if (flag == "--help" || flag == "-h") {
-      std::cout
-          << "Native fixed-weight RS product Monte Carlo (schema 2)\n"
-             "Usage: rs-product-monte-carlo --output NEW_DIRECTORY [options]\n"
-             "       rs-product-monte-carlo --report DIRECTORY | --replay "
-             "DIRECTORY\n"
-             "--seed UINT64 (default: generated, printed and persisted before "
-             "work)\n"
-             "--batch-size 1000 --batches 0 (infinite) --threads 1 (1..1024)\n"
-             "--n1 256 --k1 224 --n2 256 --k2 254 (Cantor [data][parity])\n"
-             "Strong n1,R1 powers of two, n1<=256, 2<=R1<=k1; weak\n"
-             "n2<=256, k2>=2; weak R=2 shortening or full RS(256,252).\n"
-             "--minimum-flipped-bits 2500 --maximum-flipped-bits 2700 "
-             "(inclusive, 0..8*n1*n2; small codes need explicit smaller "
-             "bounds, no cap)\n"
-             "--max-directional-passes 16 (2..1000000)\n"
-             "--[no-]anchors --[no-]binary-image (both enabled)\n"
-             "--sampler floyd|fisher-yates (default floyd; Fisher-Yates saves "
-             "RSFLIP01)\n"
-             "--checkpoint-trials 64 (1..4096, also bounds concurrency)\n"
-             "--report-seconds 2 --fsync-seconds 5 (1..86400)\n"
-             "One uniform k per batch; exactly k flips per all-zero block. No "
-             "resume.\n"
-             "Counters are exact uint64 JSON integers "
-             "(0..18446744073709551615); "
-             "overflow is an error.\n"
-             "Total bits must also fit uint64; iterations are directional "
-             "passes.\n"
-             "Legacy schema 1 sums and squared sums exceeding uint64 are "
-             "rejected.\n"
-             "SIGINT/SIGTERM stop starts, drain whole in-flight blocks, "
-             "checkpoint and fsync.\n"
-             "New runs create no journal: atomic summary snapshots are "
-             "authoritative.\n"
-             "Snapshots are fsynced every --fsync-seconds and on graceful "
-             "exit;\n"
-             "crash loss is work since the last snapshot, plus in-flight "
-             "blocks.\n"
-             "Report validates snapshot-only runs without rewriting the "
-             "summary;\n"
-             "legacy journal runs still support report regeneration.\n"
-             "Saved flips are fsynced before the summary's committed boundary; "
-             "replay checks "
-             "all 22 private metrics.\n"
-             "Uncommitted flip tails are ignored. Legacy absent codeword means "
-             "random;\n"
-             "legacy journal report ignores only an "
-             "incomplete final line.\n";
+      std::cout << R"(Fixed-weight RS product Monte Carlo
+
+Usage:
+  rs-product-monte-carlo --output NEW_DIRECTORY [options]
+  rs-product-monte-carlo --report DIRECTORY
+  rs-product-monte-carlo --replay DIRECTORY
+  -h, --help                     Show this help
+
+Code:
+  --n1 N --k1 K                  Strong columns (default: 256, 224)
+  --n2 N --k2 K                  Weak rows (default: 256, 254)
+  Cantor [data][parity]; R=N-K. Strong N,R powers of two, N<=256, 2<=R<=K.
+  Weak N<=256, K>=2: R=2 (shortening allowed) or full RS(256,252).
+
+Sampling:
+  --seed UINT64                  Default: generated, printed and saved before work
+  --batch-size N                 Blocks per batch (default: 1000)
+  --batches N                    Batch limit (default: 0, infinite)
+  --threads N                    Workers (default: 1; 1..1024)
+  --minimum-flipped-bits N       Inclusive lower bound (default: 2500)
+  --maximum-flipped-bits N       Inclusive upper bound (default: 2700)
+  --sampler floyd|fisher-yates   Default: floyd; Fisher-Yates saves flips for replay
+  One uniform flip count per batch; exactly that many flips per all-zero block.
+  Bounds must fit 0..8*n1*n2; set smaller bounds explicitly for small codes.
+
+Decoder:
+  --max-directional-passes N     Pass cap (default: 16; 2..1000000)
+  --[no-]anchors                 Default: enabled
+  --[no-]binary-image            Default: enabled
+  --postprocessing               Final repair after stall/cap (default: off)
+  Parity validity does not prove original content.
+
+Output:
+  --output NEW_DIRECTORY         Create a new run; directory must not exist
+  --report DIRECTORY             Validate saved results
+  --replay DIRECTORY             Verify results from saved Fisher-Yates flips
+  --checkpoint-trials N          Checkpoint/concurrency bound (default: 64; 1..4096)
+  --report-seconds N             Progress interval (default: 2; 1..86400)
+  --fsync-seconds N              Durable snapshot interval (default: 5; 1..86400)
+  No resume. Report/replay accept only a directory, no other options.
+  Counters and total bits must fit uint64; overflow is an error.
+  SIGINT/SIGTERM drain in-flight blocks and save a durable summary snapshot.
+  A crash may lose work since the last durable snapshot.
+)";
       return 0;
     }
     ++options;
+    if (flag == "--postprocessing") {
+      Require(equals == std::string::npos, "boolean flags take no value");
+      s.postprocessing = true;
+      continue;
+    }
     if (flag == "--anchors" || flag == "--no-anchors" ||
         flag == "--binary-image" || flag == "--no-binary-image") {
       Require(equals == std::string::npos, "boolean flags take no value");

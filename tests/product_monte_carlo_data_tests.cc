@@ -4,6 +4,50 @@
 
 #include "product_monte_carlo_sha256.h"
 
+TEST(ProductMonteCarloData,
+     PostprocessingMetadataCountersAndTransactionalOverflow) {
+  mc::Settings settings;
+  EXPECT_FALSE(mc::Settings::FromJson(settings.ToJson()).postprocessing);
+  EXPECT_FALSE(settings.ToJson().contains("postprocessing"));
+  settings.postprocessing = true;
+  EXPECT_TRUE(mc::Settings::FromJson(settings.ToJson()).postprocessing);
+  auto invalid = settings.ToJson();
+  invalid["postprocessing"] = 1;
+  EXPECT_THROW(mc::Settings::FromJson(invalid), std::runtime_error);
+  mc::Stats increment{1, 2, 0, 0, 0, 0, {1, 2, 2}};
+  EXPECT_EQ(mc::Stats::FromJson(increment.ToJson(settings), 1, 0, 16, settings)
+                .postprocessing,
+            increment.postprocessing);
+  mc::Aggregate aggregate("pp", 2, settings);
+  aggregate.Add(0, increment);
+  aggregate.Add(1, increment);
+  EXPECT_EQ(aggregate.overall.postprocessing,
+            (std::array<uint64_t, 3>{2, 4, 4}));
+  EXPECT_EQ(aggregate.by_k.at(0).postprocessing, increment.postprocessing);
+  for (size_t i = 0; i < 3; ++i) {
+    mc::Stats huge;
+    huge.postprocessing[i] = UINT64_MAX;
+    const auto before = aggregate.Summary();
+    EXPECT_THROW(aggregate.Add(0, huge), std::runtime_error);
+    EXPECT_EQ(aggregate.Summary(), before);
+    // Also exercise failure in per-k staging after overall succeeds.
+    auto copy = aggregate;
+    copy.by_k.at(0).postprocessing[i] = UINT64_MAX;
+    const auto saved = copy.Summary();
+    EXPECT_THROW(copy.Add(0, increment), std::runtime_error);
+    EXPECT_EQ(copy.Summary(), saved);
+  }
+  auto old = mc::Stats{}.ToJson();
+  for (auto name : mc::kPostprocessingMetrics) {
+    old.erase(name);
+  }
+  EXPECT_NO_THROW(mc::Stats::FromJson(old, 0, 0, 16));
+  EXPECT_THROW(mc::Stats::FromJson(old, 0, 0, 16, settings),
+               std::runtime_error);
+  old[mc::kPostprocessingMetrics[0]] = 0;
+  EXPECT_THROW(mc::Stats::FromJson(old, 0, 0, 16), std::runtime_error);
+}
+
 TEST(ProductMonteCarloData, Sha256KnownVectorsAndPadding) {
   const auto check = [](std::string_view input, std::string_view expected) {
     const auto digest = mc::Sha256(

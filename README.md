@@ -25,6 +25,10 @@ Performance comparison of $RS(256, k)$ implementations:
 
 [Open the benchmark report on GitHub Pages](https://malkovsky.github.io/galois/).
 
+### Reed-Solomon product codes
+
+We provide a special decoder for Reed-Solomon product codes over, error correction decoder for LCH aprroach is an implementation of a $\mathcal{O}((n-k)^2)$ variant of the modular approach by [Tang and Han](https://arxiv.org/pdf/2207.11079). See [Product code sampling experiments](manuals/rs-product-test.md) for details.
+
 ## Build
 
 ```bash
@@ -32,3 +36,7 @@ cmake --preset release
 cmake --build --preset release
 ctest --preset release
 ```
+
+## Manuals
+
+[Product code sampling experiments](manuals/rs-product-test.md)

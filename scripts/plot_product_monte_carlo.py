@@ -18,6 +18,8 @@ RANDOM_FY = "splitmix64 domain seeds; mt19937_64; rejection modulo; persistent F
 SNAPSHOTS = "atomic summary v1"
 NEG_INF = -math.inf
 DEFAULT_DIMENSIONS = (256, 224, 256, 254)
+POSTPROCESSING_METRICS = ("stall patterns corrected", "strong miscorrections detected",
+                        "strong miscorrections corrected")
 
 
 def dimensions(settings):
@@ -40,13 +42,14 @@ def denominators(dims):
 
 
 def configuration(settings):
-    flags = (settings["maximum directional passes"], settings["anchors"], settings["binary image"])
+    flags = (settings["maximum directional passes"], settings["anchors"], settings["binary image"],
+             settings.get("postprocessing", False))
     dims = dimensions(settings)
     return flags if dims == DEFAULT_DIMENSIONS else flags + dims
 
 
 def config_dimensions(config):
-    return config[3:] if len(config) == 7 else DEFAULT_DIMENSIONS
+    return config[4:] if len(config) == 8 else DEFAULT_DIMENSIONS
 
 
 def require(condition, message):
@@ -92,13 +95,25 @@ def minimal_rows(summary, settings):
         require(type(row) is dict and set(row) == ({"statistics"} if overall else
                 {"flipped bit count", "statistics"}), "invalid row fields")
         stats = row["statistics"]
-        require(type(stats) is dict and set(stats) == {"completed blocks", "total iterations",
-            "information bits", "full-codeword bits"}, "invalid minimal statistics")
+        fields = {"completed blocks", "total iterations", "information bits", "full-codeword bits"}
+        extra = set(POSTPROCESSING_METRICS)
+        require(type(stats) is dict and (set(stats) == fields | extra or
+                (set(stats) == fields and not settings.get("postprocessing", False))),
+                "invalid minimal statistics")
         trials, iterations = stats["completed blocks"], stats["total iterations"]
         require(natural(trials) and (overall or trials > 0), "invalid completed blocks")
         require(natural(iterations) and trials * 2 <= iterations <= trials * settings[
             "maximum directional passes"], "invalid total iterations")
         flat = {"completed blocks": trials, "total iterations": iterations}
+        for name in POSTPROCESSING_METRICS:
+            value = stats.get(name, 0)
+            require(natural(value, (1 << 64) - 1), "invalid postprocessing counter")
+            require(settings.get("postprocessing", False) or value == 0,
+                    "postprocessing counters with postprocessing disabled")
+            flat[name] = value
+        require(flat[POSTPROCESSING_METRICS[0]] <= trials and
+                flat[POSTPROCESSING_METRICS[2]] <= flat[POSTPROCESSING_METRICS[1]] <= trials * dimensions(settings)[2],
+                "inconsistent postprocessing counters")
         residuals = {}
         for metric, name in (("information", "information bits"), ("full", "full-codeword bits")):
             bits = stats[name]
@@ -165,12 +180,15 @@ def load_report(path):
                              "report seconds", "fsync seconds"}
         if "n1" in settings:
             integer_settings |= {"n1", "k1", "n2", "k2"}
-        require(type(settings) is dict and set(settings) == integer_settings | {
+        require(type(settings) is dict and set(settings) - {"postprocessing"} == integer_settings | {
             "anchors", "binary image"}, "incompatible settings")
         for name in integer_settings:
             require(natural(settings[name], (1 << 64) - 1), f"invalid {name}")
         for name in ("anchors", "binary image"):
             require(type(settings[name]) is bool, f"invalid {name}")
+        require(type(settings.get("postprocessing", False)) is bool, "invalid postprocessing")
+        require(not settings.get("postprocessing", False) or snapshot,
+                "postprocessing requires schema-2 snapshot storage")
         require(0 <= settings["minimum flipped bits"] <= settings["maximum flipped bits"] <= n,
                 "invalid sampled k range")
         for name, low, high in (("batch size", 1, (1 << 64) - 1), ("threads", 1, 1024),
@@ -378,10 +396,11 @@ def evaluate(rows, p, n=N, denominators=None):
 
 
 def config_label(config):
-    passes, anchors, binary = config[:3]
+    passes, anchors, binary, postprocessing = config[:4]
     n1, k1, n2, k2 = config_dimensions(config)
     return (f"RS{n1},{k1} x RS{n2},{k2}; passes={passes}, "
-            f"anchors={'on' if anchors else 'off'}, binary-image={'on' if binary else 'off'}")
+            f"anchors={'on' if anchors else 'off'}, binary-image={'on' if binary else 'off'}, "
+            f"postprocessing={'on' if postprocessing else 'off'}")
 
 
 def plot_value(value):

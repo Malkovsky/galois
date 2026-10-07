@@ -542,6 +542,174 @@ ProductCorrectionResult StrongWeakRSProductCode::CorrectImpl(
     }
     result.termination = ProductTermination::pass_limit;
   }
+  if (options.use_postprocessing) {
+    // Re-encoding, rather than successful BDD, independently checks membership.
+    std::vector<Element> encoded(block.begin(), block.end());
+    std::array<const Element*, 256> data{};
+    std::array<Element*, 256> parity{};
+    std::vector<Element> workspace(strong_encoder_.WorkspaceSize(weak_n_));
+    const auto strong_checks = [&](std::span<const Element> values) {
+      std::copy(values.begin(), values.end(), encoded.begin());
+      for (size_t r = 0; r < strong_k_; ++r) {
+        data[r] = encoded.data() + r * weak_n_;
+      }
+      for (size_t r = strong_k_; r < strong_n_; ++r) {
+        parity[r - strong_k_] = encoded.data() + r * weak_n_;
+      }
+      std::array<bool, 256> failed{};
+      if (strong_encoder_.Encode(std::span(data).first(strong_k_),
+                                 std::span(parity).first(strong_n_ - strong_k_),
+                                 weak_n_, workspace) != lch::Status::ok) {
+        failed.fill(true);
+        return failed;
+      }
+      for (size_t c = 0; c < weak_n_; ++c) {
+        for (size_t r = strong_k_; r < strong_n_; ++r) {
+          failed[c] =
+              failed[c] || encoded[r * weak_n_ + c] != values[r * weak_n_ + c];
+        }
+      }
+      return failed;
+    };
+    const auto failed = strong_checks(block);
+    const size_t failures = std::count(failed.begin(), failed.end(), true);
+    const size_t redundancy = weak_n_ - weak_k_;
+    // Decode uses compact public [data][parity], including shortened R=2 rows.
+    LCHDecoder erasures(weak_k_, redundancy);
+    std::vector<Element> scratch(
+        std::max(erasures.WorkspaceSize(1), weak_encoder_.WorkspaceSize(1)));
+    std::vector<Element> staged(block.begin(), block.end());
+    const auto repair = [&](const std::array<bool, 256>& selected) {
+      staged.assign(block.begin(), block.end());
+      std::array<Element, 256> row{}, check{};
+      std::array<Element*, 256> mutable_data{}, recovery_out{};
+      std::array<const Element*, 256> recovery_in{}, const_data{};
+      std::array<uint8_t, 256> present_data{}, present_recovery{};
+      for (size_t c = 0; c < weak_k_; ++c) {
+        mutable_data[c] = &row[c];
+        const_data[c] = &row[c];
+        present_data[c] = !selected[c];
+      }
+      for (size_t c = 0; c < redundancy; ++c) {
+        recovery_in[c] = &row[weak_k_ + c];
+        recovery_out[c] = &check[weak_k_ + c];
+        present_recovery[c] = !selected[weak_k_ + c];
+      }
+      for (size_t r = 0; r < strong_n_; ++r) {
+        std::copy_n(block.data() + r * weak_n_, weak_n_, row.begin());
+        if (erasures.Decode(std::span(mutable_data).first(weak_k_),
+                            std::span(present_data).first(weak_k_),
+                            std::span(recovery_in).first(redundancy),
+                            std::span(present_recovery).first(redundancy), 1,
+                            scratch) != lch::Status::ok ||
+            weak_encoder_.Encode(std::span(const_data).first(weak_k_),
+                                 std::span(recovery_out).first(redundancy), 1,
+                                 scratch) != lch::Status::ok) {
+          return false;
+        }
+        for (size_t c = 0; c < redundancy; ++c) {
+          row[weak_k_ + c] = check[weak_k_ + c];
+        }
+        for (size_t c = 0; c < weak_n_; ++c) {
+          if (!selected[c] && row[c] != block[r * weak_n_ + c]) {
+            return false;  // Inconsistent surviving weak equations.
+          }
+          staged[r * weak_n_ + c] = row[c];
+        }
+      }
+      return true;
+    };
+    bool accepted = false;
+    if (failures != 0 && failures <= redundancy) {
+      const bool consistent = repair(failed);
+      if (!consistent) {
+        // At least one error lies outside the visible failed columns. Its
+        // location and multiplicity are unknown; do not count arbitrary BDD
+        // failure.
+        result.strong_miscorrections_detected = 1;
+      } else {
+        const auto remaining = strong_checks(staged);
+        accepted = std::none_of(remaining.begin(), remaining.end(),
+                                [](bool v) { return v; });
+      }
+    }
+    if (!accepted && failures <= redundancy) {
+      struct Proposal {
+        std::array<size_t, 2> positions{};
+        size_t count = 0;
+      };
+      std::array<Proposal, 256> proposals{};
+      std::array<size_t, 256> support{};
+      for (size_t r = 0; r < strong_n_; ++r) {
+        std::array<Element, 2> magnitudes{};
+        auto& p = proposals[r];
+        const auto row = block.subspan(r * weak_n_, weak_n_);
+        const auto outcome =
+            redundancy == 4 ? WeakCandidateR4(row, p.positions, magnitudes)
+                            : WeakCandidate(row, p.positions[0], magnitudes[0]);
+        if (outcome.status == CorrectionStatus::ok) {
+          p.count = outcome.error_count;
+          for (size_t i = 0; i < p.count; ++i) {
+            ++support[p.positions[i]];
+          }
+        }
+      }
+      std::array<bool, 256> consensus{};
+      size_t columns = 0;
+      for (size_t c = 0; c < weak_n_; ++c) {
+        consensus[c] = !failed[c] && support[c] >= strong_n_ - strong_k_ + 1;
+        columns += consensus[c];
+      }
+      // R=4 permits singleton and pair proposals together, not only identical
+      // pairs. Known failed columns are already selected; reject ambiguous
+      // unions or participating proposals naming another clean column.
+      bool coherent = columns != 0 && columns <= redundancy / 2;
+      for (const auto& p : proposals) {
+        bool touches = false, outside = false;
+        for (size_t i = 0; i < p.count; ++i) {
+          touches |= consensus[p.positions[i]];
+          outside |= !consensus[p.positions[i]] && !failed[p.positions[i]];
+        }
+        coherent &= !(touches && outside);
+      }
+      auto selected = failed;
+      for (size_t c = 0; c < weak_n_; ++c) {
+        selected[c] = selected[c] || consensus[c];
+      }
+      if (coherent &&
+          std::count(selected.begin(), selected.end(), true) <=
+              static_cast<ptrdiff_t>(redundancy) &&
+          repair(selected)) {
+        const auto remaining = strong_checks(staged);
+        accepted = std::none_of(remaining.begin(), remaining.end(),
+                                [](bool v) { return v; });
+      }
+    }
+    if (accepted) {
+      std::array<bool, 256> changed{};
+      for (size_t i = 0; i < block.size(); ++i) {
+        const unsigned delta = block[i] ^ staged[i];
+        if (delta == 0) {
+          continue;
+        }
+        changed[i % weak_n_] = true;
+        ++result.changed_symbols;
+        ++result.weak_changed_symbols;
+        result.changed_bits += std::popcount(delta);
+        result.weak_changed_bits += std::popcount(delta);
+        block[i] = staged[i];
+      }
+      for (size_t c = 0; c < weak_n_; ++c) {
+        result.strong_miscorrections_corrected += changed[c] && !failed[c];
+      }
+      result.strong_miscorrections_detected =
+          std::max(result.strong_miscorrections_detected,
+                   result.strong_miscorrections_corrected);
+      result.stall_patterns_corrected = failures != 0;
+      clean_columns.fill(true);
+      clean_rows.fill(true);
+    }
+  }
   // Check the actual final block, not stale protection or tentative candidates.
   result.all_zero_syndromes = true;
   for (bool strong : {true, false}) {

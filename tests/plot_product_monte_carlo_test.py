@@ -23,7 +23,7 @@ class NumericalTest(unittest.TestCase):
         dims = (4, 2, 5, 3)
         ds = plot.denominators(dims)
         n = ds["full"]
-        config = (16, True, True) + dims
+        config = (16, True, True, False) + dims
         rows = {k: {"trials": 2, "information": min(k, ds["information"])*2,
                     "full": 2*k} for k in range(n+1)}
         p = 0.17
@@ -50,7 +50,7 @@ class NumericalTest(unittest.TestCase):
             evaluate.assert_called_once_with(rows, p, n, ds)
 
     def test_pure_conditional_export(self):
-        groups = {(16, True, True): {
+        groups = {(16, True, True, False): {
             1: {"trials": 10, "information": 0, "full": 0},
             3500: {"trials": 20, "information": 4, "full": 8}}}
         with tempfile.TemporaryDirectory() as directory:
@@ -61,7 +61,7 @@ class NumericalTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         for row, metric in zip(rows, ("information", "full")):
             self.assertEqual(set(row), {"configuration", "metric", "points"})
-            self.assertEqual(row["configuration"], plot.config_label((16, True, True)))
+            self.assertEqual(row["configuration"], plot.config_label((16, True, True, False)))
             self.assertEqual(row["metric"], metric)
             self.assertEqual(len(row["points"]), 2)
             for point in row["points"]:
@@ -85,7 +85,7 @@ class NumericalTest(unittest.TestCase):
                 figure, axis = mock.MagicMock(), mock.MagicMock()
                 plt.subplots.return_value = (figure, axis)
                 plt.rcParams.__getitem__.return_value.by_key.return_value = {"color": ["blue"]}
-                groups = {(16, True, True): {3500: {"trials": 10, "information": 20, "full": 30}}}
+                groups = {(16, True, True, False): {3500: {"trials": 10, "information": 20, "full": 30}}}
                 with mock.patch.object(plot, "evaluate", return_value=(
                         {"information": -10, "full": -9}, -1, -1)), mock.patch("sys.stderr", io.StringIO()):
                     plot.plot_results(groups, ["information"], "both", [0.006],
@@ -285,7 +285,7 @@ class ReportTest(unittest.TestCase):
             self.save(path, metadata, summary)
         groups = plot.pool_reports([self.root])
         self.assertEqual(len(groups), 4)
-        self.assertEqual(groups[(16, True, True)][2600],
+        self.assertEqual(groups[(16, True, True, False)][2600],
                          {"trials": 10, "information": 10, "full": 10})
         self.fixture("duplicate-seed")
         with self.assertRaisesRegex(ValueError, "repeated seed"):
@@ -329,7 +329,7 @@ class ReportTest(unittest.TestCase):
         c, _, _ = self.fixture("c", passes=32)
         groups = plot.pool_reports([a, b / "summary.json", c])
         self.assertEqual(len(groups), 2)
-        row = groups[(16, True, True)][2600]
+        row = groups[(16, True, True, False)][2600]
         self.assertEqual(row, {"trials": 10, "information": 10, "full": 10})
 
     def test_duplicate_identity_and_seed(self):
@@ -354,7 +354,7 @@ class ReportTest(unittest.TestCase):
         summary["overall"] = {"statistics": copy.deepcopy(stats)}
         summary["by flipped bit count"] = [{"flipped bit count": 2600, "statistics": copy.deepcopy(stats)}]
         self.save(path, metadata, summary)
-        rows = plot.pool_reports([old, path])[(16, True, True)]
+        rows = plot.pool_reports([old, path])[(16, True, True, False)]
         self.assertEqual(rows[2600], {"trials": n+1, "information": n*3+10, "full": n*4+10})
         for mutation in (
                 lambda s: s["overall"]["statistics"].update({"completed blocks": n+1}),
@@ -377,7 +377,46 @@ class ReportTest(unittest.TestCase):
         groups = plot.pool_reports([default, r4])
         self.assertEqual(len(groups), 2)
         self.assertEqual({plot.config_dimensions(config) for config in groups},
-                         {(256, 224, 256, 254), (256, 224, 256, 252)})
+                          {(256, 224, 256, 254), (256, 224, 256, 252)})
+
+    def test_postprocessing_grouping_counters_and_legacy_absence(self):
+        old, _, _ = self.fixture("pp-off")
+        path, metadata, summary = self.fixture("pp-on")
+        metadata["schema revision"] = summary["schema revision"] = 2
+        metadata["storage"] = plot.SNAPSHOTS
+        metadata["settings"]["postprocessing"] = True
+        summary["run identity"] = plot.identity(metadata)
+        stats = {"completed blocks": 1, "total iterations": 2,
+                 "information bits": {"total bits": 455168, "raw corrupted bits": 2000,
+                                      "post decoding corrupted bits": 1},
+                 "full-codeword bits": {"total bits": 524288, "raw corrupted bits": 2600,
+                                        "post decoding corrupted bits": 1},
+                 "stall patterns corrected": 1, "strong miscorrections detected": 2,
+                 "strong miscorrections corrected": 1}
+        summary["overall"] = {"statistics": copy.deepcopy(stats)}
+        summary["by flipped bit count"] = [{"flipped bit count": 2600, "statistics": copy.deepcopy(stats)}]
+        self.save(path, metadata, summary)
+        groups = plot.pool_reports([old, path])
+        self.assertEqual(set(groups), {(16, True, True, False), (16, True, True, True)})
+        self.assertIn("postprocessing=on", plot.config_label((16, True, True, True)))
+        for name, value in (("stall patterns corrected", 2), ("strong miscorrections detected", -1),
+                            ("strong miscorrections corrected", 3), ("strong miscorrections detected", True),
+                            ("strong miscorrections detected", 1 << 64)):
+            bad = copy.deepcopy(summary)
+            bad["overall"]["statistics"][name] = value
+            self.save(path, metadata, bad)
+            with self.assertRaises(ValueError):
+                plot.load_report(path)
+        for row in [summary["overall"], *summary["by flipped bit count"]]:
+            for name in plot.POSTPROCESSING_METRICS:
+                row["statistics"].pop(name)
+        self.save(path, metadata, summary)
+        with self.assertRaises(ValueError):
+            plot.load_report(path)
+        metadata["settings"]["postprocessing"] = False
+        summary["run identity"] = plot.identity(metadata)
+        self.save(path, metadata, summary)
+        self.assertEqual(plot.load_report(path)[2], (16, True, True, False))
 
     def test_shortened_and_default_dimensions_never_pool(self):
         default, _, _ = self.fixture("default")
@@ -471,10 +510,10 @@ class ReportTest(unittest.TestCase):
         self.save(zero, metadata, summary)
         self.assertEqual(plot.load_report(legacy)[4], "random")
         self.assertEqual(plot.load_report(zero)[4], "zero")
-        self.assertEqual(plot.pool_reports([zero])[(16, True, True)][2600]["trials"], 1)
+        self.assertEqual(plot.pool_reports([zero])[(16, True, True, False)][2600]["trials"], 1)
         with self.assertRaisesRegex(ValueError, "mixed zero/random"):
             plot.pool_reports([legacy, zero])
-        self.assertEqual(plot.pool_reports([legacy, zero], True)[(16, True, True)][2600]["trials"], 2)
+        self.assertEqual(plot.pool_reports([legacy, zero], True)[(16, True, True, False)][2600]["trials"], 2)
         metadata["settings"]["root seed"] = 1
         summary["run identity"] = plot.identity(metadata)
         self.save(zero, metadata, summary)
@@ -652,7 +691,7 @@ class ReportTest(unittest.TestCase):
         self.assertNotEqual(axis.lines[0].get_linestyle(), axis.lines[1].get_linestyle())
         self.assertNotEqual(axis.collections[0].get_paths()[0].vertices.tolist(),
                             axis.collections[1].get_paths()[0].vertices.tolist())
-        pooled = plot.pool_reports([a, b])[(16, True, True)]
+        pooled = plot.pool_reports([a, b])[(16, True, True, False)]
         with csv_path.open() as stream:
             records = list(csv.DictReader(stream))
         self.assertEqual(len(records), 16)
@@ -683,7 +722,7 @@ class ReportTest(unittest.TestCase):
         import matplotlib.pyplot as plt
 
         output = self.root / "underflow.svg"
-        groups = {(16, True, True): {3500: {"trials": 10**400, "information": 1}}}
+        groups = {(16, True, True, False): {3500: {"trials": 10**400, "information": 1}}}
         with mock.patch.object(plt, "close", wraps=plt.close) as close:
             plot.plot_results(groups, ["information"], "conditional", [], output,
                               output.with_suffix(".csv"), plt)

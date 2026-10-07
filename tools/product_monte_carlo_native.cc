@@ -31,6 +31,7 @@
 #include <random>
 #include <vector>
 
+#include "product_monte_carlo_trials.h"
 #include "reed_solomon/strong_weak_rs_product_code.h"
 
 namespace {
@@ -133,7 +134,9 @@ int Trial(uint64_t seed,
           size_t n1 = 256,
           size_t k1 = 224,
           size_t n2 = 256,
-          size_t k2 = 254) {
+          size_t k2 = 254,
+          bool postprocessing = false,
+          uint64_t* supplemental = nullptr) {
   try {
     // Local counters cannot alias the byte buffers and are published only once.
     // The validated cap bounds every metric by 1000000 * 524288 (< 2^39);
@@ -233,8 +236,9 @@ int Trial(uint64_t seed,
     if (out[0] != k) {
       return 4;
     }
-    const auto result = code->Correct(
-        block, {static_cast<size_t>(passes), anchors != 0, binary != 0});
+    const auto result =
+        code->Correct(block, {static_cast<size_t>(passes), anchors != 0,
+                              binary != 0, postprocessing});
     if (result.termination == gf2p8::rs::ProductTermination::invalid_argument) {
       return 3;
     }
@@ -259,6 +263,11 @@ int Trial(uint64_t seed,
       }
     }
     std::copy(out, out + 22, output);
+    if (supplemental) {
+      supplemental[0] = result.stall_patterns_corrected;
+      supplemental[1] = result.strong_miscorrections_detected;
+      supplemental[2] = result.strong_miscorrections_corrected;
+    }
     return 0;
   } catch (...) {
     return 5;
@@ -271,6 +280,36 @@ int Trial(uint64_t seed,
 // successful trials; sampler output positions are scratch and must be ignored
 // on failure.
 extern "C" {
+int product_trial_postprocessing(uint64_t seed,
+                                 uint64_t batch,
+                                 uint64_t trial,
+                                 uint64_t k,
+                                 uint64_t passes,
+                                 int anchors,
+                                 int binary,
+                                 uint64_t* output,
+                                 int sampler,
+                                 uint32_t* positions,
+                                 int random,
+                                 uint8_t* residual,
+                                 uint64_t n1,
+                                 uint64_t k1,
+                                 uint64_t n2,
+                                 uint64_t k2,
+                                 int postprocessing,
+                                 uint64_t* supplemental) {
+  if ((random != 0 && random != 1) || n1 > 256 || k1 > 256 || n2 > 256 ||
+      k2 > 256 || (postprocessing != 0 && postprocessing != 1) ||
+      !supplemental) {
+    return 1;
+  }
+  return random ? Trial<true>(seed, batch, trial, k, passes, anchors, binary,
+                              output, sampler, positions, residual, n1, k1, n2,
+                              k2, postprocessing, supplemental)
+                : Trial<false>(seed, batch, trial, k, passes, anchors, binary,
+                               output, sampler, positions, residual, n1, k1, n2,
+                               k2, postprocessing, supplemental);
+}
 int product_trial_dimensions(uint64_t seed,
                              uint64_t batch,
                              uint64_t trial,

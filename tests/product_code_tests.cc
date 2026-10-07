@@ -1257,4 +1257,241 @@ TEST(ProductCode, OptionsDefaultsAndInvalidCapsArePerCall) {
   }
 }
 
+std::vector<Element> ImpulseStrong(size_t position = 0) {
+  LCHEncoder encoder(224, 32);
+  std::vector<Element> word(256);
+  word[position] = 255;
+  std::array<const Element*, 224> data{};
+  std::array<Element*, 32> parity{};
+  for (size_t i = 0; i < 224; ++i) {
+    data[i] = &word[i];
+  }
+  for (size_t i = 0; i < 32; ++i) {
+    parity[i] = &word[224 + i];
+  }
+  std::vector<Element> workspace(encoder.WorkspaceSize(1));
+  EXPECT_EQ(encoder.Encode(data, parity, 1, workspace), Status::ok);
+  EXPECT_EQ(
+      std::count_if(word.begin(), word.end(), [](Element v) { return v != 0; }),
+      33);
+  return word;
+}
+
+TEST(ProductPostprocessing, StallErasureRepairsShortenedAndParityColumns) {
+  for (const size_t n : {4u, 5u, 175u, 256u}) {
+    for (const size_t redundancy : {2u, 4u}) {
+      if (redundancy == 4 && n != 256) {
+        continue;
+      }
+      StrongWeakRSProductCode code(256, 224, n, n - redundancy);
+      std::vector<Element> block(256 * n);
+      for (size_t r = 0; r < 17; ++r) {
+        for (size_t c = n - redundancy; c < n; ++c) {
+          block[r * n + c] = 255;
+        }
+      }
+      auto baseline = block;
+      const auto old = code.Correct(baseline);
+      ASSERT_EQ(baseline, block);
+      ASSERT_FALSE(old.all_zero_syndromes);
+      const auto result = code.Correct(block, {16, true, true, true});
+      EXPECT_TRUE(result.all_zero_syndromes);
+      EXPECT_EQ(block, std::vector<Element>(block.size()));
+      EXPECT_EQ(result.directional_passes, old.directional_passes);
+      EXPECT_EQ(result.termination, old.termination);
+      EXPECT_EQ(result.stall_patterns_corrected, 1u);
+      EXPECT_EQ(result.strong_miscorrections_detected, 0u);
+      EXPECT_EQ(result.strong_miscorrections_corrected, 0u);
+      EXPECT_EQ(result.weak_changed_symbols, 17 * redundancy);
+      EXPECT_EQ(result.changed_symbols, result.weak_changed_symbols);
+      EXPECT_EQ(result.changed_bits, 8 * result.changed_symbols);
+      EXPECT_EQ(result.strong_changed_symbols, 0u);
+      EXPECT_EQ(result.weak_lines_visited, old.weak_lines_visited);
+      EXPECT_EQ(result.strong_lines_visited, old.strong_lines_visited);
+    }
+  }
+}
+
+TEST(ProductPostprocessing,
+     ValidWrongColumnsAndGenuineSeventeenErrorMiscorrection) {
+  const auto word = ImpulseStrong();
+  for (const size_t col : {0u, 173u, 174u}) {
+    for (bool genuine : {false, true}) {
+      StrongWeakRSProductCode code(256, 224, 175, 173);
+      std::vector<Element> block(code.BlockSize());
+      size_t kept = 0;
+      for (size_t r = 0; r < 256; ++r) {
+        if (word[r] && (!genuine || kept++ < 17)) {
+          block[r * 175 + col] = word[r];
+        }
+      }
+      auto baseline = block;
+      const auto old = code.Correct(baseline, 2);
+      ASSERT_FALSE(old.all_zero_syndromes);
+      ASSERT_EQ(old.strong_changed_symbols, genuine ? 16u : 0u);
+      const auto result = code.Correct(block, {2, true, true, true});
+      EXPECT_EQ(block, std::vector<Element>(block.size()));
+      EXPECT_TRUE(result.all_zero_syndromes);
+      EXPECT_EQ(result.termination, old.termination);
+      EXPECT_EQ(result.directional_passes, 2u);
+      EXPECT_EQ(result.stall_patterns_corrected, 0u);
+      EXPECT_EQ(result.strong_miscorrections_detected, 1u);
+      EXPECT_EQ(result.strong_miscorrections_corrected, 1u);
+      EXPECT_EQ(result.weak_changed_symbols, 33u);
+      EXPECT_EQ(result.strong_changed_symbols, genuine ? 16u : 0u);
+      EXPECT_EQ(result.changed_symbols,
+                result.strong_changed_symbols + result.weak_changed_symbols);
+      EXPECT_EQ(result.changed_bits,
+                result.strong_changed_bits + result.weak_changed_bits);
+    }
+  }
+}
+
+TEST(ProductPostprocessing, R4ConsensusIncludesSingletonSubsets) {
+  StrongWeakRSProductCode code(256, 224, 256, 252);
+  const auto a = ImpulseStrong(0), b = ImpulseStrong(1);
+  std::vector<Element> block(code.BlockSize());
+  for (size_t r = 0; r < 256; ++r) {
+    block[r * 256] = a[r];
+    block[r * 256 + 255] = b[r];
+  }
+  auto baseline = block;
+  ASSERT_FALSE(code.Correct(baseline).all_zero_syndromes);
+  ASSERT_EQ(baseline, block);
+  const auto result = code.Correct(block, {16, true, true, true});
+  EXPECT_TRUE(result.all_zero_syndromes);
+  EXPECT_EQ(block, std::vector<Element>(block.size()));
+  EXPECT_EQ(result.strong_miscorrections_detected, 2u);
+  EXPECT_EQ(result.strong_miscorrections_corrected, 2u);
+  EXPECT_EQ(result.stall_patterns_corrected, 0u);
+  EXPECT_EQ(result.weak_changed_symbols, 66u);
+}
+
+TEST(ProductPostprocessing, CombinedVisibleAndHiddenColumnsCountOnce) {
+  for (size_t redundancy : {2u, 4u}) {
+    StrongWeakRSProductCode code(256, 224, 256, 256 - redundancy);
+    std::vector<Element> block(code.BlockSize());
+    for (size_t r = 0; r < 256; ++r) {
+      block[r * 256] = 255;
+    }
+    for (size_t r = 0; r < 17; ++r) {
+      block[r * 256 + 255] = 255;
+    }
+    auto baseline = block;
+    ASSERT_FALSE(code.Correct(baseline).all_zero_syndromes);
+    ASSERT_EQ(block, baseline);
+    const auto result = code.Correct(block, {16, true, true, true});
+    EXPECT_TRUE(result.all_zero_syndromes);
+    EXPECT_EQ(block, std::vector<Element>(block.size()));
+    EXPECT_EQ(result.stall_patterns_corrected, 1u);
+    EXPECT_EQ(result.strong_miscorrections_detected, 1u);
+    EXPECT_EQ(result.strong_miscorrections_corrected, 1u);
+    EXPECT_EQ(result.changed_symbols, 273u);
+    EXPECT_EQ(result.changed_bits, 273u * 8);
+  }
+}
+
+TEST(ProductPostprocessing, FinalStageAlsoRunsAtPassLimit) {
+  const auto word = ImpulseStrong();
+  StrongWeakRSProductCode code;
+  std::vector<Element> block(code.BlockSize());
+  for (size_t r = 0; r < 256; ++r) {
+    block[r * 256] = word[r];
+  }
+  for (size_t r = 1; r <= 17; ++r) {
+    block[r * 256 + 1] = 1;
+  }
+  auto baseline = block;
+  const auto old = code.Correct(baseline, 2);
+  ASSERT_EQ(old.termination, ProductTermination::pass_limit);
+  ASSERT_EQ(old.weak_changed_symbols, 17u);
+  ASSERT_FALSE(old.all_zero_syndromes);
+  const auto result = code.Correct(block, {2, true, true, true});
+  EXPECT_EQ(result.termination, ProductTermination::pass_limit);
+  EXPECT_EQ(result.directional_passes, 2u);
+  EXPECT_EQ(result.strong_lines_visited, old.strong_lines_visited);
+  EXPECT_EQ(result.weak_lines_visited, old.weak_lines_visited);
+  EXPECT_EQ(result.weak_changed_symbols, 50u);
+  EXPECT_EQ(result.strong_miscorrections_detected, 1u);
+  EXPECT_EQ(result.strong_miscorrections_corrected, 1u);
+  EXPECT_TRUE(result.all_zero_syndromes);
+  EXPECT_EQ(block, std::vector<Element>(block.size()));
+}
+
+TEST(ProductPostprocessing,
+     TentativeConsensusRejectedWithoutPartialPublication) {
+  const auto word = ImpulseStrong(20);
+  StrongWeakRSProductCode code;
+  std::vector<Element> block(code.BlockSize());
+  for (size_t r = 0; r < 256; ++r) {
+    block[r * 256] = 255;
+    block[r * 256 + 1] = word[r];
+  }
+  auto baseline = block;
+  const auto old = code.Correct(baseline);
+  ASSERT_FALSE(old.all_zero_syndromes);
+  ASSERT_EQ(block, baseline);
+  const auto result = code.Correct(block, {16, true, true, true});
+  EXPECT_EQ(block, baseline);
+  EXPECT_FALSE(result.all_zero_syndromes);
+  EXPECT_EQ(result.changed_symbols, old.changed_symbols);
+  EXPECT_EQ(result.changed_bits, old.changed_bits);
+  EXPECT_EQ(result.stall_patterns_corrected, 0u);
+  EXPECT_EQ(result.strong_miscorrections_detected, 0u);
+  EXPECT_EQ(result.strong_miscorrections_corrected, 0u);
+}
+
+TEST(ProductPostprocessing, HiddenErrorLowerBoundWithoutSingleRowReveal) {
+  const auto word = ImpulseStrong();
+  for (size_t redundancy : {2u, 4u}) {
+    StrongWeakRSProductCode code(256, 224, 256, 256 - redundancy);
+    std::vector<Element> block(code.BlockSize());
+    size_t index = 0;
+    for (size_t r = 0; r < 256; ++r) {
+      if (!word[r]) {
+        continue;
+      }
+      for (size_t c = 0; c < redundancy - 1; ++c) {
+        block[r * 256 + c] = word[r];
+      }
+      block[r * 256 + 255] = gf2p8::MultiplyCantor(word[r], 1 + index++ % 3);
+    }
+    auto baseline = block;
+    const auto old = code.Correct(baseline);
+    ASSERT_EQ(baseline, block);
+    ASSERT_EQ(old.changed_symbols, 0u);
+    const auto result = code.Correct(block, {16, true, true, true});
+    EXPECT_FALSE(result.all_zero_syndromes);
+    EXPECT_EQ(block, baseline);
+    EXPECT_EQ(result.strong_miscorrections_detected, 1u);
+    EXPECT_EQ(result.strong_miscorrections_corrected, 0u);
+    EXPECT_EQ(result.stall_patterns_corrected, 0u);
+    EXPECT_EQ(result.changed_symbols, 0u);
+  }
+}
+
+TEST(ProductPostprocessing, CleanAndAmbiguousCandidatesDoNotPublishOrDetect) {
+  StrongWeakRSProductCode code(256, 224, 256, 252);
+  for (bool clean : {true, false}) {
+    std::vector<Element> block(code.BlockSize());
+    if (!clean) {
+      // Three syndrome-clean columns exceed t=2. Arbitrary weak failures are
+      // not evidence identifying a strong miscorrection.
+      for (size_t r = 0; r < 256; ++r) {
+        for (size_t c = 0; c < 3; ++c) {
+          block[r * 256 + c] = 255;
+        }
+      }
+    }
+    const auto before = block;
+    const auto result = code.Correct(block, {16, true, true, true});
+    EXPECT_EQ(block, before);
+    EXPECT_EQ(result.all_zero_syndromes, clean);
+    EXPECT_EQ(result.changed_symbols, 0u);
+    EXPECT_EQ(result.stall_patterns_corrected, 0u);
+    EXPECT_EQ(result.strong_miscorrections_detected, 0u);
+    EXPECT_EQ(result.strong_miscorrections_corrected, 0u);
+  }
+}
+
 }  // namespace
