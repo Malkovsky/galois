@@ -4,6 +4,20 @@
 
 #include "product_monte_carlo_sha256.h"
 
+TEST(ProductMonteCarloData, IdealDecoderMetadataRoundTripsAndDefaultsToRS) {
+  mc::Settings settings;
+  EXPECT_FALSE(mc::Settings::FromJson(settings.ToJson()).ideal);
+  EXPECT_FALSE(settings.ToJson().contains("ideal decoder"));
+  settings.ideal = true;
+  EXPECT_TRUE(mc::Settings::FromJson(settings.ToJson()).ideal);
+  settings.postprocessing = true;
+  EXPECT_EQ(mc::Settings::FromJson(settings.ToJson()).ToJson(),
+            settings.ToJson());
+  auto invalid = settings.ToJson();
+  invalid["ideal decoder"] = 1;
+  EXPECT_THROW(mc::Settings::FromJson(invalid), std::runtime_error);
+}
+
 TEST(ProductMonteCarloData,
      PostprocessingMetadataCountersAndTransactionalOverflow) {
   mc::Settings settings;

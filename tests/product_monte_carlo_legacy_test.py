@@ -433,7 +433,15 @@ class ExperimentTest(unittest.TestCase):
         synced_end = [40]
 
         def sync(fd):
-            target = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            # Identify the two tracked files by inode without Linux /proc.
+            descriptor = os.fstat(fd)
+            target = None
+            for candidate in (path / "flips.bin", path / "journal.jsonl"):
+                if candidate.exists():
+                    stat = candidate.stat()
+                    if (stat.st_dev, stat.st_ino) == (descriptor.st_dev, descriptor.st_ino):
+                        target = candidate
+                        break
             if target == path / "flips.bin":
                 # Every already-published reference must have been covered by
                 # the PREVIOUS flip sync, not this one.
