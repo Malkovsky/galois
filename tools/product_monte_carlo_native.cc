@@ -119,6 +119,100 @@ void CountDifferences(const std::vector<gf2p8::Element>& block,
     }
   }
 }
+// Oracle peeling operates only on XOR differences from the transmitted block.
+// Byte degree decides whether a component is correctable; popcount counts the
+// actual bit repairs. Every write removes errors, so no acceptance gates apply.
+template <bool Random>
+gf2p8::rs::ProductCorrectionResult IdealCorrect(
+    std::vector<gf2p8::Element>& block,
+    const gf2p8::Element* original,
+    size_t n1,
+    size_t k1,
+    size_t n2,
+    size_t k2,
+    size_t passes,
+    bool postprocessing) {
+  using gf2p8::rs::ProductCorrectionResult;
+  using gf2p8::rs::ProductTermination;
+  ProductCorrectionResult result;
+  std::array<size_t, 256> rows{}, columns{};
+  std::array<bool, 256> active{};
+  active.fill(true);
+  const auto difference = [&](size_t i) {
+    return block[i] ^ (Random ? original[i] : 0);
+  };
+  for (size_t r = 0; r < n1; ++r) {
+    for (size_t c = 0; c < n2; ++c) {
+      const bool wrong = difference(r * n2 + c) != 0;
+      rows[r] += wrong;
+      columns[c] += wrong;
+    }
+  }
+  const auto repair = [&](size_t r, size_t c, bool strong) {
+    const size_t i = r * n2 + c;
+    const unsigned delta = difference(i);
+    if (delta == 0) {
+      return false;
+    }
+    const size_t bits = std::popcount(delta);
+    block[i] = Random ? original[i] : 0;
+    --rows[r];
+    --columns[c];
+    ++result.changed_symbols;
+    result.changed_bits += bits;
+    ++(strong ? result.strong_changed_symbols : result.weak_changed_symbols);
+    (strong ? result.strong_changed_bits : result.weak_changed_bits) += bits;
+    return true;
+  };
+  for (size_t pass = 0; pass < passes; ++pass) {
+    const bool strong = pass % 2 == 0;
+    const size_t lines = strong ? n2 : n1;
+    const size_t length = strong ? n1 : n2;
+    const size_t radius = (strong ? n1 - k1 : n2 - k2) / 2;
+    std::array<bool, 256> next{};
+    size_t changes = 0;
+    for (size_t line = 0; line < lines; ++line) {
+      if (pass >= 2 && !active[line]) {
+        continue;
+      }
+      ++(strong ? result.strong_lines_visited : result.weak_lines_visited);
+      const size_t errors = strong ? columns[line] : rows[line];
+      if (errors == 0 || errors > radius) {
+        continue;
+      }
+      for (size_t pos = 0; pos < length; ++pos) {
+        if (repair(strong ? pos : line, strong ? line : pos, strong)) {
+          next[pos] = true;
+          ++changes;
+        }
+      }
+    }
+    ++result.directional_passes;
+    active = next;
+    if (pass >= 1 && changes == 0) {
+      result.termination = ProductTermination::no_change;
+      break;
+    }
+    result.termination = ProductTermination::pass_limit;
+  }
+  const size_t faulty_columns =
+      std::count_if(columns.begin(), columns.begin() + n2,
+                    [](size_t degree) { return degree != 0; });
+  if (postprocessing && faulty_columns > 0 && faulty_columns <= n2 - k2) {
+    for (size_t r = 0; r < n1; ++r) {
+      for (size_t c = 0; c < n2; ++c) {
+        repair(r, c, false);
+      }
+    }
+    result.stall_patterns_corrected = 1;
+  }
+  // The oracle has no syndrome calculation: clean means no residual errors.
+  result.all_zero_syndromes =
+      std::all_of(columns.begin(), columns.begin() + n2,
+                  [](size_t degree) { return degree == 0; });
+  return result;
+}
+
 template <bool Random>
 int Trial(uint64_t seed,
           uint64_t batch,
@@ -136,7 +230,8 @@ int Trial(uint64_t seed,
           size_t n2 = 256,
           size_t k2 = 254,
           bool postprocessing = false,
-          uint64_t* supplemental = nullptr) {
+          uint64_t* supplemental = nullptr,
+          bool ideal = false) {
   try {
     // Local counters cannot alias the byte buffers and are published only once.
     // The validated cap bounds every metric by 1000000 * 524288 (< 2^39);
@@ -237,8 +332,10 @@ int Trial(uint64_t seed,
       return 4;
     }
     const auto result =
-        code->Correct(block, {static_cast<size_t>(passes), anchors != 0,
-                              binary != 0, postprocessing});
+        ideal ? IdealCorrect<Random>(block, original, n1, k1, n2, k2, passes,
+                                     postprocessing)
+              : code->Correct(block, {static_cast<size_t>(passes), anchors != 0,
+                                      binary != 0, postprocessing});
     if (result.termination == gf2p8::rs::ProductTermination::invalid_argument) {
       return 3;
     }
@@ -280,6 +377,37 @@ int Trial(uint64_t seed,
 // successful trials; sampler output positions are scratch and must be ignored
 // on failure.
 extern "C" {
+int product_trial_decoder(uint64_t seed,
+                          uint64_t batch,
+                          uint64_t trial,
+                          uint64_t k,
+                          uint64_t passes,
+                          int anchors,
+                          int binary,
+                          uint64_t* output,
+                          int sampler,
+                          uint32_t* positions,
+                          int random,
+                          uint8_t* residual,
+                          uint64_t n1,
+                          uint64_t k1,
+                          uint64_t n2,
+                          uint64_t k2,
+                          int postprocessing,
+                          int ideal,
+                          uint64_t* supplemental) {
+  if ((random != 0 && random != 1) || n1 > 256 || k1 > 256 || n2 > 256 ||
+      k2 > 256 || (postprocessing != 0 && postprocessing != 1) ||
+      (ideal != 0 && ideal != 1) || !supplemental) {
+    return 1;
+  }
+  return random ? Trial<true>(seed, batch, trial, k, passes, anchors, binary,
+                              output, sampler, positions, residual, n1, k1, n2,
+                              k2, postprocessing, supplemental, ideal)
+                : Trial<false>(seed, batch, trial, k, passes, anchors, binary,
+                               output, sampler, positions, residual, n1, k1, n2,
+                               k2, postprocessing, supplemental, ideal);
+}
 int product_trial_postprocessing(uint64_t seed,
                                  uint64_t batch,
                                  uint64_t trial,
@@ -298,17 +426,9 @@ int product_trial_postprocessing(uint64_t seed,
                                  uint64_t k2,
                                  int postprocessing,
                                  uint64_t* supplemental) {
-  if ((random != 0 && random != 1) || n1 > 256 || k1 > 256 || n2 > 256 ||
-      k2 > 256 || (postprocessing != 0 && postprocessing != 1) ||
-      !supplemental) {
-    return 1;
-  }
-  return random ? Trial<true>(seed, batch, trial, k, passes, anchors, binary,
-                              output, sampler, positions, residual, n1, k1, n2,
-                              k2, postprocessing, supplemental)
-                : Trial<false>(seed, batch, trial, k, passes, anchors, binary,
-                               output, sampler, positions, residual, n1, k1, n2,
-                               k2, postprocessing, supplemental);
+  return product_trial_decoder(seed, batch, trial, k, passes, anchors, binary,
+                               output, sampler, positions, random, residual, n1,
+                               k1, n2, k2, postprocessing, 0, supplemental);
 }
 int product_trial_dimensions(uint64_t seed,
                              uint64_t batch,

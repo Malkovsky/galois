@@ -71,6 +71,12 @@ target_include_directories(gf256_core
   PUBLIC ${PROJECT_SOURCE_DIR}/include
   PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+# Generated field/transform tables exceed Clang's default constexpr step budget,
+# including AppleClang on macOS. Keep their generation at compile time.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  target_compile_options(gf256_core PRIVATE -fconstexpr-steps=100000000)
+endif()
+
 if(GF256_ENABLE_NATIVE_ISA)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(gf256_core PRIVATE -march=native)
@@ -213,6 +219,11 @@ if(GF256_BUILD_TESTS)
     target_link_libraries(product_monte_carlo_data_tests PRIVATE nlohmann_json::nlohmann_json gtest_main)
     target_compile_features(product_monte_carlo_data_tests PRIVATE cxx_std_20)
     add_test(NAME ProductMonteCarloData COMMAND product_monte_carlo_data_tests)
+    add_executable(product_monte_carlo_ideal_tests tests/product_monte_carlo_ideal_tests.cc)
+    target_include_directories(product_monte_carlo_ideal_tests PRIVATE tools)
+    target_link_libraries(product_monte_carlo_ideal_tests PRIVATE
+      product_monte_carlo_trials gf256_core Threads::Threads gtest_main)
+    add_test(NAME ProductMonteCarloIdeal COMMAND product_monte_carlo_ideal_tests)
     add_executable(product_monte_carlo_fault_cli tools/product_monte_carlo.cc)
     target_compile_definitions(product_monte_carlo_fault_cli PRIVATE GF256_MC_TEST_HOOKS=1)
     target_link_libraries(product_monte_carlo_fault_cli PRIVATE product_monte_carlo_trials
@@ -221,6 +232,10 @@ if(GF256_BUILD_TESTS)
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/product_monte_carlo_test.py
               ${PROJECT_BINARY_DIR}/rs-product-monte-carlo)
     set_tests_properties(ProductMonteCarloCli PROPERTIES TIMEOUT 180)
+    add_test(NAME ProductMonteCarloSmoke
+      COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/product_monte_carlo_smoke_test.py
+        $<TARGET_FILE:rs-product-monte-carlo>)
+    set_tests_properties(ProductMonteCarloSmoke PROPERTIES TIMEOUT 60)
     add_test(NAME ProductMonteCarloLegacy
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/product_monte_carlo_legacy_test.py
         ${PROJECT_BINARY_DIR}/product_monte_carlo_reference.py)

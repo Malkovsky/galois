@@ -56,9 +56,9 @@ def integer(text):
 
 def native():
     here = Path(__file__).resolve().parent
-    candidates = [here / "product_monte_carlo_native.so",
-                  here.parent / "lib" / "product_monte_carlo_native.so",
-                  here.parent / "lib64" / "product_monte_carlo_native.so"]
+    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+    candidates = [folder / f"product_monte_carlo_native{suffix}"
+                  for folder in (here, here.parent / "lib", here.parent / "lib64")]
     path = next((p for p in candidates if p.is_file()), None)
     if path is None:
         raise ValueError("native trial library not found beside CLI or in ../lib[64]")

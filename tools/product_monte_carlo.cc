@@ -326,11 +326,12 @@ class Workers {
           }
         }
 #endif
-        int status = product_trial_postprocessing(
+        int status = product_trial_decoder(
             s_.seed, batch_, index, k_, s_.passes, s_.anchors, s_.binary,
             slot.metrics.data(), recorded_ ? 1 : 0,
             recorded_ ? slot.positions.data() : nullptr, 0, nullptr, s_.n1,
-            s_.k1, s_.n2, s_.k2, s_.postprocessing, slot.supplemental.data());
+            s_.k1, s_.n2, s_.k2, s_.postprocessing, s_.ideal,
+            slot.supplemental.data());
         Require(status == 0, "native status=" + std::to_string(status));
       } catch (...) {
         slot.error = std::current_exception();
@@ -637,10 +638,10 @@ void ReadFlips(std::istream& stream,
     if (replay) {
       std::array<uint64_t, 22> actual{};
       std::array<uint64_t, 3> actual_supplemental{};
-      int status = product_trial_postprocessing(
+      int status = product_trial_decoder(
           s.seed, batch, trial, k, s.passes, s.anchors, s.binary, actual.data(),
           2, positions.data(), random, nullptr, s.n1, s.k1, s.n2, s.k2,
-          s.postprocessing, actual_supplemental.data());
+          s.postprocessing, s.ideal, actual_supplemental.data());
       Require(status == 0 && actual == metrics &&
                   actual_supplemental == supplemental,
               "replay mismatch batch=" + std::to_string(batch) + " trial=" +
@@ -853,6 +854,8 @@ void Recover(const fs::path& directory, bool replay) {
   auto settings = Settings::FromJson(metadata.at("settings"));
   Require(!settings.postprocessing || snapshot,
           "postprocessing requires schema-2 snapshot storage");
+  Require(!settings.ideal || snapshot,
+          "ideal decoder requires schema-2 snapshot storage");
   Require(metadata.at("code") == settings.Code(),
           "incompatible code/dimensions/coordinates");
   // Never insert defaults before hashing legacy metadata.
@@ -987,6 +990,9 @@ Sampling:
   Bounds must fit 0..8*n1*n2; set smaller bounds explicitly for small codes.
 
 Decoder:
+  --ideal-decoder                Count wrong bytes; repair within floor((N-K)/2)
+  Ideal mode uses known errors, ignores anchors/binary gates, never miscorrects.
+  With postprocessing, erase up to N2-K2 residual faulty columns in all rows.
   --max-directional-passes N     Pass cap (default: 16; 2..1000000)
   --[no-]anchors                 Default: enabled
   --[no-]binary-image            Default: enabled
@@ -1008,9 +1014,9 @@ Output:
       return 0;
     }
     ++options;
-    if (flag == "--postprocessing") {
+    if (flag == "--postprocessing" || flag == "--ideal-decoder") {
       Require(equals == std::string::npos, "boolean flags take no value");
-      s.postprocessing = true;
+      (flag == "--postprocessing" ? s.postprocessing : s.ideal) = true;
       continue;
     }
     if (flag == "--anchors" || flag == "--no-anchors" ||

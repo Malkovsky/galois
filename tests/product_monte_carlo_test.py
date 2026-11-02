@@ -50,7 +50,8 @@ class NativeTest(unittest.TestCase):
                 env={**os.environ, "LD_PRELOAD": preload}, capture_output=True, text=True, timeout=90)
             self.assertEqual(child.returncode, 0, child.stderr)
             return
-        lib = ctypes.CDLL(str(CLI.parent / "product_monte_carlo_native.so"))
+        suffix = ".dylib" if sys.platform == "darwin" else ".so"
+        lib = ctypes.CDLL(str(CLI.parent / f"product_monte_carlo_native{suffix}"))
         trial = lib.product_trial_postprocessing
         u64, u32 = ctypes.c_uint64, ctypes.c_uint32
         trial.argtypes = [u64] * 5 + [ctypes.c_int] * 2 + [ctypes.POINTER(u64),
@@ -504,7 +505,8 @@ class NativeTest(unittest.TestCase):
         env = dict(os.environ, PATH="/nonexistent")
         self.invoke("--output", path, "--batches", 1, "--batch-size", 1,
                     "--minimum-flipped-bits", 0, "--maximum-flipped-bits", 0, env=env)
-        self.assertEqual(CLI.read_bytes()[:4], b"\x7fELF")
+        magic = (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf") if sys.platform == "darwin" else (b"\x7fELF",)
+        self.assertIn(CLI.read_bytes()[:4], magic)
         seed = self.read(path, "metadata.json")["settings"]["root seed"]
         self.assertTrue(0 <= seed < 2**64)
         self.assertIn(f"root seed={seed}", (path / "progress.log").read_text())
