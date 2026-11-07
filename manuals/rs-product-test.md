@@ -190,7 +190,7 @@ Both references assume converged ideal decoding and are asymptotic estimates,
 not finite-BER bounds. `--no-error-floor` hides the plain reference; the
 postprocessing reference is selected independently.
 
-![RS(64,56) × RS(175,173) residual BER](../docs/images/rs_product_64x175_error_floor.svg)
+![RS(64,56) × RS(175,173) residual BER](../docs/images/rs_product_ideal_comparison.png)
 
 100M blocks per ideal configuration; 10M per RS configuration.
 Lowest-BER points remain sample-limited.
