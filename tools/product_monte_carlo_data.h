@@ -140,6 +140,7 @@ struct Settings {
   uint64_t seed = 0, size = 1000, batches = 0, threads = 1, lo = 2500,
            hi = 2700, passes = 16, checkpoint = 64, report = 2, sync = 5;
   bool anchors = true, binary = true, postprocessing = false;
+  bool ideal = false;
 
   /** @brief Transmitted bits per block after dimension validation. */
   uint64_t FullBits() const { return 8 * n1 * n2; }
@@ -192,6 +193,9 @@ struct Settings {
     if (postprocessing) {
       j["postprocessing"] = true;
     }
+    if (ideal) {
+      j["ideal decoder"] = true;
+    }
     if (!DefaultDimensions()) {
       j["n1"] = n1;
       j["k1"] = k1;
@@ -221,6 +225,9 @@ struct Settings {
     if (j.contains("postprocessing")) {
       fields.insert("postprocessing");
     }
+    if (j.contains("ideal decoder")) {
+      fields.insert("ideal decoder");
+    }
     Fields(j, fields);
     Settings s;
     if (dimensions) {
@@ -247,6 +254,11 @@ struct Settings {
       Require(j.at("postprocessing").is_boolean(),
               "postprocessing must be boolean");
       s.postprocessing = j.at("postprocessing").get<bool>();
+    }
+    if (j.contains("ideal decoder")) {
+      Require(j.at("ideal decoder").is_boolean(),
+              "ideal decoder must be boolean");
+      s.ideal = j.at("ideal decoder").get<bool>();
     }
     s.Validate();
     return s;

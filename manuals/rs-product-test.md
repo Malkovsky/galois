@@ -144,3 +144,53 @@ when a pass makes no changes after the initial strong pass; the current CLI
 cannot force exactly four passes. Postprocessing, when enabled, is a separate
 final stage and does not consume a directional pass. These switches control
 decoding rules, not SIMD acceleration.
+
+### Ideal decoder
+
+`--ideal-decoder` replaces RS decoding with known-error counting: a byte is
+wrong if any bit differs from the transmitted byte. Columns and rows within
+their component's correction radius $\lfloor(n_i-k_i)/2\rfloor$ are restored
+completely. Passes alternate until a stall or `--max-directional-passes`.
+With `--postprocessing`, residual errors occupying at most $n_2-k_2$ columns
+are also repaired.
+
+### Error-floor estimates
+
+For independent input bit errors with probability $p$, define
+$q=1-(1-p)^8$ and $t_i=\lfloor(n_i-k_i)/2\rfloor$. Counting minimum
+$(t_1+1)\times(t_2+1)$ stall rectangles gives the residual BER estimate
+
+$$
+B_0(p)=\binom{n_1-1}{t_1}\binom{n_2-1}{t_2}
+       p\,q^{(t_1+1)(t_2+1)-1}.
+$$
+
+This adapts the stall counting in [Condò et al., *Stall Pattern Avoidance in
+Polynomial Product Codes*, Section III](https://arxiv.org/abs/1611.04834)
+to unequal byte-code components, using $8p/q$ wrong bits per erroneous byte.
+
+`--postprocessing-error-floor` adds the estimate for this tool's final erasure
+repair. Let $a=t_1+1$, $c=n_2-k_2+1$, and $w=ac$. If $M_{\rm PP}$ counts
+supports with $c$ columns, $a$ errors per column, and at least $t_2+1$ errors
+in every affected row, then
+
+$$
+B_{\rm PP}(p)=\frac{wM_{\rm PP}}{n_1n_2}\,p\,q^{w-1}.
+$$
+
+For weak redundancy $n_2-k_2=2$,
+
+$$
+M_{\rm PP}=\binom{n_2}{3}
+\sum_{r=a}^{\min(n_1,\lfloor3a/2\rfloor)}
+\binom{n_1}{r}\frac{r!}{(3a-2r)!\,((r-a)!)^3}.
+$$
+
+Both references assume converged ideal decoding and are asymptotic estimates,
+not finite-BER bounds. `--no-error-floor` hides the plain reference; the
+postprocessing reference is selected independently.
+
+![RS(64,56) × RS(175,173) residual BER](../docs/images/rs_product_ideal_comparison.png)
+
+100M blocks per ideal configuration; 10M per RS configuration.
+Lowest-BER points remain sample-limited.

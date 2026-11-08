@@ -1,3 +1,11 @@
 .vscode
 build
 CMakeUserPresets.json
+
+# Local experiment artifacts
+/experiments/
+
+# Python and macOS generated files
+__pycache__/
+*.py[cod]
+.DS_Store

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Pool reports and plot fixed-weight conditional BER and/or BSC contributions."""
+"""Plot pooled conditional BER/BSC contributions with a minimum-stall reference."""
 
 import argparse
 import csv
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -45,11 +46,12 @@ def configuration(settings):
     flags = (settings["maximum directional passes"], settings["anchors"], settings["binary image"],
              settings.get("postprocessing", False))
     dims = dimensions(settings)
-    return flags if dims == DEFAULT_DIMENSIONS else flags + dims
+    config = flags if dims == DEFAULT_DIMENSIONS else flags + dims
+    return config + (True,) if settings.get("ideal decoder", False) else config
 
 
 def config_dimensions(config):
-    return config[4:] if len(config) == 8 else DEFAULT_DIMENSIONS
+    return config[4:8] if len(config) in (8, 9) else DEFAULT_DIMENSIONS
 
 
 def require(condition, message):
@@ -180,13 +182,16 @@ def load_report(path):
                              "report seconds", "fsync seconds"}
         if "n1" in settings:
             integer_settings |= {"n1", "k1", "n2", "k2"}
-        require(type(settings) is dict and set(settings) - {"postprocessing"} == integer_settings | {
+        require(type(settings) is dict and set(settings) - {"postprocessing", "ideal decoder"} == integer_settings | {
             "anchors", "binary image"}, "incompatible settings")
         for name in integer_settings:
             require(natural(settings[name], (1 << 64) - 1), f"invalid {name}")
         for name in ("anchors", "binary image"):
             require(type(settings[name]) is bool, f"invalid {name}")
         require(type(settings.get("postprocessing", False)) is bool, "invalid postprocessing")
+        require(type(settings.get("ideal decoder", False)) is bool, "invalid ideal decoder")
+        require(not settings.get("ideal decoder", False) or snapshot,
+                "ideal decoder requires schema-2 snapshot storage")
         require(not settings.get("postprocessing", False) or snapshot,
                 "postprocessing requires schema-2 snapshot storage")
         require(0 <= settings["minimum flipped bits"] <= settings["maximum flipped bits"] <= n,
@@ -398,9 +403,93 @@ def evaluate(rows, p, n=N, denominators=None):
 def config_label(config):
     passes, anchors, binary, postprocessing = config[:4]
     n1, k1, n2, k2 = config_dimensions(config)
+    if len(config) in (5, 9):
+        return (f"RS{n1},{k1} x RS{n2},{k2}; passes={passes}, decoder=ideal, "
+                f"postprocessing={'on' if postprocessing else 'off'}")
     return (f"RS{n1},{k1} x RS{n2},{k2}; passes={passes}, "
             f"anchors={'on' if anchors else 'off'}, binary-image={'on' if binary else 'off'}, "
             f"postprocessing={'on' if postprocessing else 'off'}")
+
+
+@lru_cache(maxsize=None)
+def postprocessing_stalls(dims):
+    """Count leading stalls left by failed-column erasure postprocessing.
+
+    Model CorrectImpl's known-failure repair under converged ideal BDD:
+    at most Rweak erroneous columns are repaired, so surviving minimum
+    patterns have Rweak+1 columns, a=tstrong+1 errors in each column, and
+    at least tweak+1 errors in each affected row. Count all such supports,
+    including nonrectangular ones. Hidden syndrome-clean errors and the
+    value-dependent consensus/miscorrection path are outside this model.
+    Return (erroneous bytes, number of supports in the full array).
+    """
+    n1, k1, n2, k2 = dims
+    a, redundancy = (n1 - k1) // 2 + 1, n2 - k2
+    require(redundancy in (2, 4), "postprocessing error floor supports weak R=2 or R=4")
+    columns = redundancy + 1
+    if redundancy == 2:
+        # In r active rows, each of the three columns is absent r-a times.
+        # Rows miss at most one column; the other 3a-2r rows contain all three.
+        count = sum(math.comb(n1, r) * math.factorial(r) //
+                    (math.factorial(3*a - 2*r) * math.factorial(r-a)**3)
+                    for r in range(a, min(n1, 3*a//2) + 1))
+    else:
+        # Count five labeled columns of weight a, with row degree >=3.
+        # Group the first three columns by row degrees u=1, v=2, z=3.
+        # No new row can reach degree 3 in the last two columns. Both must
+        # include every u-row, and together they must cover every v-row.
+        histograms = {}
+        for overlap in range(a + 1):
+            if 2*a - overlap > n1:
+                continue
+            zero, one = n1 - 2*a + overlap, 2*(a-overlap)
+            first_two = (math.comb(n1, a) * math.comb(a, overlap)
+                         * math.comb(n1-a, a-overlap))
+            for z in range(overlap + 1):
+                for selected_one in range(max(0, a-z-zero), min(one, a-z) + 1):
+                    selected_zero = a-z-selected_one
+                    u, v = one-selected_one+selected_zero, overlap-z+selected_one
+                    remaining = a-u
+                    if remaining < 0 or remaining > v+z or v > 2*remaining:
+                        continue
+                    ways = (first_two * math.comb(overlap, z) * math.comb(one, selected_one)
+                            * math.comb(zero, selected_zero))
+                    key = (u, v, z)
+                    histograms[key] = histograms.get(key, 0) + ways
+        count = 0
+        for (u, v, z), ways in histograms.items():
+            remaining = a-u
+            # Fourth column chooses x of the v-rows. The fifth must include
+            # the other v-x; its remaining choices come from x+z rows.
+            completions = sum(math.comb(v, x) * math.comb(z, remaining-x)
+                              * math.comb(x+z, remaining-v+x)
+                              for x in range(max(0, remaining-z, v-remaining),
+                                             min(v, remaining) + 1))
+            count += ways * completions
+    return a * columns, count * math.comb(n2, columns)
+
+
+def log_error_floor(p, dims=DEFAULT_DIMENSIONS, postprocessing=False):
+    """Return log of the leading minimum-stall BSC residual bit-rate estimate.
+
+    For byte RS components, t_i = floor((n_i-k_i)/2), q = 1-(1-p)^8,
+    and B_0 = C(n1-1,t1) C(n2-1,t2) p q^((t1+1)(t2+1)-1).
+    With postprocessing, replace the minimum-rectangle family by all leading
+    supports counted by postprocessing_stalls. Payload and full-codeword bit
+    rates coincide by symmetry. These are asymptotic references for converged
+    ideal BDD, not finite-p bounds or fixed-weight conditional BERs.
+    See https://arxiv.org/abs/1611.04834, Section III, for stall counting.
+    """
+    require(0 < p < 1, "error-floor p must be between zero and one")
+    n1, k1, n2, k2 = dims
+    t1, t2 = (n1 - k1) // 2, (n2 - k2) // 2
+    q = -math.expm1(8 * math.log1p(-p))
+    if postprocessing:
+        weight, count = postprocessing_stalls(tuple(dims))
+        return (math.log(weight) + math.log(count) - math.log(n1*n2)
+                + math.log(p) + (weight-1) * math.log(q))
+    return (math.log(math.comb(n1 - 1, t1)) + math.log(math.comb(n2 - 1, t2))
+            + math.log(p) + ((t1 + 1) * (t2 + 1) - 1) * math.log(q))
 
 
 def plot_value(value):
@@ -441,8 +530,12 @@ def export_conditional(groups, metrics, path):
         stream.write("\n")
 
 
-def plot_results(groups, metrics, mode, ps, output, csv_path, plt, thin=0.5):
+def plot_results(groups, metrics, mode, ps, output, csv_path, plt, thin=0.5, error_floor=True,
+                 postprocessing_error_floor=False, p_min=0.0045, p_max=0.008,
+                 y_min=1e-30, y_max=1e-1):
     require(math.isfinite(thin) and thin > 0, "--thin must be finite and greater than zero")
+    require(0 < p_min < p_max < 1, "require 0 < --p-min < --p-max < 1")
+    require(0 < y_min < y_max <= 1, "require 0 < --y-min < --y-max <= 1")
     figure, axis = plt.subplots(figsize=(11, 7))
     positive = False
     total_underflows = 0
@@ -453,7 +546,8 @@ def plot_results(groups, metrics, mode, ps, output, csv_path, plt, thin=0.5):
             "configuration", "metric", "p", "log10_contribution", "log10_covered_mass",
             "log10_missing_mass", "sampled_strata", "zero_observed_strata", "record_type",
             "k", "residual_bits_sum", "completed_blocks", "mean", "log10_mean",
-            "raw_ber", "conditional_ber", "log10_conditional_ber"])
+            "raw_ber", "conditional_ber", "log10_conditional_ber", "log10_error_floor",
+            "error_floor_model"])
         writer.writeheader()
         for index, (config, rows) in enumerate(groups.items()):
             ds = denominators(config_dimensions(config))
@@ -476,7 +570,7 @@ def plot_results(groups, metrics, mode, ps, output, csv_path, plt, thin=0.5):
                                      for v, y in zip(values, ys))
                     total_underflows += underflows
                     positive |= bool(visible)
-                    clipped = sum(not (0.0045 <= x <= 0.008 and 1e-30 <= y <= 1e-1)
+                    clipped = sum(not (p_min <= x <= p_max and y_min <= y <= y_max)
                                   for x, y in visible)
                     note = f"{zeros}/{len(values)} zero-observed strata omitted"
                     print(f"{label}; {metric}: {note}; {underflows} positive BERs underflowed "
@@ -498,24 +592,50 @@ def plot_results(groups, metrics, mode, ps, output, csv_path, plt, thin=0.5):
                     axis.plot(ps, [plot_value(v[0][metric]) for v in weighted], linewidth=2 * thin,
                               color=color, linestyle="-" if metric == "information" else "--",
                               label=f"Sampled-stratum BSC contribution; {metric}: {label}")
-    axis.set(xscale="linear", yscale="log", xlim=(0.008, 0.0045), ylim=(1e-30, 1e-1),
-             xlabel="Raw BER (k / transmitted bits for conditional; p for BSC)",
+        if error_floor or postprocessing_error_floor:
+            # One reference per code size: the analytic model has no decoder
+            # flags, pass cap, or distinction between payload and full BER.
+            floor_ps = ps or [p_max + (p_min - p_max) * i / 199 for i in range(200)]
+            for dims in dict.fromkeys(config_dimensions(config) for config in groups):
+                n1, k1, n2, k2 = dims
+                label = f"RS{n1},{k1} x RS{n2},{k2}"
+                for enabled, postprocessing in ((error_floor, False), (postprocessing_error_floor, True)):
+                    if not enabled:
+                        continue
+                    logs = [log_error_floor(p, dims, postprocessing) for p in floor_ps]
+                    model = "postprocessing" if postprocessing else "bdd"
+                    for metric in metrics:
+                        for p, value in zip(floor_ps, logs):
+                            writer.writerow({"configuration": label, "metric": metric,
+                                             "record_type": "error_floor", "p": p,
+                                             "error_floor_model": model,
+                                             "log10_error_floor": value / math.log(10)})
+                    name = "Postprocessing" if postprocessing else "Minimum-stall"
+                    axis.plot(floor_ps, [plot_value(value) for value in logs], linewidth=2 * thin,
+                              linestyle="-." if postprocessing else ":",
+                              label=f"{name} BSC error-floor estimate: {label}")
+    axis.set(xscale="linear", yscale="log", xlim=(p_max, p_min), ylim=(y_min, y_max),
+             xlabel="Raw BER (k / transmitted bits for conditional; p for BSC/reference)",
              ylabel="Residual BER", title="Product-code BER")
     if mode == "conditional" and not positive:
-        message = ("All observed residual sums are zero; no positive BERs to plot."
+        message = ("All observed residual sums are zero; no positive measured BERs to plot."
                     if sampled else "No completed blocks in these report snapshots.")
         if total_underflows:
-            message = "No representable positive BERs to plot; see CSV logs."
+            message = "No representable positive measured BERs to plot; see CSV logs."
         axis.text(0.5, 0.5, message + "\nNo artificial floor is used.",
                   transform=axis.transAxes, ha="center", va="center")
     axis.grid(True, which="major", color="#d1d5db", alpha=0.75)
     axis.spines[["top", "right"]].set_visible(False)
-    axis.legend(fontsize=8)
+    axis.legend(fontsize=8, loc="upper right")
+    floor_note = ("\nError-floor references: converged ideal BDD; leading stalls only, asymptotic estimates, not bounds."
+                  if error_floor or postprocessing_error_floor else "")
+    if postprocessing_error_floor:
+        floor_note += "\nPostprocessing reference removes stalls in at most Rweak detected columns; hidden errors excluded."
     figure.text(0.5, 0.02,
                 "Fixed-weight conditional BER is not a full BSC expectation. Missing strata unknown.\n"
                 "Zeros omitted, not floored; zero observed errors are not certainty. "
-                "No weight renormalization or extrapolation.", ha="center", fontsize=9)
-    figure.tight_layout(rect=(0, 0.06, 1, 1))
+                "No sample weight renormalization or extrapolation." + floor_note, ha="center", fontsize=9)
+    figure.tight_layout(rect=(0, 0.12 if postprocessing_error_floor else 0.09 if error_floor else 0.06, 1, 1))
     figure.savefig(output, facecolor="white", metadata={"Creator": __file__, "Date": None})
     plt.close(figure)
 
@@ -529,11 +649,22 @@ def main(argv=None):
         "raw BER k/N and residual BER sum(residual bits)/(sum(completed blocks)*D), "
         "N=8*n1*n2; D=8*k1*k2 for information or N for full, per code. Both mode overlays conditional scatter and "
         "sampled-stratum BSC contribution lines; conditional BER is not a full BSC expectation. "
-        "All modes use descending linear x 0.008 to 0.0045 and log y 1e-30 to 1e-1; "
+        "All modes default to descending linear x 0.008 to 0.0045 and log y 1e-30 to 1e-1; "
+        "--p-min/--p-max change the input BER range and --y-min/--y-max change the residual BER range. "
         "out-of-range points are clipped, not discarded from CSV. "
-        "Zeros are omitted and counted, never floored. The unified CSV uses record_type conditional/ber, "
+        "A minimum-stall BSC error-floor estimate is overlaid once per code size in every mode, "
+        "using q=1-(1-p)^8 and t_i=floor((n_i-k_i)/2). It assumes converged BDD without "
+        "miscorrections or postprocessing; it is asymptotic, not a finite-p bound or a conditional BER. "
+        "The reference uses the BER p-grid, or 200 points in conditional mode; --no-error-floor hides it. "
+        "--postprocessing-error-floor independently adds a second leading-stall estimate after erasing "
+        "up to Rweak=n2-k2 detected columns; it counts nonrectangular surviving supports too. "
+        "Use both flags together for only the postprocessing reference; use the latter alone for both. "
+        "Hidden syndrome-clean errors and value-dependent consensus are outside the analytic model. "
+        "Zeros are omitted and counted, never floored. The unified CSV uses record_type conditional/ber/error_floor, "
         "retains BER columns and conditional exact sums/counts and mean/log10_mean, and adds "
-        "raw_ber, conditional_ber/log10_conditional_ber. Inapplicable fields are blank. "
+        "raw_ber, conditional_ber/log10_conditional_ber, log10_error_floor and error_floor_model (bdd/postprocessing). "
+        "Reference rows have one selected metric per code size, independent of decoder flags. "
+        "Inapplicable fields are blank. "
         "Missing k are unknown; "
         "zero observed errors are not certainty. Arbitrarily low plotted values are not reliability "
         "evidence. No extrapolation or MSE fit: a fitting model has not been specified. "
@@ -552,7 +683,7 @@ def main(argv=None):
                         help="run directories, summary files with sibling metadata.json, or containers "
                         "recursively searched in sorted order for metadata.json + summary.json pairs")
     parser.add_argument("--output", type=Path, default=Path("product_monte_carlo.svg"), help="SVG output")
-    parser.add_argument("--csv", type=Path, help="unified CSV output, both row types in both mode "
+    parser.add_argument("--csv", type=Path, help="unified CSV output with measured and reference rows "
                         "(default: output path with .csv suffix; no sidecar)")
     parser.add_argument("--export", type=Path, metavar="JSON",
                         help="also export only pooled conditional raw/residual BER values to indented JSON, "
@@ -561,7 +692,20 @@ def main(argv=None):
     parser.add_argument("--mode", choices=("conditional", "ber", "both"), default="ber",
                         help="conditional: fixed-weight BER scatter; ber: BSC contribution lines; both: overlay")
     parser.add_argument("--points", type=int, default=200, help="BER p-grid size; ignored in conditional mode")
+    parser.add_argument("--p-min", type=float, default=0.0045,
+                        help="lower BER axis/grid limit (default: 0.0045)")
+    parser.add_argument("--p-max", type=float, default=0.008,
+                        help="upper BER axis/grid limit (default: 0.008)")
+    parser.add_argument("--y-min", type=float, default=1e-30,
+                        help="lower residual BER axis limit (default: 1e-30)")
+    parser.add_argument("--y-max", type=float, default=1e-1,
+                        help="upper residual BER axis limit (default: 1e-1)")
     parser.add_argument("--metric", choices=("information", "full", "both"), default="information")
+    parser.add_argument("--no-error-floor", action="store_true",
+                        help="hide the plain BDD minimum-stall reference; does not hide the postprocessing reference")
+    parser.add_argument("--postprocessing-error-floor", action="store_true",
+                        help="add the leading-stall reference after failed-column erasure postprocessing; "
+                        "independent of --no-error-floor and report decoder flags")
     parser.add_argument("--thin", type=float, default=0.5,
                         help="positive size multiplier for curve widths, marker diameters and marker strokes; "
                         "smaller is thinner, 1 uses the previous curve width and marker area")
@@ -572,6 +716,8 @@ def main(argv=None):
     require(math.isfinite(args.thin) and args.thin > 0,
             "--thin must be finite and greater than zero")
     require(args.mode == "conditional" or args.points >= 2, "--points must be at least 2")
+    require(0 < args.p_min < args.p_max < 1, "require 0 < --p-min < --p-max < 1")
+    require(0 < args.y_min < args.y_max <= 1, "require 0 < --y-min < --y-max <= 1")
     require(args.output.suffix.lower() == ".svg", "--output must be an .svg path")
     csv_path = args.csv or args.output.with_suffix(".csv")
     reports = discover_reports(args.inputs)
@@ -595,9 +741,12 @@ def main(argv=None):
         raise ValueError("plotting requires matplotlib; numerical core uses only the standard library") from error
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11,
                          "svg.hashsalt": "gf256-product-monte-carlo"})
-    ps = ([0.008 + (0.0045 - 0.008) * i / (args.points - 1) for i in range(args.points)]
+    ps = ([args.p_max + (args.p_min - args.p_max) * i / (args.points - 1) for i in range(args.points)]
           if args.mode != "conditional" else [])
-    plot_results(groups, metrics, args.mode, ps, args.output, csv_path, plt, thin=args.thin)
+    plot_results(groups, metrics, args.mode, ps, args.output, csv_path, plt, thin=args.thin,
+                 error_floor=not args.no_error_floor,
+                 postprocessing_error_floor=args.postprocessing_error_floor,
+                 p_min=args.p_min, p_max=args.p_max, y_min=args.y_min, y_max=args.y_max)
     if args.export is not None:
         export_conditional(groups, metrics, args.export)
 

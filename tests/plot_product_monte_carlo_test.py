@@ -2,6 +2,7 @@ import copy
 import csv
 import importlib.util
 import io
+import itertools
 import json
 import math
 from pathlib import Path
@@ -19,6 +20,122 @@ SPEC.loader.exec_module(plot)
 
 
 class NumericalTest(unittest.TestCase):
+    def test_ideal_configuration_keeps_dimensions_and_rs_separate(self):
+        for dims in (plot.DEFAULT_DIMENSIONS, (64, 56, 175, 173)):
+            settings = {"maximum directional passes": 64, "anchors": True,
+                        "binary image": True, **dict(zip(("n1", "k1", "n2", "k2"), dims))}
+            rs = plot.configuration(settings)
+            settings["ideal decoder"] = True
+            ideal = plot.configuration(settings)
+            self.assertNotEqual(rs, ideal)
+            self.assertEqual(plot.config_dimensions(ideal), dims)
+            self.assertIn("decoder=ideal", plot.config_label(ideal))
+            self.assertIn("passes=64", plot.config_label(ideal))
+
+    def test_postprocessing_leading_stalls_by_exhaustive_column_supports(self):
+        for n1, a, redundancy in ((4, 2, 2), (4, 2, 4), (5, 3, 4)):
+            columns, b = redundancy+1, redundancy//2+1
+            n2 = columns+1
+            dims = (n1, n1-2*(a-1), n2, n2-redundancy)
+            fixed_columns = 0
+            for supports in itertools.product(itertools.combinations(range(n1), a), repeat=columns):
+                degrees = [sum(row in support for support in supports) for row in range(n1)]
+                if all(degree == 0 or degree >= b for degree in degrees):
+                    fixed_columns += 1
+            weight, count = plot.postprocessing_stalls(dims)
+            self.assertEqual(weight, a*columns)
+            self.assertEqual(count, fixed_columns*math.comb(n2, columns))
+            # A rectangle-only estimate would omit leading nonrectangular stalls.
+            self.assertGreater(count, math.comb(n1, a)*math.comb(n2, columns))
+
+    def test_postprocessing_error_floor_known_rs_product(self):
+        dims = (256, 224, 175, 173)
+        weight, count = plot.postprocessing_stalls(dims)
+        self.assertEqual(weight, 51)
+        self.assertEqual(count, 8946379251204716742436101752459666054048078704800000)
+        self.assertAlmostEqual(math.exp(plot.log_error_floor(0.005, dims, True)) /
+                               2.6938929593017986e-24, 1, places=12)
+        self.assertTrue(math.isfinite(plot.log_error_floor(1e-300, dims, True)))
+        self.assertEqual(plot.postprocessing_stalls((256, 224, 256, 252))[0], 85)
+
+    def test_error_floor_known_rs_product_and_stable_small_ber(self):
+        dims = (256, 224, 175, 173)
+        self.assertAlmostEqual(math.exp(plot.log_error_floor(0.005, dims)) /
+                               3.4071247960400173e-22, 1, places=12)
+        self.assertEqual(plot.log_error_floor(0.005, dims),
+                         plot.log_error_floor(0.005, (175, 173, 256, 224)))
+        # The log-domain estimate remains usable even when linear BER
+        # underflows; byte-error conversion must not subtract nearly equal 1s.
+        value = plot.log_error_floor(1e-300, dims)
+        expected = (math.log(math.comb(255, 16) * 174) + 34 * math.log(1e-300)
+                    + 33 * math.log(8))
+        self.assertAlmostEqual(value, expected, places=10)
+        self.assertTrue(math.isfinite(value))
+        self.assertTrue(math.isnan(plot.plot_value(value)))
+
+    def test_error_floor_matches_exhaustive_small_array_asymptote(self):
+        # All error supports of a 3x3 array with t1=t2=1. Compare against
+        # converged ideal decoding, independent of the rectangle formula.
+        dims, p = (3, 1, 3, 1), 1e-6
+        q = -math.expm1(8 * math.log1p(-p))
+        residual_symbols = 0.0
+        for mask in range(1 << 9):
+            errors = {(r, c) for r in range(3) for c in range(3)
+                      if mask & (1 << (3*r+c))}
+            weight = len(errors)
+            while errors:
+                before = set(errors)
+                for r in range(3):
+                    row = {cell for cell in errors if cell[0] == r}
+                    if len(row) <= 1:
+                        errors -= row
+                for c in range(3):
+                    column = {cell for cell in errors if cell[1] == c}
+                    if len(column) <= 1:
+                        errors -= column
+                if errors == before:
+                    break
+            residual_symbols += len(errors) * q**weight * (1-q)**(9-weight)
+        uber = p/q * residual_symbols/9
+        self.assertAlmostEqual(math.exp(plot.log_error_floor(p, dims))/uber, 1, places=12)
+
+    def test_error_floor_distinct_dimensions_zero_samples_and_csv(self):
+        configs = [(16, True, True, False), (32, False, False, True),
+                   (16, True, True, False, 256, 224, 175, 173),
+                   (16, True, True, False, 256, 224, 256, 252)]
+        groups = {config: {100: {"trials": 10, "information": 0, "full": 0}}
+                  for config in configs}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)/"out.svg"
+            plt, axis = mock.MagicMock(), mock.MagicMock()
+            plt.subplots.return_value = (mock.MagicMock(), axis)
+            plt.rcParams.__getitem__.return_value.by_key.return_value = {"color": ["blue"]}
+            with mock.patch("sys.stderr", io.StringIO()):
+                plot.plot_results(groups, ["information", "full"], "conditional", [],
+                                  output, output.with_suffix(".csv"), plt)
+            # Decoder flags/caps and metric selection do not duplicate curves;
+            # shortening and an increased weak correction radius do change them.
+            self.assertEqual(axis.plot.call_count, 3)
+            with output.with_suffix(".csv").open() as stream:
+                records = list(csv.DictReader(stream))
+        observed = [row for row in records if row["record_type"] == "conditional"]
+        self.assertEqual(len(observed), 8)
+        self.assertTrue(all(float(row["conditional_ber"]) == 0 for row in observed))
+        floors = [row for row in records if row["record_type"] == "error_floor"]
+        self.assertEqual(len(floors), 3*2*200)
+        for call, dims in zip(axis.plot.call_args_list,
+                              (plot.DEFAULT_DIMENSIONS, (256, 224, 175, 173), (256, 224, 256, 252))):
+            ps, ys = call.args
+            self.assertEqual((ps[0], ps[-1]), (0.008, 0.0045))
+            self.assertEqual(len(ps), 200)
+            self.assertAlmostEqual(math.log(ys[0]), plot.log_error_floor(ps[0], dims))
+            self.assertIn(f"RS{dims[0]},{dims[1]} x RS{dims[2]},{dims[3]}", call.kwargs["label"])
+        for rows in (floors[i:i+400] for i in range(0, len(floors), 400)):
+            self.assertEqual([r["log10_error_floor"] for r in rows[:200]],
+                             [r["log10_error_floor"] for r in rows[200:]])
+            self.assertTrue(all(r["log10_covered_mass"] == r["log10_contribution"] == ""
+                                for r in rows))
+
     def test_dimension_specific_conditional_export_and_weighted_plot(self):
         dims = (4, 2, 5, 3)
         ds = plot.denominators(dims)
@@ -318,6 +435,7 @@ class ReportTest(unittest.TestCase):
                     rows = list(csv.DictReader(stream))
                 self.assertEqual({row["metric"] for row in rows}, {"information", "full"})
                 if mode == "conditional":
+                    rows = [row for row in rows if row["record_type"] == "conditional"]
                     self.assertEqual(len(rows), 2)
                     self.assertTrue(all(row["completed_blocks"] == "10" and
                                         float(row["mean"]) == 1 for row in rows))
@@ -417,6 +535,33 @@ class ReportTest(unittest.TestCase):
         summary["run identity"] = plot.identity(metadata)
         self.save(path, metadata, summary)
         self.assertEqual(plot.load_report(path)[2], (16, True, True, False))
+
+    def test_ideal_reports_keep_same_seed_rs_runs_separate_and_validate_flag(self):
+        old, _, _ = self.fixture("rs")
+        path, metadata, summary = self.fixture("ideal")
+        metadata["schema revision"] = summary["schema revision"] = 2
+        metadata["storage"] = plot.SNAPSHOTS
+        metadata["settings"]["ideal decoder"] = True
+        summary["run identity"] = plot.identity(metadata)
+        stats = {"completed blocks": 1, "total iterations": 2,
+                 "information bits": {"total bits": 455168, "raw corrupted bits": 2000,
+                                      "post decoding corrupted bits": 1},
+                 "full-codeword bits": {"total bits": 524288, "raw corrupted bits": 2600,
+                                        "post decoding corrupted bits": 1}}
+        summary["overall"] = {"statistics": copy.deepcopy(stats)}
+        summary["by flipped bit count"] = [{"flipped bit count": 2600, "statistics": copy.deepcopy(stats)}]
+        self.save(path, metadata, summary)
+        self.assertEqual(set(plot.pool_reports([old, path])),
+                         {(16, True, True, False), (16, True, True, False, True)})
+        metadata["settings"]["ideal decoder"] = 1
+        self.save(path, metadata, summary)
+        with self.assertRaisesRegex(ValueError, "invalid ideal decoder"):
+            plot.load_report(path)
+        metadata["settings"]["ideal decoder"] = True
+        del metadata["storage"]
+        self.save(path, metadata, summary)
+        with self.assertRaisesRegex(ValueError, "ideal decoder requires"):
+            plot.load_report(path)
 
     def test_shortened_and_default_dimensions_never_pool(self):
         default, _, _ = self.fixture("default")
@@ -610,6 +755,7 @@ class ReportTest(unittest.TestCase):
             self.assertAlmostEqual(y, mean / plot.DENOMINATORS["information"], places=18)
         with output.with_suffix(".csv").open() as stream:
             rows = list(csv.DictReader(stream))
+        rows = [row for row in rows if row["record_type"] == "conditional"]
         self.assertEqual(len(rows), 6)
         self.assertEqual([int(row["k"]) for row in rows[:2]], [2500, 2600])
         self.assertEqual(rows[0]["residual_bits_sum"], "0")
@@ -642,7 +788,8 @@ class ReportTest(unittest.TestCase):
                     self.save(path, metadata, summary)
                 output = self.root / "zero.svg"
                 with mock.patch.object(plt, "close", wraps=plt.close) as close:
-                    plot.main([str(path), "--mode", "conditional", "--output", str(output)])
+                    plot.main([str(path), "--mode", "conditional", "--no-error-floor",
+                               "--output", str(output)])
                 axis = close.call_args.args[0].axes[0]
                 self.assertEqual(len(axis.collections[0].get_offsets()), 0)
                 self.assertEqual(len(axis.lines), 0)
@@ -680,7 +827,7 @@ class ReportTest(unittest.TestCase):
         self.assertEqual((axis.get_xscale(), axis.get_yscale()), ("linear", "log"))
         self.assertEqual(axis.get_xlim(), (0.008, 0.0045))
         self.assertEqual(axis.get_ylim(), (1e-30, 1e-1))
-        self.assertEqual((len(axis.collections), len(axis.lines)), (4, 4))
+        self.assertEqual((len(axis.collections), len(axis.lines)), (4, 5))
         for index, (scatter, line) in enumerate(zip(axis.collections, axis.lines)):
             self.assertEqual(tuple(scatter.get_facecolors()[0]), to_rgba(line.get_color()))
             self.assertIn("Fixed-weight conditional BER", scatter.get_label())
@@ -694,9 +841,19 @@ class ReportTest(unittest.TestCase):
         pooled = plot.pool_reports([a, b])[(16, True, True, False)]
         with csv_path.open() as stream:
             records = list(csv.DictReader(stream))
-        self.assertEqual(len(records), 16)
+        self.assertEqual(len(records), 22)
         conditional = [r for r in records if r["record_type"] == "conditional"]
         weighted = [r for r in records if r["record_type"] == "ber"]
+        floors = [r for r in records if r["record_type"] == "error_floor"]
+        self.assertEqual(len(floors), 6)
+        self.assertIn("Minimum-stall BSC error-floor estimate", axis.lines[-1].get_label())
+        self.assertEqual(axis.lines[-1].get_linestyle(), ":")
+        for row in floors:
+            self.assertEqual(row["error_floor_model"], "bdd")
+            self.assertAlmostEqual(float(row["log10_error_floor"]),
+                                   plot.log_error_floor(float(row["p"]))/math.log(10))
+            self.assertEqual(row["log10_contribution"], "")
+            self.assertEqual(row["completed_blocks"], "")
         self.assertEqual((len(conditional), len(weighted)), (4, 12))
         for row in conditional[:2]:
             self.assertEqual((row["k"], row["residual_bits_sum"], row["completed_blocks"]),
@@ -716,6 +873,38 @@ class ReportTest(unittest.TestCase):
         self.assertFalse(output.with_suffix(".csv").exists())
 
     @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "matplotlib not installed")
+    def test_independent_error_floor_switches_and_models(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        path, _, _ = self.fixture()
+        for options, models in (([], {"bdd"}),
+                                (["--postprocessing-error-floor"], {"bdd", "postprocessing"}),
+                                (["--no-error-floor", "--postprocessing-error-floor"], {"postprocessing"}),
+                                (["--no-error-floor"], set())):
+            with self.subTest(options=options):
+                output = self.root / "references.svg"
+                with mock.patch.object(plt, "close", wraps=plt.close) as close, \
+                        mock.patch("sys.stderr", io.StringIO()):
+                    plot.main([str(path), "--mode", "ber", "--metric", "both", "--points", "2",
+                               "--output", str(output), *options])
+                axis = close.call_args.args[0].axes[0]
+                self.assertEqual(len(axis.lines), 2+len(models))
+                with output.with_suffix(".csv").open() as stream:
+                    records = list(csv.DictReader(stream))
+                floors = [row for row in records if row["record_type"] == "error_floor"]
+                self.assertEqual({row["error_floor_model"] for row in floors}, models)
+                self.assertEqual(len(floors), 4*len(models))
+                for row in floors:
+                    expected = plot.log_error_floor(float(row["p"]),
+                                                   postprocessing=row["error_floor_model"] == "postprocessing")
+                    self.assertAlmostEqual(float(row["log10_error_floor"]), expected/math.log(10))
+                if "postprocessing" in models:
+                    self.assertEqual(axis.lines[-1].get_linestyle(), "-.")
+                    self.assertIn("Postprocessing BSC", axis.lines[-1].get_label())
+
+    @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "matplotlib not installed")
     def test_conditional_underflow_csv_not_floored(self):
         import matplotlib
         matplotlib.use("Agg")
@@ -725,7 +914,7 @@ class ReportTest(unittest.TestCase):
         groups = {(16, True, True, False): {3500: {"trials": 10**400, "information": 1}}}
         with mock.patch.object(plt, "close", wraps=plt.close) as close:
             plot.plot_results(groups, ["information"], "conditional", [], output,
-                              output.with_suffix(".csv"), plt)
+                              output.with_suffix(".csv"), plt, error_floor=False)
         axis = close.call_args.args[0].axes[0]
         self.assertEqual(len(axis.collections[0].get_offsets()), 0)
         with output.with_suffix(".csv").open() as stream:
@@ -734,12 +923,12 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(row["residual_bits_sum"], "1")
         self.assertEqual(float(row["conditional_ber"]), 0)
         self.assertAlmostEqual(float(row["log10_conditional_ber"]), -400 - math.log10(455168))
-        self.assertIn("No representable positive BERs", output.read_text())
+        self.assertIn("No representable positive measured BERs", output.read_text())
 
     def test_help_and_headless_outputs(self):
         result = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("No extrapolation", result.stdout)
+        self.assertIn("No extrapolation", " ".join(result.stdout.split()))
         self.assertIn("recursively", result.stdout)
         self.assertIn("merged.svg", result.stdout)
         self.assertIn("Partial or malformed runs", " ".join(result.stdout.split()))
