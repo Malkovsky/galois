@@ -129,7 +129,6 @@ if(GF256_BUILD_MONTE_CARLO)
 endif()
 
 if(GF256_BUILD_TOOLS)
-  set(XXHASH_BUILD_XXHSUM OFF CACHE BOOL "" FORCE)
   set(INDICATORS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(INDICATORS_SAMPLES OFF CACHE BOOL "" FORCE)
   set(INDICATORS_DEMO OFF CACHE BOOL "" FORCE)
@@ -137,13 +136,14 @@ if(GF256_BUILD_TOOLS)
     xxhash
     GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
     GIT_TAG v0.8.2
-    SOURCE_SUBDIR cmake_unofficial
   )
   FetchContent_Declare(
     indicators
     GIT_REPOSITORY https://github.com/p-ranav/indicators.git
     GIT_TAG v2.3
   )
+  # xxHash v0.8.2 has no root CMakeLists.txt. Fetch its sources and build the
+  # library directly instead of using its obsolete cmake_unofficial project.
   FetchContent_MakeAvailable(xxhash indicators)
   if(NOT TARGET xxhash)
     add_library(xxhash STATIC ${xxhash_SOURCE_DIR}/xxhash.c)
